@@ -3,9 +3,10 @@ import os
 from collections import Counter
 from time import sleep
 
+from logpass.logpass import valstan_l, valstan_p
 from moduls.read_write.get_session_vk_api import get_session_vk_api
 
-vkapp = get_session_vk_api("79229005910", "Nitro@1941")
+vkapp = get_session_vk_api(valstan_l, valstan_p)
 group_name = 'Обо всем г.Малмыж'
 group_id = 89083141
 persons = []
@@ -19,11 +20,15 @@ for i in range(20):
 
 deactivated = 0
 city = []
+local_pers = 0
 for pers in persons:
     if 'deactivated' in pers:
         deactivated = deactivated + 1
+        continue
     if 'city' in pers:
         city.append(pers['city']['title'])
+    else:
+        city.append('None')
 sort_sity = dict(Counter(city))
 len_gorod = len(sort_sity)
 sort_sity = {k: v for k, v in sorted(sort_sity.items(), key=lambda item: item[1], reverse=True)}
