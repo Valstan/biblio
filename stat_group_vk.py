@@ -21,6 +21,9 @@ for i in range(20):
 deactivated = 0
 city = []
 local_pers = 0
+city_raion = 'МалмыжКазань'
+city_oblast = ''
+city_tatarstan = ''
 for pers in persons:
     if 'deactivated' in pers:
         deactivated = deactivated + 1
@@ -29,6 +32,7 @@ for pers in persons:
         city.append(pers['city']['title'])
     else:
         city.append('None')
+
 sort_sity = dict(Counter(city))
 len_gorod = len(sort_sity)
 sort_sity = {k: v for k, v in sorted(sort_sity.items(), key=lambda item: item[1], reverse=True)}
