@@ -2,13 +2,16 @@ import json
 import os
 from collections import Counter
 from time import sleep
+from datetime import datetime
 
 from logpass.logpass import brigadir_l, brigadir_p
 from moduls.read_write.get_session_vk_api import get_session_vk_api
 
 vkapp = get_session_vk_api(brigadir_l, brigadir_p)
-group_name = 'Малмыж Инфо'
-group_id = 158787639
+group_name = 'Малмыж и Малмыжский район'
+group_id = 142186489
+current_date = datetime.now().date()
+current_time = datetime.now().time()
 persons = []
 limit = 1000
 for i in range(20):
@@ -61,14 +64,16 @@ sort_sity = dict(Counter(city))
 len_gorod = len(sort_sity)
 sort_sity = {k: v for k, v in sorted(sort_sity.items(), key=lambda item: item[1], reverse=True)}
 result = [group_name, 'Всего подписчиков - ' + str(len(persons)), 'Мертвые души - ' + str(deactivated),
-          'Количество городов - ' + str(len_gorod), 'Подписички с Малмыжского района - ', str(city_raion_counter),
-          'Подписички с Кировской области - ', str(city_oblast_counter),
-          'Подписички с Татарстана - ', str(city_tatarstan_counter),
-          'Подписички с других городов (живые) - ', str(city_other_counter),
-          'Города:']
+          'Количество городов - ' + str(len_gorod), 'Малмыжский район - ', str(city_raion_counter),
+          'Кировская область - ', str(city_oblast_counter),
+          'Татарстан - ', str(city_tatarstan_counter),
+          'Другие города (живые) - ', str(city_other_counter),
+          'Города (живых+мертвых):']
 for k, v in sort_sity.items():
     result.extend([str(v) + '-' + str(k)])
 
 
-with open(os.path.join(str(group_id) + '.json'), 'w', encoding='utf-8') as f:
+with open(os.path.join(group_name + '_' + str(group_id) + '_' + str(current_date) +
+                       '-' + str(current_time.hour) + '-' + str(current_time.minute) + '.json'),
+          'w', encoding='utf-8') as f:
     f.write(json.dumps(result, indent=2, ensure_ascii=False))
