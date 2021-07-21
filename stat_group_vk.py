@@ -3,12 +3,12 @@ import os
 from collections import Counter
 from time import sleep
 
-from logpass.logpass import valstan_l, valstan_p
+from logpass.logpass import brigadir_l, brigadir_p
 from moduls.read_write.get_session_vk_api import get_session_vk_api
 
-vkapp = get_session_vk_api(valstan_l, valstan_p)
-group_name = 'Обо всем г.Малмыж'
-group_id = 89083141
+vkapp = get_session_vk_api(brigadir_l, brigadir_p)
+group_name = 'Малмыж Инфо'
+group_id = 158787639
 persons = []
 limit = 1000
 for i in range(20):
@@ -21,25 +21,39 @@ for i in range(20):
 deactivated = 0
 city = []
 local_pers = 0
-city_raion = 'МалмыжСавалиКалининоСтарый ИрюкТат-Верх-Гоньба' \
-             'РожкиАджимНовая СмаильМари-МалмыжМалый Китяк' \
-             'Большой КитякКинерьБольшой СатнурАрыкКонстантиновка' \
-             'ПлотбищеЛазаревоКаксинвайМелетьСтарый БурецБольшая Шабанка' \
-             'РальникиБольшой РойНовый БурецГоньбаПукшинерь' \
-             'Новый ИрюкНовая ТушкаУдмурт КитякНовый БуртекАлдарово' \
-             'Большой Порек'
-city_oblast = 'КировВятские ПоляныУржумКильмезьКрасная ПолянаСосновка' \
-              'НолинскКотельничСоветскВяткаСлободскойЛебяжьеОмутнинск'
-city_tatarstan = 'КазаньБалтасиНабережные ЧелныКукморНуринер' \
-                 'АрскНижнекамскАльметьевскЦипьяЗеленодольск' \
-                 'ЕлабугаЯнгуловоЧутайЧебоксарыТатарстанКизнер' \
-                 ''
+city_raion = 'МалмыжСавалиКалининоСтарый ИрюкТат-Верх-ГоньбаАкбатыревоШишинер' \
+             'РожкиАджимНовая СмаильМари-МалмыжМалый КитякПоречке КитякКокуй' \
+             'Большой КитякКинерьБольшой СатнурАрыкКонстантиновкаЗахватаево' \
+             'ПлотбищеЛазаревоКаксинвайМелетьСтарый БурецБольшая ШабанкаРусский Турек' \
+             'РальникиБольшой РойНовый БурецГоньбаПукшинерьСмаильНовый ИрюкНовая Тушка' \
+             'Удмурт КитякНовый БуртекАзнакаевоМарсПерескокиПорезНослыСтарый Пукшинер' \
+             'АлдаровоЧетвертое отделение психоневрологического диспансера' \
+             'Большой ПорекМалая ШабанкаПостниковоСтарый БуртекКаменный КлючКуженерка'
+city_oblast = 'КировВятские ПоляныУржумКильмезьКрасная ПолянаСосновкаДонауровоВерхошижемье' \
+              'НолинскКотельничСоветскВяткаСлободскойЛебяжьеОмутнинскНемаДаровскойПреображенка' \
+              'ЛузаЗуевкаВахруши (пгт)Малая КильмезьМурыгиноМурашиУниСредняя ТоймаЮрьяКикнур' \
+              'КирсСанчурскСуна'
+city_tatarstan = 'КазаньБалтасиНабережные ЧелныКукморНуринерИннополисШеморданМамадыш' \
+                 'АрскНижнекамскАльметьевскЦипьяЗеленодольскБугульмаБольшой Кукмор' \
+                 'ЕлабугаЯнгуловоЧутайЧебоксарыТатарстанКизнерБогатые Сабы'
+city_raion_counter = 0
+city_oblast_counter = 0
+city_tatarstan_counter = 0
+city_other_counter = 0
 for pers in persons:
     if 'deactivated' in pers:
         deactivated = deactivated + 1
         continue
     if 'city' in pers:
         city.append(pers['city']['title'])
+        if pers['city']['title'] in city_raion:
+            city_raion_counter = city_raion_counter + 1
+        elif pers['city']['title'] in city_oblast:
+            city_oblast_counter = city_oblast_counter + 1
+        elif pers['city']['title'] in city_tatarstan:
+            city_tatarstan_counter = city_tatarstan_counter + 1
+        else:
+            city_other_counter = city_other_counter + 1
     else:
         city.append('None')
 
@@ -47,7 +61,11 @@ sort_sity = dict(Counter(city))
 len_gorod = len(sort_sity)
 sort_sity = {k: v for k, v in sorted(sort_sity.items(), key=lambda item: item[1], reverse=True)}
 result = [group_name, 'Всего подписчиков - ' + str(len(persons)), 'Мертвые души - ' + str(deactivated),
-          'Количество городов - ' + str(len_gorod), 'Города:']
+          'Количество городов - ' + str(len_gorod), 'Подписички с Малмыжского района - ', str(city_raion_counter),
+          'Подписички с Кировской области - ', str(city_oblast_counter),
+          'Подписички с Татарстана - ', str(city_tatarstan_counter),
+          'Подписички с других городов (живые) - ', str(city_other_counter),
+          'Города:']
 for k, v in sort_sity.items():
     result.extend([str(v) + '-' + str(k)])
 
