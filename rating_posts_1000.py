@@ -11,8 +11,8 @@ from logpass.logpass import valstan_l, valstan_p
 vk_session = VkApi(valstan_l, valstan_p)
 vk_session.auth()
 vkapp = vk_session.get_api()
-group_name = 'Обо всем Малмыж'
-group_id = -89083141
+group_name = 'МалмыжМолодой'
+group_id = -187462239
 current_date = datetime.now().date()
 current_time = datetime.now().time()
 msgs = []
@@ -73,25 +73,25 @@ views = sorted(msgs_views, key=lambda k: k['views']['count'], reverse=True)
 links = []
 for sample in likes[:10]:
     link = ''.join(map(str, ('https://vk.com/wall',
-                             sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:40])))
+                             sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:60])))
     links.extend([link])
     result['Рейтинг лайков'][sample['likes']['count']] = link
 
 for sample in views[:10]:
     link = ''.join(map(str, ('https://vk.com/wall',
-                             sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:40])))
+                             sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:60])))
     links.extend([link])
     result['Рейтинг просмотров'][sample['views']['count']] = link
 
 for sample in comments[:10]:
     link = ''.join(map(str, ('https://vk.com/wall',
-                             sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:40])))
+                             sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:60])))
     links.extend([link])
     result['Рейтинг коментов'][sample['comments']['count']] = link
 
 for sample in reposts[:10]:
     link = ''.join(map(str, ('https://vk.com/wall',
-                             sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:40])))
+                             sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:60])))
     links.extend([link])
     result['Рейтинг репостов'][sample['reposts']['count']] = link
 
