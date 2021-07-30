@@ -23,42 +23,21 @@ for i in range(10):
     print(offset)
     sleep(1)
 
-result = {"Имя группы": group_name,
-          "Номер группы": group_id,
-          'Рейтинг лайков': {},
-          'Всего лайков': 0,
-          'Рейтинг просмотров': {},
-          'Всего просмотров': 0,
-          'Рейтинг коментов': {},
-          'Всего коментов': 0,
-          'Рейтинг репостов': {},
-          'Всего репостов': 0,
-          'Рейтинг ссылок': {}
-          }
+result = ["Имя группы", group_name, "Номер группы", group_id]
 
 likes_all = 0
+views_all = 0
+comments_all = 0
+reposts_all = 0
 for i in range(1000):
     if 'likes' in msgs[i]:
         likes_all += msgs[i]['likes']['count']
-result['Всего лайков'] = likes_all
-
-views_all = 0
-for i in range(1000):
     if 'views' in msgs[i]:
         views_all += msgs[i]['views']['count']
-result['Всего просмотров'] = views_all
-
-comments_all = 0
-for i in range(1000):
     if 'comments' in msgs[i]:
         comments_all += msgs[i]['comments']['count']
-result['Всего коментов'] = comments_all
-
-reposts_all = 0
-for i in range(1000):
     if 'reposts' in msgs[i]:
         reposts_all += msgs[i]['reposts']['count']
-result['Всего репостов'] = reposts_all
 
 likes = sorted(msgs, key=lambda k: k['likes']['count'], reverse=True)
 comments = sorted(msgs, key=lambda k: k['comments']['count'], reverse=True)
@@ -71,32 +50,41 @@ for sample in msgs:
 views = sorted(msgs_views, key=lambda k: k['views']['count'], reverse=True)
 
 links = []
+
+result.append('Лайки = ' + str(likes_all))
 for sample in likes[:10]:
     link = ''.join(map(str, ('https://vk.com/wall',
                              sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:60])))
-    links.extend([link])
-    result['Рейтинг лайков'][sample['likes']['count']] = link
+    links.append(link)
+    result.append(str(sample['likes']['count']) + ' - ' + link)
 
+result.append('Просмотры = ' + str(views_all))
 for sample in views[:10]:
     link = ''.join(map(str, ('https://vk.com/wall',
                              sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:60])))
-    links.extend([link])
-    result['Рейтинг просмотров'][sample['views']['count']] = link
+    links.append(link)
+    result.append(str(sample['views']['count']) + ' - ' + link)
 
+result.append('Комментарии = ' + str(comments_all))
 for sample in comments[:10]:
     link = ''.join(map(str, ('https://vk.com/wall',
                              sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:60])))
-    links.extend([link])
-    result['Рейтинг коментов'][sample['comments']['count']] = link
+    links.append(link)
+    result.append(str(sample['comments']['count']) + ' - ' + link)
 
+result.append('Репосты = ' + str(reposts_all))
 for sample in reposts[:10]:
     link = ''.join(map(str, ('https://vk.com/wall',
                              sample['owner_id'], '_', sample['id'], ' : ', sample['text'][:60])))
-    links.extend([link])
-    result['Рейтинг репостов'][sample['reposts']['count']] = link
+    links.append(link)
+    result.append(str(sample['reposts']['count']) + ' - ' + link)
 
+result.append('Рейтинг ссылок:')
 sort_links = dict(Counter(links))
-result['Рейтинг ссылок'] = {k: v for k, v in sorted(sort_links.items(), key=lambda item: item[1], reverse=True)}
+result_links = {k: v for k, v in sorted(sort_links.items(), key=lambda item: item[1], reverse=True)}
+for k, v in result_links.items():
+    result.append(str(v) + ' - ' + k)
+
 
 with open(os.path.join('РейтингПостов_' + group_name + '_' + str(group_id) + '_' + str(current_date) +
                        '-' + str(current_time.hour) + '-' + str(current_time.minute) + '.json'),
