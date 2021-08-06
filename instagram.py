@@ -1,7 +1,9 @@
 import os
 import shutil
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL.Image import Image
+from PIL.ImageDraw import ImageDraw
+from PIL.ImageFont import ImageFont
 from instabot import Bot
 
 from logpass.logpass import insta_mi_l, insta_mi_p
