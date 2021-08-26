@@ -1,4 +1,5 @@
-from config import bases, fbase
+from moduls.read_write.change_lp import change_lp
+from config import bases, fbase, conf
 from moduls.read_write.get_json import getjson
 from moduls.read_write.get_msg import get_msg
 from moduls.read_write.get_session_vk_api import get_session_vk_api
@@ -9,7 +10,7 @@ from moduls.utils.clear_copy_history import clear_copy_history
 def aprel(prefix_base):
     base = getjson(bases + prefix_base + fbase)
 
-    vkapp = get_session_vk_api(base['id']['l'], base['id']['p'])
+    vkapp = get_session_vk_api(change_lp(prefix_base))
     aprel_id = -144647350
     msgs = get_msg(vkapp, aprel_id, 0, 10)
     msg_link = []
@@ -17,16 +18,16 @@ def aprel(prefix_base):
     for msg in msgs:
         msg = clear_copy_history(msg)
         msg_link = ''.join(map(str, ('wall', msg['owner_id'], '_', msg['id'])))
-        if msg_link not in base['aprel_links']:
+        if msg_link not in base['links']['aprel']:
             break
 
     if msg_link:
-        id_group = base['id']['post_group']['key'] * -1
+        id_group = -conf[base['prefix']]['post_group']['key']
         try:
             vkapp.wall.repost(object=msg_link, group_id=id_group)
-            base['aprel_links'].append(msg_link)
-            while len(base['aprel_links']) > 5:
-                del base['aprel_links'][0]
+            base['links']['aprel'].append(msg_link)
+            while len(base['links']['aprel']) > 5:
+                del base['links']['aprel'][0]
             writejson(bases + base['prefix'] + fbase, base)
             return True
         except:

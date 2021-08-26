@@ -11,7 +11,7 @@ from moduls.utils.tesseract import tesseract
 def sort_po_foto(msg, base):
     histo = ''
     if msg['attachments'][0]['type'] == 'photo' and\
-            image_get(msg['attachments'][0]['photo']['sizes'][0]['url']):
+            image_get(msg['attachments'][0]['photo']['sizes'][0]['url'], bases + fimage):
         image = Image.open(bases + fimage)
         histo = image.histogram()
         hash_object = hashlib.md5(str(histo).encode())

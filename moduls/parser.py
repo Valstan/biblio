@@ -1,3 +1,4 @@
+from config import conf
 from moduls.sort.sort_old_date import sort_old_date
 from moduls.utils.avtortut import avtortut
 from moduls.utils.clear_copy_history import clear_copy_history
@@ -34,7 +35,10 @@ def parser(vkapp, base, name_novost):
             continue
         sample, histo = sort_po_foto(sample, base)
         if not sample: continue
-        sample['text'] = ''.join(map(str, (base['heshteg'][name_novost], avtortut(sample))))
+        sample['text'] = ''.join(map(str, (conf[base['prefix']]['podpisi']['zagolovok'][name_novost],
+                                           avtortut(sample),
+                                           conf[base['prefix']]['podpisi']['heshteg'][name_novost],
+                                           conf[base['prefix']]['podpisi']['final'])))
         sample = sort_double(sample, news_msg_list, maingroup_msg_list, base)
         if not sample: continue
         news_msg_list.append(sample)
