@@ -5,7 +5,8 @@
 40 7,12,18,20,22 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_addons
 40 21 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_krugozor
 40 19 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_aprel
-45 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_me
+45 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_valstan
+47 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_brigadir
 # dran
 50 6-22 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py dran_reklama
 55 7,9,12,18,20,22 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py dran_novost
