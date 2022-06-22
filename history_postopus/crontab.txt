@@ -1,8 +1,9 @@
 # mi
 30 6-22 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_reklama
-35 7,8,10,12,14-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_novost
+35 6,8,10,12,14,16,19-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_novost
+35 7,18 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_sosed
 35 9,13 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_reklama
-40 7,12,18,20,22 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_addons
+40 6,12,17,20,22 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_addons
 40 21 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_krugozor
 40 19 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_aprel
 45 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_valstan
