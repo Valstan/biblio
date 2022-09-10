@@ -1,9 +1,8 @@
 from vk_api import VkApi
 
 
-def get_session_vk_api(l, p):
-    vk_session = VkApi(l, p)
-    vk_session.auth()
+def get_session_vk_api(token):
+    vk_session = VkApi(token=token)
     return vk_session.get_api()
 
 

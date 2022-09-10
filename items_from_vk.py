@@ -5,8 +5,9 @@ from moduls.read_write.get_session_vk_api import get_session_vk_api
 
 session = config.session
 
-vkapp = get_session_vk_api(session['VK_LOGIN_VALSTAN'], session['VK_PASSWORD_VALSTAN'])
-new_posts = get_msg(vkapp, -43215063, 0, 20)
+
+vkapp = get_session_vk_api(session['VK_TOKEN_VALSTAN'])
+new_posts = get_msg(vkapp, -158787639, 0, 20)
 # sample_clear = []
 # for sample in new_posts:
 #     template = clear_copy_history(vkapp, sample)
