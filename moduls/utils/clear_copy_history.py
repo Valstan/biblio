@@ -1,13 +1,10 @@
-from moduls.read_write.get_msg import get_msg
-
-
-def clear_copy_history(vkapp, msg):
+def clear_copy_history(msg):
     if 'copy_history' in msg:
-        msg = msg['copy_history'][0]
-        msgs = get_msg(vkapp, msg['owner_id'], 0, 30)
-        for i in msgs:
-            if i['id'] == msg['id']:
-                msg = i
-                break
+        new_msg = msg['copy_history'][0]
+        if 'likes' in msg:
+            new_msg['likes'] = msg['likes']
+        if 'views' in msg:
+            new_msg['views'] = msg['views']
+        msg = new_msg
 
     return msg
