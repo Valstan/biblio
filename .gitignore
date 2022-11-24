@@ -8,3 +8,4 @@
 /out/
 /logpass.json
 /config.py
+*.pyc
