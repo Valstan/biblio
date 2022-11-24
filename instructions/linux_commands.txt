@@ -1,0 +1,76 @@
+GPG
+gpg --full-gen-key
+nano ~/.gnupg/gpg.conf
+Вставить этот текст:
+keyid-format 0xlong
+throw-keyids
+no-emit-version
+no-comments
+Проверить какие ключи есть:
+gpg -k
+gpg -K
+Что-нибудь зашифровать:
+gpg -e -a -r valstan@valstan.rufile.txt
+Расшифровать:
+gpg -d -o file.txt tile.txt.asc
+Экспорт ключей:
+gpg --export -a valstan@valstan.ru >public_key_valstan.gpg
+gpg --export-secret-key -a valstan@valstan.ru >secret_key_valstan.gpg
+gpg --import 
+WSL2
+Чтобы проверить, какие дистрибутивы запущены в данный момент, выполните команду:
+wsl --list -v
+Чтобы выключить сразу все запущенные Linux выполните команду:
+wsl --shutdown
+Вы можете остановить не все системы, а определённые, для этого используйте команду вида:
+wsl -t ДИСТРИБУТИВ
+
+Для создания виртуального окружения, перейдите в директорию своего проекта и выполните:
+Устанавливаем программу в систему
+sudo apt install python3-venv
+устанавливаем Венв в папку Венв директории проекта
+python3 -m venv venv
+На практике, для автоматической активации перед запуском скрипта, создают скрипт-обертку на bash:
+#!/usr/bin/env bash
+source $BASEDIR/venv/bin/activate
+python $BASEDIR/my_app.py
+Теперь можно установить права на исполнение и запустить нашу обертку:
+chmod +x myapp/run.sh ./myapp/run.sh
+Активация виртуальной среды
+source venv/bin/activate
+deactivate
+
+Установкавсехмодулей Python изодногофайла requirements
+pip3 install -r requirements.txt
+для venv:
+pip install -r requirements.txt
+
+TMUX
+nano ~/.tmux.conf
+---------
+set-option -g prefix C-q
+set -g mouse on
+---------------
+tmux new-session -s valstan
+tmux attach -t valstan
+
+https://losst.pro/shpargalka-po-tmux
+Ctrl+b c - создать новое окно;
+Ctrl+b w - выбрать окно из списка;
+Ctrl+b 0-9 - открыть окно по его номеру;
+Ctrl+b , - переименовать текущее окно;
+Ctrl+b % - разделить текущую панель по горизонтали;
+Ctrl+b " - разделить текущую панель по вертикали;
+Ctrl+b стрелка - перейти на панель, находящуюся в стороне, куда указывает стрелка;
+Ctrl+bCtrl+стрелка - изменить размер текущей панели;
+Ctrl+b o - перейти на следующую панель;
+Ctrl+b ; - переключаться между текущей и предыдущей панелью;
+Ctrl+b x - закрыть текущую панель;
+Ctrl+b[ - войти в режим копирования (подробнее ниже);
+Ctrl+b ] - вставить из внутреннего буфера обмена tmux;
+Ctrl+b d - отключится от текущей сессии;
+Ctrl+b : - открыть командную строку.
+ 
+SSH
+Подключиться к серверу APInagrada
+ssh valstan@ovz6.id45d.m61kn.vps.myjino.ru -p 49417
