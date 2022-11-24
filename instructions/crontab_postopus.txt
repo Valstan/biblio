@@ -1,19 +1,19 @@
-# dran
-5 9-16 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py dran_reklama
-10 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py dran_novost
-15 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py dran_addons
-
 # mi
 18 9,13 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_reklama
-20 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_novost
-30 9-16 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_reklama
+20 9-16 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_reklama
+25 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_novosti
+28 5-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_valstan
+
+30 7,11,15,18 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_sosed
+30 6,12,17,20,22 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_addons
+30 21 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_krugozor
+30 19 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_aprel
 33 5-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_valstan
 
-35 7,11,15,18 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_sosed
-40 6,12,17,20,22 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_addons
-40 21 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_krugozor
-40 19 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_aprel
-43 5-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_valstan
+35 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_novost
+38 5-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_valstan
 
-45 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_novosti
-48 5-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py mi_repost_valstan
+# dran
+40 9-16 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py dran_reklama
+45 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py dran_novost
+50 6-23 * * * cd /home/valstan/postopus && /usr/bin/python3 start.py dran_addons
