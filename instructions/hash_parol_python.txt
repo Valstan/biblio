@@ -1,0 +1,21 @@
+Сгенерировать уникальный ID:
+from uuid6 import uuid7
+token = str(uuid7())
+print(token)
+
+Сгенерировать токен:
+import secrets
+>>>token_urlsafe(16)  
+'Drmhze6EPcv0fN_81Bj-nA'
+
+Сравнитьдва хеша токена:
+>>> import secrets, hashlib
+# Вводимый пользователем пароль
+>>>input = 'passwd_secret'
+# Хеш пароля из базы данных 
+>>>pwd_db = '95abda4e8f18a3c4e75214f0bc10e0a7968d5f22e42d127294c2af458eae537f'
+# получаем хеш вводимого пароля (конечно к нему должна подмешиваться 'соль')
+>>>pwd_input = hashlib.sha256(input.encode()).hexdigest()
+# И проводим безопасное сравнение с эталоном их базы
+>>>secrets.compare_digest(pwd_db, pwd_input)
+# True

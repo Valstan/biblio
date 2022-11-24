@@ -1,0 +1,176 @@
+Чек-код установки нового сервера на БубунтеСервер.docx
+Логинимся под рутом.
+adduser valstan
+usermod -aG sudo valstan
+apt -y update
+apt -y upgrade
+apt -y install mc ufw nano git tmux htop
+
+На Дебиане нужно еще настроить часовой пояс:
+sudo dpkg-reconfigure locales
+timedatectl list-timezones | grep Moscow
+sudo timedatectl set-timezone Europe/Moscow
+timedatectl
+sudo apt-get install ntp -y
+date
+
+Отключить логиниться по SSH под Рутом:
+sudo nano /etc/ssh/sshd_config
+PermitRootLogin no
+sudo service ssh restart
+установить брандмауэр. Это программное обеспечение, которое блокирует доступ к серверу на порты, которые не разрешены явно:
+sudo ufw allow ssh
+sudo ufw allow http
+sudo ufw allow 443/tcp
+sudo ufw --force enable
+sudo ufw status
+Эти команды устанавливают UFW, простенький брандмауэр и настраивают его на разрешение только внешнего трафика на портах 22 (SSH), 80 (http) и 443 (HTTPS). Любые другие порты будут закрыты.
+ 
+Можно настроить подключение через SSH не через логин-пароль а с помощью ключей:
+
+Создаем свои ключи шифрования (если есть старые, то используем старые):
+ssh-keygen
+Копируем публичный ключ на сервер (это все в одну строчку, одна команда):
+cat ~/.ssh/id_rsa.pub | ssh -p 49356 valstan@ovz8.id45d.mzlgn.vps.myjino.ru "mkdir -p ~/.ssh && touch ~/.ssh/authorized_keys && chmod -R go= ~/.ssh && cat >> ~/.ssh/authorized_keys"
+Вход на сервер:
+ssh -p 49356 valstan@ovz8.id45d.mzlgn.vps.myjino.ru
+
+
+
+Установка Nginx
+sudo apt -y update
+sudo apt -y installnginx
+ 
+При установке Nginx он сам добавиться в файервол ufw, но если он был установлен до файервола, то надо ему рассказать об этом в файле:
+sudo nano /etc/ufw/applications.d/nginx
+добавить вот этот текст:
+[Nginx HTTP] title=Web Server (Nginx, HTTP) description=Small, but very powerful and efficient web server ports=80/tcp
+[Nginx HTTPS] title=Web Server (Nginx, HTTPS) description=Small, but very powerful and efficient web server ports=443/tcp
+[Nginx Full] title=Web Server (Nginx, HTTP + HTTPS) description=Small, but very powerful and efficient web server ports=80,443/tcp
+Указать файерволу:
+sudo ufw app update Nginx
+Проверим список приложений в брандмауэре:
+sudo ufw app list
+Должно быть:
+Available applications:
+Nginx Full
+Nginx HTTP
+Nginx HTTPS
+OpenSSH
+Для начала откроем порты для HTTP:
+sudo ufw allow 'Nginx HTTP'
+Проверяем:
+sudo ufw status
+Должно выдать типа этого:
+Status: active
+To                         Action      From
+--                         ------      ----
+OpenSSH                    ALLOW       Anywhere
+Nginx HTTP                 ALLOW       Anywhere
+OpenSSH (v6)               ALLOW       Anywhere (v6)
+Nginx HTTP (v6)            ALLOW       Anywhere (v6)
+Проверяем что сервер запущен:
+Systemctl status nginx
+(КАК ВЫЙТИ ИЗ VIM
+Нажмите клавишу Esc, т.е. выйти из режима вставки. Далее можете вести:
+:q - двоеточие - это тоже часть команды, она просто закроет редактор;)
+Теперь переходим в браузер по адресу нашего вебсервера и вы должны увидеть надпись:
+Welcometonginx!
+Значит все работает!
+Чтобы остановить веб-сервер, введите следующее:
+sudo systemctl stop nginx
+Чтобы запустить веб-сервер, когда он остановлен, введите следующее:
+sudo systemctl start nginx
+Чтобы остановить, а затем снова запустить службу, введите следующее:
+sudo systemctl restart nginx
+Если вы просто вносите изменения в конфигурацию, вы часто можете перезагрузить Nginx без разрыва соединений вместо его перезапуска. Для этого введите следующее:
+sudo systemctl reload nginx
+Отрубить автозапуск при загрузке системы:
+sudo systemctl disable nginx
+Включить автозапуск:
+sudo systemctl enable nginx
+Еще настройки сервера:
+https://www.digitalocean.com/community/tutorials/how-to-install-nginx-on-ubuntu-18-04
+https://www.digitalocean.com/community/tutorials/how-to-serve-flask-applications-with-gunicorn-and-nginx-on-ubuntu-20-04-ru
+ 
+Теперь настройка Питона:
+https://www.digitalocean.com/community/tutorials/how-to-serve-flask-applications-with-gunicorn-and-nginx-on-ubuntu-18-04-ru
+sudo apt -y update
+sudo apt -y install python3-pip python3-dev build-essential libssl-dev libffi-dev python3-setuptools python3-venv
+cd /home/valstan
+git clone https://github.com/Valstan/nagradapi.git
+cd /home/valstan/nagradapi
+Заполнить конфигурационный файл которого нет в Гите:
+nano config.py
+Создаем виртуальное окружение с Питоном
+python3 -m venv venv
+Активируем виртуалку:
+source venv/bin/activate
+pip install wheel
+pip install -r requirements.txt
+
+pip==22.3
+requests==2.28.1
+setuptools==65.5.0
+pymongo==4.3.2
+dnspython==2.2.1
+gunicorn==20.1.0
+Flask==2.2.2
+Flask-RESTful==0.3.9
+ 
+sudo ufw allow 5000
+sudo nano /etc/systemd/system/nagrada-api.service
+ 
+[Unit]
+ 
+Description=Gunicorn instance to serve nagrada-api
+After=network.target
+ 
+[Service]
+User=valstan
+Group=www-data
+WorkingDirectory=/home/valstan/NagradaMongoAPI
+Environment="PATH=/home/valstan/NagradaMongoAPI/venv/bin"
+ExecStart=/home/valstan/NagradaMongoAPI/venv/bin/gunicorn --workers 3 --bind unix:nagrada-api.sock -m 007 wsgi:app
+ 
+[Install]
+WantedBy=multi-user.target
+ 
+Теперь добавим в автозапуск и запустим службу
+sudo systemctl start nagrada-api
+sudo systemctl enable nagrada-api
+ 
+Проверить состояние
+sudo systemctl status nagrada-api
+ТеперьнастроимNGINX
+sudo nano /etc/nginx/sites-available/nagrada-api
+вставим в него этот текст:
+server {
+listen 80;
+server_name ovz6.id45d.m61kn.vps.myjino.ru www.ovz6.id45d.m61kn.vps.myjino.ru;
+
+    location / {
+        include proxy_params;
+proxy_pass http://unix:/home/valstan/NagradaMongoAPI/nagrada-api.sock;
+}
+}
+Чтобы активировать созданную конфигурацию серверных блоков Nginx, необходимо привязать файл к каталогу sites-enabled:
+
+sudo ln -s /etc/nginx/sites-available/nagrada-api /etc/nginx/sites-enabled
+Когда файл будет находиться в этом каталоге, можно провести проверку на ошибки синтаксиса:
+sudonginx -t
+Если ошибок обнаружено не будет, перезапустите процесс Nginx для чтения новой конфигурации:
+
+sudo systemctl restart nginx
+В заключение снова изменим настройки брандмауэра. Нам больше не потребуется доступ через порт 5000, и мы можем удалить это правило. Затем мы сможем разрешить полный доступ к серверу Nginx:
+sudo ufw delete allow 5000
+sudo ufw allow 'NginxFull'
+Теперь у вас должна быть возможность открыть доменное имя вашего сервера в браузере:
+http://ovz6.id45d.m61kn.vps.myjino.ru
+
+Теперьсертификат:
+
+sudo apt -y install python3-certbot-nginx
+sudo certbot --nginx -d ovz6.id45d.m61kn.vps.myjino.ru -d www.ovz6.id45d.m61kn.vps.myjino.ru
+
+
