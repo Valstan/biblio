@@ -1,0 +1,8 @@
+# Зависимости audio-to-text. torch ставится отдельно в install.ps1
+# (CPU-сборка через индекс PyTorch), чтобы не тянуть CUDA.
+gigaam
+soundfile
+imageio-ffmpeg
+# tkinterdnd2 — опционально, включает drag-and-drop файла в окно.
+# Если установка падает на этой строке — закомментируйте, GUI работает и без неё.
+tkinterdnd2
