@@ -1,6 +1,6 @@
 import pywhatkit as pwt
 
-phone_number = "+79960452043"
+phone_number = "+7XXXXXXXXXX"  # укажите номер получателя
 msg = "Исчо тест"
 hour = 13
 minute = 9

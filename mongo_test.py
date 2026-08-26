@@ -1,6 +1,6 @@
 from pymongo import MongoClient
 
-client = MongoClient("mongodb+srv://valstan:nitro2000@postopus.qjxr9.mongodb.net/postopus?retryWrites=true&w=majority")
+client = MongoClient("mongodb+srv://<user>:<password>@<cluster>.mongodb.net/postopus?retryWrites=true&w=majority")  # секрет удалён из публичного репо — задать реальную строку через переменную окружения
 
 db = client["postopus"]
 

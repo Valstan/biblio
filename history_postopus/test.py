@@ -37,7 +37,7 @@ print(name_session)'''
 
 '''from vk_api import VkApi
 
-vk_session = VkApi('79229005910', 'Tutmos@1941')
+vk_session = VkApi('<vk-login>', '<vk-password>')
 vk_session.auth()
 vk_app = vk_session.get_api()
 

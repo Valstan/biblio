@@ -11,3 +11,11 @@
 *.pyc
 /example.txt
 /pribil.txt
+
+# Личные данные и инфра-детали — не трекать (аудит 2026-08-26, D-038)
+/pywhatkit_dbs.txt
+/history_postopus/config.json
+/history_postopus/crontab.txt
+/instructions/linux_commands.txt
+/instructions/install_new_server.txt
+/instructions/crontab_postopus.txt
