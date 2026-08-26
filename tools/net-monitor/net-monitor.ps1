@@ -1,17 +1,21 @@
-﻿# net-monitor.ps1 — трей-монитор сети для Windows 11 (brain_matrica tools, 2026-08-26)
+﻿# net-monitor.ps1 — трей-монитор сети для Windows 11 (biblio/tools, 2026-08-26)
 #
-# Значок в трее: зелёный = интернет есть, оранжевый = частично (IP-связь есть, DNS не
-# отвечает — или наоборот), красный = интернета нет. Синее кольцо = активен VPN.
-# Тултип: скорость приёма/отдачи, VPN, текущий DNS.
-# Меню: статус сети · «через что идёт сайт X» · тест DNS-серверов с применением лучшего ·
-# авто-тест DNS раз в час · автозапуск · лог.
+# Значок в трее: зелёный = всё работает, оранжевый = частично (нет DNS / лёг туннель /
+# не отвечает канал до Anthropic), красный = связи нет. Синее кольцо = активен VPN,
+# красное кольцо = авария выхода (сменилась страна или трафик пошёл мимо туннеля).
+# Тултип: скорость, VPN, DNS, состояние канала Claude Code.
+# Меню: статус сети · канал Claude Code · «через что идёт сайт X» · тест DNS ·
+# автовосстановление интернета · автозапуск · лог.
 #
 # Запуск: Запустить.cmd (или powershell -sta -ep bypass -file net-monitor.ps1)
-# Диагностика без GUI: powershell -ep bypass -file net-monitor.ps1 -Once
+# Диагностика без GUI:  powershell -ep bypass -file net-monitor.ps1 -Once
+# Проверка логики восстановления, без изменений в системе: ... -SelfTest
 #
-# Смена DNS требует прав администратора — пункт меню «Перезапустить от администратора».
+# Смена DNS и восстановление требуют прав администратора — пункт меню
+# «Перезапустить от администратора».
 param(
-    [switch]$Once   # разовый прогон проверок в консоль, без трея
+    [switch]$Once,     # разовый прогон проверок в консоль, без трея
+    [switch]$SelfTest  # печатает, какие шаги были бы выбраны; ничего не меняет
 )
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -52,8 +56,26 @@ function Write-Log([string]$msg) {
 }
 
 function Load-Config {
-    if (Test-Path $ConfFile) { try { return Get-Content $ConfFile -Raw | ConvertFrom-Json } catch {} }
-    [pscustomobject]@{ autoDns = $false }
+    # Умолчания намеренно безопасные: мониторинг работает сразу, а всё, что меняет
+    # систему, владелец включает сам.
+    $def = [ordered]@{
+        autoDns             = $false
+        autoRecover         = $false   # лестница восстановления
+        allowVpnRestart     = $false   # ступень «перезапустить службу VPN»
+        allowAdapterRestart = $false   # ступень «перезапустить сетевой адаптер»
+        graceSec            = 10       # сколько ждать, вдруг вернётся само
+        expectedCountry     = 'DE'     # ожидаемая страна выхода
+    }
+    $cfg = [pscustomobject]$def
+    if (Test-Path $ConfFile) {
+        try {
+            $saved = Get-Content $ConfFile -Raw | ConvertFrom-Json
+            foreach ($k in $def.Keys) {
+                if ($null -ne $saved.$k) { $cfg.$k = $saved.$k }
+            }
+        } catch {}
+    }
+    $cfg
 }
 function Save-Config($cfg) { try { $cfg | ConvertTo-Json | Set-Content $ConfFile -Encoding UTF8 } catch {} }
 
@@ -62,23 +84,17 @@ function Test-IsAdmin {
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+# ---------------- модули ----------------
+# probe.ps1  — индикаторы состояния (только читает: Test-TcpPort, Get-DefaultRouteInfo,
+#              Test-Link, Get-TunnelState, Test-ClaudeChannel, Test-Egress, Get-FullHealth)
+# recovery.ps1 — лестница восстановления, снапшот и откат (всё, что меняет систему)
+foreach ($m in @('probe.ps1','recovery.ps1')) {
+    $p = Join-Path $PSScriptRoot "lib\$m"
+    if (-not (Test-Path $p)) { throw "Не найден модуль lib\$m рядом со скриптом ($PSScriptRoot)." }
+    . $p
+}
+
 # ---------------- сетевые проверки ----------------
-
-function Test-TcpPort([string]$target, [int]$port = 443, [int]$timeoutMs = 1500) {
-    $c = New-Object System.Net.Sockets.TcpClient
-    try {
-        $iar = $c.BeginConnect($target, $port, $null, $null)
-        if ($iar.AsyncWaitHandle.WaitOne($timeoutMs) -and $c.Connected) { return $true }
-        return $false
-    } catch { return $false } finally { $c.Close() }
-}
-
-function Get-DefaultRouteInfo {
-    # интерфейс с маршрутом по умолчанию (минимальная метрика)
-    $r = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |
-         Sort-Object -Property { $_.RouteMetric + $_.InterfaceMetric } | Select-Object -First 1
-    if ($r) { [pscustomobject]@{ IfIndex = $r.InterfaceIndex; Alias = $r.InterfaceAlias } }
-}
 
 function Get-VpnState {
     # 1) штатные VPN-подключения Windows
@@ -119,21 +135,19 @@ function Get-NetSnapshot {
     [pscustomobject]@{ Rx = $rx; Tx = $tx; At = (Get-Date) }
 }
 
-function Test-Internet {
-    $ipOk = $false
-    foreach ($a in $IpAnchors) { if (Test-TcpPort $a 443 1500) { $ipOk = $true; break } }
-    $dnsOk = $false
-    try {
-        $ans = Resolve-DnsName -Name $HostAnchor -Type A -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -First 1
-        if ($ans -and (Test-TcpPort $ans.IPAddress 443 1500)) { $dnsOk = $true }
-    } catch {}
-    [pscustomobject]@{ IpOk = $ipOk; DnsOk = $dnsOk }
-}
+function Test-Internet { Test-Link -IpAnchors $IpAnchors -HostAnchor $HostAnchor }
 
 function Format-Speed([double]$bps) {
     if ($bps -ge 1MB) { '{0:0.0} МБ/с' -f ($bps/1MB) }
     elseif ($bps -ge 1KB) { '{0:0} КБ/с' -f ($bps/1KB) }
     else { '{0:0} Б/с' -f $bps }
+}
+
+function Format-Bytes([double]$b) {
+    if ($b -ge 1GB) { '{0:0.00} ГБ' -f ($b/1GB) }
+    elseif ($b -ge 1MB) { '{0:0.0} МБ' -f ($b/1MB) }
+    elseif ($b -ge 1KB) { '{0:0} КБ' -f ($b/1KB) }
+    else { '{0:0} Б' -f $b }
 }
 
 function Resolve-FirstIPv4([string]$name) {
@@ -185,9 +199,20 @@ function Invoke-DnsBench {
     $rows
 }
 
+function Get-DnsTargetInterface {
+    # Куда писать DNS. НЕ «интерфейс маршрута по умолчанию»: при активном VPN это сам
+    # туннель, чьи настройки принадлежат VPN-клиенту — он их перезапишет при следующем
+    # переподключении, а сброс на DHCP там способен оборвать резолв до реконнекта.
+    # Настройка имеет смысл только на физическом адаптере.
+    $phys = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
+            Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+    if ($phys) { return [pscustomobject]@{ IfIndex = $phys.ifIndex; Alias = $phys.Name } }
+    Get-DefaultRouteInfo
+}
+
 function Apply-Dns([string[]]$servers) {
-    $def = Get-DefaultRouteInfo
-    if (-not $def) { return 'Не найден интерфейс с маршрутом по умолчанию.' }
+    $def = Get-DnsTargetInterface
+    if (-not $def) { return 'Не найден сетевой адаптер для настройки DNS.' }
     if (Test-IsAdmin) {
         try {
             Set-DnsClientServerAddress -InterfaceIndex $def.IfIndex -ServerAddresses $servers -ErrorAction Stop
@@ -208,8 +233,8 @@ function Apply-Dns([string[]]$servers) {
 }
 
 function Reset-DnsToDhcp {
-    $def = Get-DefaultRouteInfo
-    if (-not $def) { return 'Не найден интерфейс с маршрутом по умолчанию.' }
+    $def = Get-DnsTargetInterface
+    if (-not $def) { return 'Не найден сетевой адаптер для настройки DNS.' }
     if (Test-IsAdmin) {
         try { Set-DnsClientServerAddress -InterfaceIndex $def.IfIndex -ResetServerAddresses -ErrorAction Stop; return 'DNS возвращён на автомат (DHCP).' }
         catch { return "Ошибка: $_" }
@@ -242,6 +267,27 @@ function Get-StatusReport {
     }
     [void]$sb.AppendLine("DNS сейчас: " + $(if ($dns) { $dns -join ', ' } else { 'не задан / DHCP не выдал' }))
     [void]$sb.AppendLine('')
+
+    # --- канал Claude Code и выходная точка ---
+    $tun = Get-TunnelState
+    [void]$sb.AppendLine('--- канал Claude Code ---')
+    $cc = Test-ClaudeChannel
+    [void]$sb.AppendLine("Связь с Anthropic: " + $(if ($cc.Ok) { "ЕСТЬ ($($cc.Reason), $($cc.Ms) мс)" } else { "НЕТ — $($cc.Reason)" }))
+    [void]$sb.AppendLine("Путь Claude Code: " + $(if ($cc.Via) { $cc.Via } else { 'напрямую, без прокси' }))
+    if ($tun.AdapterUp) {
+        [void]$sb.AppendLine("Туннель: $($tun.AdapterName) — " + $(if ($tun.ViaTunnel) { 'трафик идёт через него' } else { 'поднят, но трафик идёт мимо' }))
+        if ($tun.Upstream) { [void]$sb.AppendLine("Узлы VPN: " + ($tun.Upstream -join ', ')) }
+    } else {
+        [void]$sb.AppendLine('Туннель: не поднят')
+    }
+    $eg = Test-Egress
+    [void]$sb.AppendLine("Выход в интернет: " + $eg.Reason)
+    $st = Get-XrayStats
+    if ($st) {
+        [void]$sb.AppendLine(("Всего через прокси: Claude Code {0}, туннель {1}, мимо туннеля {2}" -f
+            (Format-Bytes ($st.HttpIn + $st.HttpOut)), (Format-Bytes ($st.ProxyIn + $st.ProxyOut)), (Format-Bytes ($st.DirectIn + $st.DirectOut))))
+    }
+    [void]$sb.AppendLine('')
     [void]$sb.AppendLine('Интерфейсы (Up):')
     foreach ($i in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
              Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' }) {
@@ -254,15 +300,90 @@ function Get-StatusReport {
 # ---------------- режим -Once (диагностика в консоль) ----------------
 if ($Once) {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
-    $s1 = Get-NetSnapshot; Start-Sleep -Seconds 2; $s2 = Get-NetSnapshot
+    $cfgOnce = Load-Config
+    Set-ExpectedCountry $cfgOnce.expectedCountry
+    $s1 = Get-NetSnapshot; $x1 = Get-XrayStats
+    Start-Sleep -Seconds 2
+    $s2 = Get-NetSnapshot; $x2 = Get-XrayStats
     $dt = ($s2.At - $s1.At).TotalSeconds
     Write-Host (Get-StatusReport)
     Write-Host ("Скорость за 2 с:  ↓ {0}   ↑ {1}" -f (Format-Speed (($s2.Rx-$s1.Rx)/$dt)), (Format-Speed (($s2.Tx-$s1.Tx)/$dt)))
+    $fl = Get-FlowDelta $x1 $x2
+    if ($fl) {
+        Write-Host ("За те же 2 с:  Claude Code {0}, туннель {1}, мимо туннеля {2}" -f
+            (Format-Bytes $fl.ClaudeBytes), (Format-Bytes $fl.TunnelBytes), (Format-Bytes $fl.DirectBytes))
+    }
+    exit 0
+}
+
+# ---------------- режим -SelfTest (проверка логики, без изменений) ----------------
+if ($SelfTest) {
+    try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
+    $cfgT = Load-Config
+    Set-ExpectedCountry $cfgT.expectedCountry
+    Write-Host '=== Самопроверка net-monitor (ничего не меняется) ==='
+    Write-Host ("Права администратора: {0}" -f $(if (Test-IsAdmin) { 'есть' } else { 'НЕТ — шаги восстановления будут пропускаться' }))
+    Write-Host ("Автовосстановление: {0} · перезапуск VPN: {1} · перезапуск адаптера: {2} · пауза: {3} с · ожидаемая страна: {4}" -f
+        $(if ($cfgT.autoRecover) { 'включено' } else { 'выключено' }),
+        $(if ($cfgT.allowVpnRestart) { 'разрешён' } else { 'запрещён' }),
+        $(if ($cfgT.allowAdapterRestart) { 'разрешён' } else { 'запрещён' }),
+        $cfgT.graceSec, $cfgT.expectedCountry)
+
+    Write-Host "`n--- какие шаги были бы выбраны для каждого класса поломки ---"
+    foreach ($c in @('no-link','dns-down','tunnel-down','claude-down','egress-changed','leak')) {
+        $plan = Get-RecoveryPlan $c ([bool]$cfgT.allowVpnRestart) ([bool]$cfgT.allowAdapterRestart)
+        Write-Host ("  {0,-15} → {1}" -f $c, $(if ($plan.Count) { $plan -join ' → ' } else { '(нет разрешённых действий — зову владельца)' }))
+    }
+
+    Write-Host "`n--- запреты, которые нельзя снять настройкой ---"
+    foreach ($f in @('metric-favor-physical','ipv6-enable','winsock-reset','ip-reset','restart-tunnel-adapter','vpn-switch-server','vpn-edit-config')) {
+        try { Assert-Forbidden $f; Write-Host "  ПЛОХО: $f не заблокирован" }
+        catch { Write-Host "  заблокировано: $f" }
+    }
+
+    # Проверка стоп-листа сама по себе мало что доказывает: она подтверждает лишь, что в
+    # списке есть строки. Поэтому каждая ступень вызывается по-настоящему — без прав
+    # администратора любая из них обязана остановиться на своём предусловии и НИЧЕГО не
+    # сделать. Так ловятся ошибки в самих проверках, а не только в списке.
+    Write-Host "`n--- сухой прогон ступеней: на чём каждая останавливается ---"
+    if (Test-IsAdmin) {
+        Write-Host '  ПРОПУСК: запущено от администратора — сухой прогон изменил бы настройки.'
+        Write-Host '  Для этой проверки запустите самопроверку БЕЗ прав администратора.'
+    } else {
+        foreach ($s in @('flush-dns','restore-dns','physical-dns','restart-vpn','restart-physical')) {
+            try {
+                $e = Invoke-RecoveryStep $s $null
+                Write-Host ("  {0,-17} → {1}" -f $s, $(if ($e) { $e.Result } else { '(без записи в журнал)' }))
+            } catch {
+                Write-Host ("  {0,-17} → ИСКЛЮЧЕНИЕ: {1}" -f $s, $_.Exception.Message)
+            }
+        }
+    }
+
+    Write-Host "`n--- текущее состояние ---"
+    $h = Get-FullHealth
+    Write-Host ("  вердикт: [{0}] {1}" -f $h.Verdict.Class, $h.Verdict.Text)
+    Write-Host ("  связь: IP={0} DNS={1} · туннель: {2} · Anthropic: {3} · выход: {4}" -f
+        $h.Link.IpOk, $h.Link.DnsOk, $h.Tunnel.Ok, $h.Claude.Ok, $(if ($h.Egress) { "$($h.Egress.Ip) $($h.Egress.Country)" } else { 'не проверялся' }))
+
+    Write-Host "`n--- снапшот и его применимость ---"
+    $sn = New-NetSnapshot
+    Write-Host ("  отпечаток сети: шлюз {0} / {1}" -f $sn.Fingerprint.GatewayIp, $sn.Fingerprint.GatewayMac)
+    Write-Host ("  применим к текущей сети: {0}" -f (Test-SnapshotApplicable $sn))
     exit 0
 }
 
 # ---------------- GUI (трей) ----------------
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing, Microsoft.VisualBasic
+
+# DestroyIcon нужен, чтобы освобождать HICON после Icon.FromHandle — сам .NET его не
+# освобождает, а значок в трее перерисовывается многократно за сутки работы.
+if (-not ('NetMonitorNative' -as [type])) {
+    Add-Type -Namespace '' -Name 'NetMonitorNative' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+public static extern bool DestroyIcon(System.IntPtr handle);
+'@
+}
 
 # один экземпляр
 $mutex = New-Object System.Threading.Mutex($false, "Global\$AppName")
@@ -273,8 +394,9 @@ if (-not $mutex.WaitOne(0, $false)) {
 
 $cfg = Load-Config
 
-function New-TrayIcon([string]$state, [bool]$vpn) {
-    # state: green|orange|red|gray
+function New-TrayIcon([string]$state, [bool]$vpn, [bool]$egressAlarm = $false) {
+    # state: green|orange|red|gray. Кольцо: синее = VPN активен,
+    # красное = авария выхода (сменилась страна или трафик пошёл мимо туннеля).
     $bmp = New-Object System.Drawing.Bitmap 16, 16
     $g = [System.Drawing.Graphics]::FromImage($bmp)
     $g.SmoothingMode = 'AntiAlias'
@@ -286,14 +408,26 @@ function New-TrayIcon([string]$state, [bool]$vpn) {
     }
     $brush = New-Object System.Drawing.SolidBrush $color
     $g.FillEllipse($brush, 2, 2, 12, 12)
-    if ($vpn) {
+    if ($egressAlarm) {
+        $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(255, 0, 0)), 2
+        $g.DrawEllipse($pen, 1, 1, 14, 14)
+        $pen.Dispose()
+    } elseif ($vpn) {
         $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(0, 120, 255)), 2
         $g.DrawEllipse($pen, 1, 1, 14, 14)
         $pen.Dispose()
     }
     $brush.Dispose(); $g.Dispose()
     $h = $bmp.GetHicon()
-    [System.Drawing.Icon]::FromHandle($h)
+    $icon = [System.Drawing.Icon]::FromHandle($h)
+    # Icon.FromHandle не владеет хэндлом, поэтому копируем иконку и сразу освобождаем
+    # и HICON, и bitmap: значок меняется часто, и утечка на каждой смене накапливалась бы
+    # в процессе, который живёт сутками.
+    $copy = $icon.Clone()
+    $icon.Dispose()
+    [void][NetMonitorNative]::DestroyIcon($h)
+    $bmp.Dispose()
+    $copy
 }
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
@@ -304,12 +438,32 @@ $notify.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 $miStatus  = $menu.Items.Add('Статус сети…')
+$miClaude  = $menu.Items.Add('Канал Claude Code…')
 $miSite    = $menu.Items.Add('Через что идёт сайт…')
 $miBench   = $menu.Items.Add('Тест DNS-серверов…')
 $miAuto    = New-Object System.Windows.Forms.ToolStripMenuItem('Авто-тест DNS раз в час + ставить лучший')
 $miAuto.CheckOnClick = $true
 $miAuto.Checked = [bool]$cfg.autoDns
 [void]$menu.Items.Add($miAuto)
+$menu.Items.Add('-') | Out-Null
+
+# --- автовосстановление интернета ---
+$miRec = New-Object System.Windows.Forms.ToolStripMenuItem('Восстанавливать интернет автоматически')
+$miRec.CheckOnClick = $true
+$miRec.Checked = [bool]$cfg.autoRecover
+[void]$menu.Items.Add($miRec)
+
+$miRecSub = New-Object System.Windows.Forms.ToolStripMenuItem('…что при этом разрешено')
+$miRecVpn = New-Object System.Windows.Forms.ToolStripMenuItem('Перезапускать службу VPN (рвёт соединения!)')
+$miRecVpn.CheckOnClick = $true
+$miRecVpn.Checked = [bool]$cfg.allowVpnRestart
+$miRecNic = New-Object System.Windows.Forms.ToolStripMenuItem('Перезапускать сетевой адаптер (рвёт всё!)')
+$miRecNic.CheckOnClick = $true
+$miRecNic.Checked = [bool]$cfg.allowAdapterRestart
+$miRecCountry = New-Object System.Windows.Forms.ToolStripMenuItem("Ожидаемая страна выхода: $($cfg.expectedCountry)…")
+[void]$miRecSub.DropDownItems.AddRange(@($miRecVpn, $miRecNic, $miRecCountry))
+[void]$menu.Items.Add($miRecSub)
+$miRecNow = $menu.Items.Add('Починить сейчас (разово)…')
 $menu.Items.Add('-') | Out-Null
 $miRun     = New-Object System.Windows.Forms.ToolStripMenuItem('Автозапуск при входе в Windows')
 $miRun.CheckOnClick = $true
@@ -323,9 +477,24 @@ $miExit    = $menu.Items.Add('Выход')
 $notify.ContextMenuStrip = $menu
 
 # ---- состояние ----
+Set-ExpectedCountry $cfg.expectedCountry
 $script:prev = Get-NetSnapshot
+$script:prevStats = Get-XrayStats
 $script:lastState = ''
 $script:lastInetOk = $null
+$script:lastClaudeOk = $null
+$script:claudeAt = [datetime]::MinValue   # канал проверяем не каждые 5 с, а раз в минуту
+$script:claude = $null
+$script:egressAt = [datetime]::MinValue   # страну — раз в 5 минут
+$script:egress = $null
+$script:healthyStreak = 0                 # подряд здоровых тиков — для снятия снапшота
+$script:badStreak = 0                     # подряд больных — порог запуска восстановления
+$script:goldSnapshot = $null
+$script:recovery = $null                  # состояние идущего восстановления (автомат)
+$script:recoveryFails = 0                 # неудачных попыток подряд
+$script:recoveryCooldownUntil = [datetime]::MinValue
+$script:lastVerdict = $null
+$script:ownerAlerted = ''
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 5000
@@ -342,30 +511,170 @@ $timer.Add_Tick({
 
         $inet = Test-Internet
         $vpn  = Get-VpnState
-        $state = if ($inet.IpOk -and $inet.DnsOk) { 'green' } elseif ($inet.IpOk -or $inet.DnsOk) { 'orange' } else { 'red' }
+        $tun  = Get-TunnelState
 
-        $key = "$state|$($vpn.Active)"
+        # Счётчики xray: показывают, идут ли токены Claude Code и не течёт ли трафик
+        # мимо туннеля. Локально и мгновенно, без внешних запросов.
+        $stats = Get-XrayStats
+        $flow  = Get-FlowDelta $script:prevStats $stats
+        if ($stats) { $script:prevStats = $stats }
+
+        # Канал до Anthropic — раз в минуту (или сразу, если связь только что упала).
+        $needClaude = ((Get-Date) - $script:claudeAt).TotalSeconds -ge 60 -or $null -eq $script:claude
+        if ($needClaude -and $inet.IpOk) {
+            $script:claude = Test-ClaudeChannel
+            $script:claudeAt = Get-Date
+        } elseif (-not $inet.IpOk) {
+            $script:claude = [pscustomobject]@{ Ok = $false; Status = $null; Ms = 0; Via = $null; Reason = 'нет связи' }
+        }
+
+        # Страна выхода — раз в 5 минут; при живой связи.
+        if ($inet.Ok -and ((Get-Date) - $script:egressAt).TotalMinutes -ge 5) {
+            $script:egress = Test-Egress
+            $script:egressAt = Get-Date
+        }
+
+        $verdict = Get-HealthVerdict $inet $tun $script:claude $script:egress $flow
+        $script:lastVerdict = $verdict
+        $egressAlarm = ($verdict.Class -in @('egress-changed','leak'))
+
+        $state = switch ($verdict.Severity) {
+            'ok'      { 'green' }
+            'partial' { 'orange' }
+            'alarm'   { 'orange' }
+            default   { 'red' }
+        }
+
+        $key = "$state|$($vpn.Active)|$egressAlarm"
         if ($key -ne $script:lastState) {
             $old = $notify.Icon
-            $notify.Icon = New-TrayIcon $state $vpn.Active
+            $notify.Icon = New-TrayIcon $state $vpn.Active $egressAlarm
             if ($old) { $old.Dispose() }
             $script:lastState = $key
         }
 
-        $inetOk = ($state -eq 'green')
+        # --- уведомления о смене состояния ---
+        $inetOk = ($verdict.Severity -eq 'ok')
         if ($null -ne $script:lastInetOk -and $inetOk -ne $script:lastInetOk) {
-            if ($inetOk) { $notify.ShowBalloonTip(3000, 'Интернет восстановился', 'Якоря снова отвечают.', 'Info') }
-            else {
-                $why = if ($inet.IpOk) { 'IP-связь есть, DNS молчит' } elseif ($inet.DnsOk) { 'DNS жив, IP-якорь молчит' } else { 'не отвечает ничего' }
-                $notify.ShowBalloonTip(5000, 'Проблема с интернетом', $why, 'Warning')
-            }
-            Write-Log "смена состояния: inetOk=$inetOk"
+            if ($inetOk) { $notify.ShowBalloonTip(3000, 'Связь восстановилась', $verdict.Text, 'Info') }
+            else { $notify.ShowBalloonTip(5000, 'Проблема со связью', $verdict.Text, 'Warning') }
+            Write-Log "смена состояния: [$($verdict.Class)] $($verdict.Text)"
         }
         $script:lastInetOk = $inetOk
 
-        $dns = @(Get-CurrentDns) -join ','
-        $vtxt = if ($vpn.Active) { if ($vpn.DefaultVia) { 'VPN:весь' } else { 'VPN:часть' } } else { 'VPN:нет' }
-        $txt = "v {0}  ^ {1} | {2} | DNS {3}" -f (Format-Speed $down), (Format-Speed $up), $vtxt, $dns
+        # Канал Claude Code — отдельная новость: ради этого и затевался мониторинг.
+        $ccOk = [bool]($script:claude -and $script:claude.Ok)
+        if ($null -ne $script:lastClaudeOk -and $ccOk -ne $script:lastClaudeOk) {
+            if ($ccOk) { $notify.ShowBalloonTip(3000, 'Claude Code снова на связи', 'Канал до Anthropic отвечает.', 'Info') }
+            else { $notify.ShowBalloonTip(6000, 'Claude Code потерял связь', "Канал до Anthropic не отвечает: $($script:claude.Reason)", 'Warning') }
+            Write-Log "канал Claude: ok=$ccOk ($($script:claude.Reason))"
+        }
+        $script:lastClaudeOk = $ccOk
+
+        # Авария выхода: показываем один раз на каждое новое состояние, не каждые 5 с.
+        if ($egressAlarm -and $script:ownerAlerted -ne $verdict.Text) {
+            $notify.ShowBalloonTip(10000, 'ВНИМАНИЕ: выход в интернет изменился', $verdict.Text, 'Error')
+            Write-Log "АВАРИЯ ВЫХОДА: $($verdict.Text)"
+            $script:ownerAlerted = $verdict.Text
+        }
+        if (-not $egressAlarm) { $script:ownerAlerted = '' }
+
+        # --- снапшот «золотой» конфигурации: три здоровых тика подряд ---
+        if ($verdict.Severity -eq 'ok' -and $script:egress -and $script:egress.Verified -and $script:egress.Ok) {
+            $script:healthyStreak++
+            if ($script:healthyStreak -ge 3 -and
+                (-not $script:goldSnapshot -or ((Get-Date) - $script:goldSnapshot.At).TotalMinutes -ge 30)) {
+                $script:goldSnapshot = New-NetSnapshot
+                Write-Log "снят снапшот рабочей конфигурации (выход $($script:goldSnapshot.EgressIp)/$($script:goldSnapshot.Country))"
+            }
+        } else {
+            $script:healthyStreak = 0
+        }
+
+        # --- автовосстановление: по одному шагу за тик ---
+        #
+        # Лестница НЕ выполняется целиком внутри тика: её шаги и паузы занимают минуты,
+        # а тик идёт в потоке интерфейса — значок, меню и окна замерли бы ровно на то
+        # время, когда владелец на них смотрит. Поэтому здесь конечный автомат: каждый
+        # тик делает один шаг и возвращает управление.
+        $bad = ($verdict.Severity -in @('down','partial'))
+        if ($bad) { $script:badStreak++ } else { $script:badStreak = 0 }
+
+        if ($script:recovery) {
+            # --- идёт восстановление ---
+            $r = $script:recovery
+            if ($verdict.Severity -eq 'ok') {
+                $notify.ShowBalloonTip(5000, 'Связь восстановлена',
+                    $(if ($r.Steps.Count) { "Помогло: $($r.Steps -join ' → ')" } else { 'Вернулось само.' }), 'Info')
+                Write-Log "восстановление завершено: помогло [$($r.Steps -join ', ')]"
+                $script:recovery = $null
+                $script:recoveryFails = 0
+                $script:recoveryCooldownUntil = [datetime]::MinValue
+            }
+            elseif ($verdict.Severity -eq 'alarm') {
+                # Авария выхода: дальше не лечим и не повторяем — ждём владельца.
+                $notify.ShowBalloonTip(10000, 'Восстановление остановлено', $verdict.Text, 'Error')
+                Write-Log "восстановление остановлено: $($verdict.Text)"
+                $script:recovery = $null
+                $script:recoveryCooldownUntil = (Get-Date).AddMinutes(30)
+            }
+            elseif ((Get-Date) -lt $r.WaitUntil) {
+                $notify.Text = "восстановление: жду ($($r.Phase))"
+            }
+            elseif ($r.Index -ge $r.Plan.Count) {
+                # Лестница пройдена без успеха — возвращаем известное рабочее состояние.
+                if ($script:goldSnapshot) { Invoke-StepRestoreDns $script:goldSnapshot }
+                # Пауза перед следующей попыткой, нарастающая. Без неё утилита при
+                # стойкой поломке гоняла бы лестницу каждые полминуты — с балунами и,
+                # что хуже, с повторными перезапусками VPN, если они разрешены.
+                $script:recoveryFails++
+                $wait = [Math]::Min(30, 5 * [Math]::Pow(2, $script:recoveryFails - 1))
+                $script:recoveryCooldownUntil = (Get-Date).AddMinutes($wait)
+                $notify.ShowBalloonTip(10000, 'Восстановить не удалось',
+                    "Пробовал: $($r.Steps -join ' → '). Следующая попытка через $wait мин — или почините вручную.", 'Error')
+                Write-Log "восстановление не помогло: [$($r.Steps -join ', ')]; следующая попытка через $wait мин"
+                $script:recovery = $null
+            }
+            else {
+                $step = $r.Plan[$r.Index]
+                $r.Index++
+                $notify.Text = "восстановление: $step"
+                Write-Log "шаг восстановления: $step"
+                $entry = Invoke-RecoveryStep $step $script:goldSnapshot
+                $r.Steps += $step
+                $r.Phase = $step
+                $r.WaitUntil = (Get-Date).AddSeconds(5)   # дать сети устояться до проверки
+                if ($entry -and $entry.Result -like 'СТОП*') {
+                    $notify.ShowBalloonTip(10000, 'Восстановление остановлено', $entry.Result, 'Error')
+                    Write-Log "восстановление остановлено на шаге $step : $($entry.Result)"
+                    $script:recovery = $null
+                }
+            }
+        }
+        elseif ($miRec.Checked -and $bad -and $script:badStreak -ge 3 -and
+                (Get-Date) -ge $script:recoveryCooldownUntil) {
+            # Порог в несколько тиков подряд: одиночная заминка (медленный ответ, пауза
+            # у провайдера) не должна запускать лестницу — тем более её тяжёлые ступени.
+            $plan = Get-RecoveryPlan $verdict.Class ([bool]$miRecVpn.Checked) ([bool]$miRecNic.Checked)
+            # Ступени, рвущие соединения, требуют более уверенного диагноза.
+            if ($script:badStreak -lt 6) {
+                $plan = @($plan | Where-Object { $_ -notin @('restart-vpn','restart-physical') })
+            }
+            if ($plan.Count) {
+                Write-Log "запускаю восстановление, класс: $($verdict.Class), план: [$($plan -join ', ')]"
+                $script:recovery = [pscustomobject]@{
+                    Class = $verdict.Class; Plan = @($plan); Index = 0; Steps = @()
+                    Phase = 'пауза'; WaitUntil = (Get-Date).AddSeconds([int]$cfg.graceSec)
+                }
+                $notify.Text = "восстановление: жду $($cfg.graceSec) с"
+            }
+        }
+
+        # --- тултип ---
+        $ccTxt = if ($null -eq $script:claude) { 'CC:?' } elseif ($script:claude.Ok) { "CC:ok $($script:claude.Ms)мс" } else { 'CC:НЕТ' }
+        $cty = if ($script:egress -and $script:egress.Country) { $script:egress.Country } else { '?' }
+        $vtxt = if ($vpn.Active) { if ($vpn.DefaultVia) { "VPN:$cty" } else { 'VPN:часть' } } else { 'VPN:нет' }
+        $txt = "v {0} ^ {1} | {2} | {3}" -f (Format-Speed $down), (Format-Speed $up), $vtxt, $ccTxt
         if ($txt.Length -gt 63) { $txt = $txt.Substring(0, 63) }   # лимит NotifyIcon.Text
         $notify.Text = $txt
     } catch { Write-Log "tick error: $_" }
@@ -462,6 +771,144 @@ $miBench.Add_Click({
     $bDhcp.Add_Click({ [System.Windows.Forms.MessageBox]::Show((Reset-DnsToDhcp), 'Смена DNS') | Out-Null })
     $f.Show()
     & $doRun
+})
+
+$miClaude.Add_Click({
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text = 'Канал Claude Code'
+    $f.Size = New-Object System.Drawing.Size(680, 420)
+    $f.StartPosition = 'CenterScreen'
+    $tb = New-Object System.Windows.Forms.TextBox
+    $tb.Multiline = $true; $tb.ReadOnly = $true; $tb.ScrollBars = 'Vertical'
+    $tb.Dock = 'Fill'; $tb.Font = New-Object System.Drawing.Font('Consolas', 10)
+
+    $build = {
+        $sb = New-Object System.Text.StringBuilder
+        $cc  = Test-ClaudeChannel
+        $tun = Get-TunnelState
+        $eg  = Test-Egress
+        $s1 = Get-XrayStats; Start-Sleep -Milliseconds 1500; $s2 = Get-XrayStats
+        $fl = Get-FlowDelta $s1 $s2
+
+        [void]$sb.AppendLine("=== Канал Claude Code  $(Get-Date -Format 'HH:mm:ss') ===")
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine("Связь с Anthropic: " + $(if ($cc.Ok) { "ЕСТЬ — $($cc.Reason), отклик $($cc.Ms) мс" } else { "НЕТ — $($cc.Reason)" }))
+        [void]$sb.AppendLine("Проверено тем же путём, которым ходит Claude Code: " + $(if ($cc.Via) { $cc.Via } else { 'напрямую' }))
+        [void]$sb.AppendLine('')
+        [void]$sb.AppendLine("Туннель: " + $(if ($tun.Ok) { "$($tun.AdapterName), трафик идёт через него" }
+                                             elseif ($tun.AdapterUp) { "$($tun.AdapterName) поднят, но трафик идёт мимо" }
+                                             else { 'не поднят' }))
+        if ($tun.Upstream) { [void]$sb.AppendLine("Узлы VPN: " + ($tun.Upstream -join ', ')) }
+        [void]$sb.AppendLine("Выход: $($eg.Reason)")
+        [void]$sb.AppendLine('')
+        if ($fl) {
+            [void]$sb.AppendLine("--- за последние $([int]$fl.Seconds) с ---")
+            [void]$sb.AppendLine("Трафик Claude Code: $(Format-Bytes $fl.ClaudeBytes)")
+            [void]$sb.AppendLine("Через туннель:      $(Format-Bytes $fl.TunnelBytes)")
+            # «Утечка» — только когда трафик перестал идти через туннель. Часть трафика
+            # штатно ходит напрямую (так настроена маршрутизация клиента), и подписывать
+            # это утечкой значило бы пугать владельца при каждой открытой странице.
+            $leakMark = if (-not $tun.ViaTunnel -and $fl.DirectBytes -gt 0) { '   ← мимо туннеля!' } else { '' }
+            [void]$sb.AppendLine("Мимо туннеля:       $(Format-Bytes $fl.DirectBytes)$leakMark")
+            [void]$sb.AppendLine('')
+            # Тот самый вопрос: Клод завис или интернет отвалился.
+            $answer = if (-not $cc.Ok) { 'СЕТЬ: канал до Anthropic не отвечает — Claude Code ждёт впустую.' }
+                      elseif ($fl.ClaudeBytes -gt 0) { 'РАБОТАЕТ: канал жив и токены идут прямо сейчас.' }
+                      else { 'КАНАЛ ЖИВ, но обмена нет: либо Claude Code сейчас думает/ждёт вас, либо он подвис — сеть тут не виновата.' }
+            [void]$sb.AppendLine("Вердикт: $answer")
+        } else {
+            [void]$sb.AppendLine('Счётчики xray недоступны (порт 11111 не отвечает) — трафик по процессам не виден.')
+        }
+        $sb.ToString()
+    }
+
+    $tb.Text = (& $build) -replace "`n", "`r`n"
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text = 'Обновить'; $btn.Dock = 'Bottom'
+    # GetNewClosure обязателен: скриптблоки PowerShell не захватывают локальные
+    # переменные, и к моменту клика по немодальному окну $f/$tb/$build были бы уже
+    # недоступны — кнопка молча ничего не делала бы.
+    $btn.Add_Click({ $f.Cursor = 'WaitCursor'; $tb.Text = (& $build) -replace "`n", "`r`n"; $f.Cursor = 'Default' }.GetNewClosure())
+    $f.Controls.Add($tb); $f.Controls.Add($btn)
+    $f.Show()
+})
+
+$miRec.Add_Click({
+    $cfg.autoRecover = $miRec.Checked
+    Save-Config $cfg
+    if ($miRec.Checked) {
+        $msg = "Автовосстановление включено.`n`nЧто будет делать: подождёт $($cfg.graceSec) с, потом попробует безопедные шаги — сброс кэша DNS, возврат сохранённых настроек, при лежащем туннеле смена DNS на физическом адаптере.`n`nПерезапуск VPN и адаптера остаются запрещёнными, пока вы не разрешите их отдельно (подменю «что при этом разрешено»)."
+        if (-not (Test-IsAdmin)) { $msg += "`n`nСейчас нет прав администратора — шаги будут пропускаться. Перезапустите от администратора." }
+        [System.Windows.Forms.MessageBox]::Show($msg, $AppName) | Out-Null
+    }
+})
+
+$miRecVpn.Add_Click({
+    if ($miRecVpn.Checked) {
+        $r = [System.Windows.Forms.MessageBox]::Show(
+            "Разрешить перезапуск службы VPN при обрыве?`n`nЭто рвёт ВСЕ соединения через туннель. Главное: при переподключении клиент VPN может выбрать другой узел — то есть другую страну.`n`nУтилита сверяет страну до и после, и при расхождении сразу остановится и позовёт вас. Но саму смену страны она предотвратить не может.`n`nВключить?",
+            $AppName, 'YesNo', 'Warning')
+        if ($r -ne 'Yes') { $miRecVpn.Checked = $false; return }
+    }
+    $cfg.allowVpnRestart = $miRecVpn.Checked
+    Save-Config $cfg
+})
+
+$miRecNic.Add_Click({
+    if ($miRecNic.Checked) {
+        $r = [System.Windows.Forms.MessageBox]::Show(
+            "Разрешить перезапуск сетевого адаптера?`n`nСамый жёсткий из разрешённых шагов: рвёт всё, включая канал самого VPN, и применяется только когда нет линка или адрес APIPA (169.254.x.x).`n`nВключить?",
+            $AppName, 'YesNo', 'Warning')
+        if ($r -ne 'Yes') { $miRecNic.Checked = $false; return }
+    }
+    $cfg.allowAdapterRestart = $miRecNic.Checked
+    Save-Config $cfg
+})
+
+$miRecCountry.Add_Click({
+    $cur = Get-ExpectedCountry
+    $v = [Microsoft.VisualBasic.Interaction]::InputBox(
+        "Код страны, в которой должен быть выход VPN (две буквы, например DE).`n`nУтилита не переключает страну — она только следит, что выход остался в этой стране, и бьёт тревогу при изменении.",
+        'Ожидаемая страна выхода', $cur)
+    # Только буквы: ввод вида «12» дал бы вечную тревогу «страна сменилась».
+    if ($v -and $v.Trim() -match '^[A-Za-z]{2}$') {
+        Set-ExpectedCountry $v.Trim()
+        $cfg.expectedCountry = (Get-ExpectedCountry)
+        Save-Config $cfg
+        $miRecCountry.Text = "Ожидаемая страна выхода: $($cfg.expectedCountry)…"
+        $script:egressAt = [datetime]::MinValue   # перепроверить сразу
+    }
+})
+
+$miRecNow.Add_Click({
+    if (-not (Test-IsAdmin)) {
+        [System.Windows.Forms.MessageBox]::Show('Для восстановления нужны права администратора — воспользуйтесь пунктом «Перезапустить от администратора».', $AppName) | Out-Null
+        return
+    }
+    if ($script:recovery) {
+        [System.Windows.Forms.MessageBox]::Show('Восстановление уже идёт — дождитесь его окончания.', $AppName) | Out-Null
+        return
+    }
+    # Диагноз берётся из последнего тика, а не считается заново: полный опрос занимает
+    # десятки секунд, и владелец нажал бы кнопку, за которой ничего не происходит.
+    $cls = if ($script:lastVerdict) { $script:lastVerdict.Class } else { 'ok' }
+    $txt = if ($script:lastVerdict) { $script:lastVerdict.Text } else { 'состояние ещё не измерено' }
+    $plan = Get-RecoveryPlan $cls ([bool]$miRecVpn.Checked) ([bool]$miRecNic.Checked)
+    if (-not $plan.Count) {
+        [System.Windows.Forms.MessageBox]::Show("Сейчас: $txt`n`nДля этого случая разрешённых действий нет — либо всё в порядке, либо это ситуация, которую утилита намеренно не лечит сама.", $AppName) | Out-Null
+        return
+    }
+    $r = [System.Windows.Forms.MessageBox]::Show(
+        "Сейчас: $txt`n`nБудут выполнены шаги:`n$($plan -join ' → ')`n`nЗапустить?", $AppName, 'YesNo', 'Question')
+    if ($r -ne 'Yes') { return }
+    # Запускаем тот же автомат, что и автоматика: шаги пойдут по тикам, трей не замрёт.
+    $script:recovery = [pscustomobject]@{
+        Class = $cls; Plan = @($plan); Index = 0; Steps = @(); Phase = 'запуск вручную'
+        WaitUntil = (Get-Date)
+    }
+    # Ручной запуск снимает паузу после прошлых неудач: владелец решил попробовать ещё.
+    $script:recoveryCooldownUntil = [datetime]::MinValue
+    Write-Log "ручное восстановление: класс $cls, план [$($plan -join ', ')]"
 })
 
 $miAuto.Add_Click({
