@@ -41,12 +41,10 @@ $DnsCandidates = [ordered]@{
 }
 $BenchDomains = @('ya.ru','vk.com','wikipedia.org')
 
-# Якоря «интернет жив». IP-якоря проверяются TCP-коннектом на 443 (без DNS вообще),
-# хост-якорь дополнительно доказывает, что работает резолвинг.
-# ВАЖНО: в некоторых сетях провайдер/шлюз фильтрует мелкие сайты при живом интернете —
-# поэтому якоря только крупные, иначе будут ложные «нет интернета».
-$IpAnchors   = @('77.88.8.8','1.1.1.1')   # :443
-$HostAnchor  = 'ya.ru'                     # :443
+# Якоря «интернет жив» заданы в lib/probe.ps1 (Test-Link): набор из разных «миров»,
+# чтобы блокировка сервисов одной страны не выглядела как «интернета нет». Здесь их
+# дубля быть не должно — иначе трей считал бы состояние по одному набору, а
+# диагностика по другому.
 
 $VpnNameRegex = 'wireguard|openvpn|tap-|\btun\b|tunnel|vpn|proton|outline|amnezia|warp|radmin'
 $VpnExclude   = 'teredo|isatap|6to4|loopback'
@@ -58,13 +56,20 @@ function Write-Log([string]$msg) {
 function Load-Config {
     # Умолчания намеренно безопасные: мониторинг работает сразу, а всё, что меняет
     # систему, владелец включает сам.
+    # Умолчания рассчитаны на ЧУЖУЮ машину: ничего не предполагаем про VPN, страну и
+    # Claude Code — иначе на компьютере без них утилита показывала бы вечную аварию.
     $def = [ordered]@{
         autoDns             = $false
         autoRecover         = $false   # лестница восстановления
         allowVpnRestart     = $false   # ступень «перезапустить службу VPN»
         allowAdapterRestart = $false   # ступень «перезапустить сетевой адаптер»
         graceSec            = 10       # сколько ждать, вдруг вернётся само
-        expectedCountry     = 'DE'     # ожидаемая страна выхода
+        expectedCountry     = ''       # пусто = не следить за страной выхода
+        vpnMode             = 'auto'   # auto | on | off — следить ли за туннелем
+        claudeMode          = 'auto'   # auto | on | off — следить ли за каналом Claude Code
+        vpnService          = ''       # имя службы VPN-клиента для перезапуска (пусто = определить)
+        setupDone           = $false   # был ли задан вопрос про страну при первом запуске
+        vpnSeen             = $false   # на этой машине VPN когда-либо видели
     }
     $cfg = [pscustomobject]$def
     if (Test-Path $ConfFile) {
@@ -135,7 +140,7 @@ function Get-NetSnapshot {
     [pscustomobject]@{ Rx = $rx; Tx = $tx; At = (Get-Date) }
 }
 
-function Test-Internet { Test-Link -IpAnchors $IpAnchors -HostAnchor $HostAnchor }
+function Test-Internet { Test-Link }   # якоря живут в probe.ps1 — там их набор из разных «миров»
 
 function Format-Speed([double]$bps) {
     if ($bps -ge 1MB) { '{0:0.0} МБ/с' -f ($bps/1MB) }
@@ -270,15 +275,19 @@ function Get-StatusReport {
 
     # --- канал Claude Code и выходная точка ---
     $tun = Get-TunnelState
-    [void]$sb.AppendLine('--- канал Claude Code ---')
-    $cc = Test-ClaudeChannel
-    [void]$sb.AppendLine("Связь с Anthropic: " + $(if ($cc.Ok) { "ЕСТЬ ($($cc.Reason), $($cc.Ms) мс)" } else { "НЕТ — $($cc.Reason)" }))
-    [void]$sb.AppendLine("Путь Claude Code: " + $(if ($cc.Via) { $cc.Via } else { 'напрямую, без прокси' }))
+    if (Test-ClaudePresent) {
+        [void]$sb.AppendLine('--- канал Claude Code ---')
+        $cc = Test-ClaudeChannel
+        [void]$sb.AppendLine("Связь с Anthropic: " + $(if ($cc.Ok) { "ЕСТЬ ($($cc.Reason), $($cc.Ms) мс)" } else { "НЕТ — $($cc.Reason)" }))
+        [void]$sb.AppendLine("Путь Claude Code: " + $(if ($cc.Via) { $cc.Via } else { 'напрямую, без прокси' }))
+    }
     if ($tun.AdapterUp) {
         [void]$sb.AppendLine("Туннель: $($tun.AdapterName) — " + $(if ($tun.ViaTunnel) { 'трафик идёт через него' } else { 'поднят, но трафик идёт мимо' }))
         if ($tun.Upstream) { [void]$sb.AppendLine("Узлы VPN: " + ($tun.Upstream -join ', ')) }
-    } else {
+    } elseif ($tun.Configured) {
         [void]$sb.AppendLine('Туннель: не поднят')
+    } else {
+        [void]$sb.AppendLine('VPN: на этой машине не обнаружен — контроль туннеля выключен')
     }
     $eg = Test-Egress
     [void]$sb.AppendLine("Выход в интернет: " + $eg.Reason)
@@ -302,6 +311,8 @@ if ($Once) {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
     $cfgOnce = Load-Config
     Set-ExpectedCountry $cfgOnce.expectedCountry
+    Set-WatchModes $cfgOnce.vpnMode $cfgOnce.claudeMode
+    Set-VpnSeen ([bool]$cfgOnce.vpnSeen)
     $s1 = Get-NetSnapshot; $x1 = Get-XrayStats
     Start-Sleep -Seconds 2
     $s2 = Get-NetSnapshot; $x2 = Get-XrayStats
@@ -321,6 +332,8 @@ if ($SelfTest) {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
     $cfgT = Load-Config
     Set-ExpectedCountry $cfgT.expectedCountry
+    Set-WatchModes $cfgT.vpnMode $cfgT.claudeMode
+    Set-VpnSeen ([bool]$cfgT.vpnSeen)
     Write-Host '=== Самопроверка net-monitor (ничего не меняется) ==='
     Write-Host ("Права администратора: {0}" -f $(if (Test-IsAdmin) { 'есть' } else { 'НЕТ — шаги восстановления будут пропускаться' }))
     Write-Host ("Автовосстановление: {0} · перезапуск VPN: {1} · перезапуск адаптера: {2} · пауза: {3} с · ожидаемая страна: {4}" -f
@@ -393,6 +406,11 @@ if (-not $mutex.WaitOne(0, $false)) {
 }
 
 $cfg = Load-Config
+# Режимы применяем до построения меню: пункт «Канал Claude Code…» показывается по
+# результату Test-ClaudePresent, а тот зависит от claudeMode из настроек.
+Set-ExpectedCountry $cfg.expectedCountry
+Set-WatchModes $cfg.vpnMode $cfg.claudeMode
+Set-VpnSeen ([bool]$cfg.vpnSeen)
 
 function New-TrayIcon([string]$state, [bool]$vpn, [bool]$egressAlarm = $false) {
     # state: green|orange|red|gray. Кольцо: синее = VPN активен,
@@ -438,7 +456,8 @@ $notify.Visible = $true
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 $miStatus  = $menu.Items.Add('Статус сети…')
-$miClaude  = $menu.Items.Add('Канал Claude Code…')
+# Пункт про Claude Code показываем только тем, у кого он есть.
+$miClaude  = if (Test-ClaudePresent) { $menu.Items.Add('Канал Claude Code…') } else { $null }
 $miSite    = $menu.Items.Add('Через что идёт сайт…')
 $miBench   = $menu.Items.Add('Тест DNS-серверов…')
 $miAuto    = New-Object System.Windows.Forms.ToolStripMenuItem('Авто-тест DNS раз в час + ставить лучший')
@@ -460,7 +479,8 @@ $miRecVpn.Checked = [bool]$cfg.allowVpnRestart
 $miRecNic = New-Object System.Windows.Forms.ToolStripMenuItem('Перезапускать сетевой адаптер (рвёт всё!)')
 $miRecNic.CheckOnClick = $true
 $miRecNic.Checked = [bool]$cfg.allowAdapterRestart
-$miRecCountry = New-Object System.Windows.Forms.ToolStripMenuItem("Ожидаемая страна выхода: $($cfg.expectedCountry)…")
+$miRecCountry = New-Object System.Windows.Forms.ToolStripMenuItem(
+    "Ожидаемая страна выхода: $(if ($cfg.expectedCountry) { $cfg.expectedCountry } else { 'не задана' })…")
 [void]$miRecSub.DropDownItems.AddRange(@($miRecVpn, $miRecNic, $miRecCountry))
 [void]$menu.Items.Add($miRecSub)
 $miRecNow = $menu.Items.Add('Починить сейчас (разово)…')
@@ -477,7 +497,6 @@ $miExit    = $menu.Items.Add('Выход')
 $notify.ContextMenuStrip = $menu
 
 # ---- состояние ----
-Set-ExpectedCountry $cfg.expectedCountry
 $script:prev = Get-NetSnapshot
 $script:prevStats = Get-XrayStats
 $script:lastState = ''
@@ -495,11 +514,22 @@ $script:recoveryFails = 0                 # неудачных попыток п
 $script:recoveryCooldownUntil = [datetime]::MinValue
 $script:lastVerdict = $null
 $script:ownerAlerted = ''
+# Определяется один раз при старте: следить ли за каналом Claude Code. На машине без
+# него проверка была бы десятисекундной паузой ради тревоги о ненужном сервисе.
+$script:claudeWatched = Test-ClaudePresent
+Write-Log ("режимы: VPN=$($cfg.vpnMode), Claude=$($cfg.claudeMode) (следим: $script:claudeWatched), страна=" +
+           $(if ($cfg.expectedCountry) { $cfg.expectedCountry } else { 'не задана' }))
 
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 5000
 
 $timer.Add_Tick({
+    # Защита от повторного входа. Внутри тика открываются модальные окна и идут
+    # ожидания; пока они висят, WinForms продолжает качать сообщения, и таймер
+    # выстрелил бы снова — вложенный проход перезаписал бы состояние счётчиков и мог
+    # запустить второй шаг восстановления поверх первого.
+    if ($script:inTick) { return }
+    $script:inTick = $true
     try {
         $snap = Get-NetSnapshot
         $dt = ($snap.At - $script:prev.At).TotalSeconds
@@ -519,13 +549,17 @@ $timer.Add_Tick({
         $flow  = Get-FlowDelta $script:prevStats $stats
         if ($stats) { $script:prevStats = $stats }
 
-        # Канал до Anthropic — раз в минуту (или сразу, если связь только что упала).
-        $needClaude = ((Get-Date) - $script:claudeAt).TotalSeconds -ge 60 -or $null -eq $script:claude
-        if ($needClaude -and $inet.IpOk) {
-            $script:claude = Test-ClaudeChannel
-            $script:claudeAt = Get-Date
-        } elseif (-not $inet.IpOk) {
-            $script:claude = [pscustomobject]@{ Ok = $false; Status = $null; Ms = 0; Via = $null; Reason = 'нет связи' }
+        # Канал до Anthropic — раз в минуту, и только если Claude Code тут используется.
+        if (-not $script:claudeWatched) {
+            $script:claude = $null
+        } else {
+            $needClaude = ((Get-Date) - $script:claudeAt).TotalSeconds -ge 60 -or $null -eq $script:claude
+            if ($needClaude -and $inet.IpOk) {
+                $script:claude = Test-ClaudeChannel
+                $script:claudeAt = Get-Date
+            } elseif (-not $inet.IpOk) {
+                $script:claude = [pscustomobject]@{ Ok = $false; Status = $null; Ms = 0; Via = $null; Reason = 'нет связи' }
+            }
         }
 
         # Страна выхода — раз в 5 минут; при живой связи.
@@ -536,6 +570,45 @@ $timer.Add_Tick({
 
         $verdict = Get-HealthVerdict $inet $tun $script:claude $script:egress $flow
         $script:lastVerdict = $verdict
+
+        # Запоминаем, что VPN на этой машине есть. Иначе выключенный клиент выглядел бы
+        # как «VPN тут не настроен», и надзор за страной отключался бы сам.
+        if (($tun.AdapterUp -or $tun.CoreRunning) -and -not $cfg.vpnSeen) {
+            $cfg.vpnSeen = $true
+            Set-VpnSeen $true
+            Save-Config $cfg
+            Write-Log 'на этой машине обнаружен VPN — контроль туннеля включён'
+        }
+
+        # Однократный вопрос про страну — когда интерфейс уже жив и туннель успел
+        # подняться. Отметку «спросили» ставим только после фактического вопроса:
+        # при автозапуске вместе с Windows клиент VPN поднимается не сразу, и
+        # преждевременная отметка означала бы «не спросим уже никогда».
+        if ($script:askCountry -and -not (Get-ExpectedCountry)) {
+            if ($tun.AdapterUp -and $script:egress -and $script:egress.Verified -and $script:egress.Country) {
+                $script:askCountry = $false
+                $cfg.setupDone = $true
+                Save-Config $cfg
+                $eg0 = $script:egress
+                $where0 = if ($eg0.City) { "$($eg0.Country), $($eg0.City)" } else { $eg0.Country }
+                $ans = [System.Windows.Forms.MessageBox]::Show(
+                    "Обнаружен VPN. Сейчас выход в интернет — $where0 (адрес $($eg0.Ip)).`n`nСледить, чтобы страна выхода оставалась $($eg0.Country)? Утилита предупредит, если она изменится — например, когда клиент VPN сам переключится на другой сервер.`n`nПереключать страну она никогда не будет.",
+                    $AppName, 'YesNo', 'Question')
+                if ($ans -eq 'Yes') {
+                    Set-ExpectedCountry $eg0.Country
+                    $cfg.expectedCountry = (Get-ExpectedCountry)
+                    Save-Config $cfg
+                    $miRecCountry.Text = "Ожидаемая страна выхода: $($cfg.expectedCountry)…"
+                    Write-Log "контроль страны включён: $($cfg.expectedCountry)"
+                    $script:egressAt = [datetime]::MinValue
+                }
+            } elseif (((Get-Date) - $script:startedAt).TotalMinutes -ge 10) {
+                # Десять минут прошло, туннеля так и нет — VPN тут, видимо, не нужен.
+                $script:askCountry = $false
+                $cfg.setupDone = $true
+                Save-Config $cfg
+            }
+        }
         $egressAlarm = ($verdict.Class -in @('egress-changed','leak'))
 
         $state = switch ($verdict.Severity) {
@@ -640,7 +713,7 @@ $timer.Add_Tick({
                 $r.Index++
                 $notify.Text = "восстановление: $step"
                 Write-Log "шаг восстановления: $step"
-                $entry = Invoke-RecoveryStep $step $script:goldSnapshot
+                $entry = Invoke-RecoveryStep $step $script:goldSnapshot $cfg.vpnService
                 $r.Steps += $step
                 $r.Phase = $step
                 $r.WaitUntil = (Get-Date).AddSeconds(5)   # дать сети устояться до проверки
@@ -671,13 +744,18 @@ $timer.Add_Tick({
         }
 
         # --- тултип ---
-        $ccTxt = if ($null -eq $script:claude) { 'CC:?' } elseif ($script:claude.Ok) { "CC:ok $($script:claude.Ms)мс" } else { 'CC:НЕТ' }
         $cty = if ($script:egress -and $script:egress.Country) { $script:egress.Country } else { '?' }
-        $vtxt = if ($vpn.Active) { if ($vpn.DefaultVia) { "VPN:$cty" } else { 'VPN:часть' } } else { 'VPN:нет' }
-        $txt = "v {0} ^ {1} | {2} | {3}" -f (Format-Speed $down), (Format-Speed $up), $vtxt, $ccTxt
+        $vtxt = if ($vpn.Active) { if ($vpn.DefaultVia) { "VPN:$cty" } else { 'VPN:часть' } }
+                elseif ($tun.Configured) { 'VPN:нет' } else { "выход:$cty" }
+        $txt = "v {0} ^ {1} | {2}" -f (Format-Speed $down), (Format-Speed $up), $vtxt
+        if ($script:claudeWatched) {
+            $ccTxt = if ($null -eq $script:claude) { 'CC:?' } elseif ($script:claude.Ok) { "CC:ok $($script:claude.Ms)мс" } else { 'CC:НЕТ' }
+            $txt += " | $ccTxt"
+        }
         if ($txt.Length -gt 63) { $txt = $txt.Substring(0, 63) }   # лимит NotifyIcon.Text
         $notify.Text = $txt
     } catch { Write-Log "tick error: $_" }
+    finally { $script:inTick = $false }
 })
 
 # часовой авто-DNS
@@ -773,7 +851,7 @@ $miBench.Add_Click({
     & $doRun
 })
 
-$miClaude.Add_Click({
+if ($miClaude) { $miClaude.Add_Click({
     $f = New-Object System.Windows.Forms.Form
     $f.Text = 'Канал Claude Code'
     $f.Size = New-Object System.Drawing.Size(680, 420)
@@ -831,7 +909,7 @@ $miClaude.Add_Click({
     $btn.Add_Click({ $f.Cursor = 'WaitCursor'; $tb.Text = (& $build) -replace "`n", "`r`n"; $f.Cursor = 'Default' }.GetNewClosure())
     $f.Controls.Add($tb); $f.Controls.Add($btn)
     $f.Show()
-})
+}) }
 
 $miRec.Add_Click({
     $cfg.autoRecover = $miRec.Checked
@@ -868,16 +946,20 @@ $miRecNic.Add_Click({
 $miRecCountry.Add_Click({
     $cur = Get-ExpectedCountry
     $v = [Microsoft.VisualBasic.Interaction]::InputBox(
-        "Код страны, в которой должен быть выход VPN (две буквы, например DE).`n`nУтилита не переключает страну — она только следит, что выход остался в этой стране, и бьёт тревогу при изменении.",
+        "Код страны, в которой должен быть выход в интернет (две буквы, например DE).`n`nОставьте пустым, чтобы не следить за страной — тогда утилита просто покажет, где выход.`n`nУтилита никогда не переключает страну сама: она следит и предупреждает.",
         'Ожидаемая страна выхода', $cur)
-    # Только буквы: ввод вида «12» дал бы вечную тревогу «страна сменилась».
-    if ($v -and $v.Trim() -match '^[A-Za-z]{2}$') {
-        Set-ExpectedCountry $v.Trim()
-        $cfg.expectedCountry = (Get-ExpectedCountry)
-        Save-Config $cfg
-        $miRecCountry.Text = "Ожидаемая страна выхода: $($cfg.expectedCountry)…"
-        $script:egressAt = [datetime]::MinValue   # перепроверить сразу
+    if ($null -eq $v) { return }   # нажали «Отмена»
+    $v = $v.Trim()
+    # Пусто = выключить контроль. Иначе только буквы: ввод вида «12» дал бы вечную тревогу.
+    if ($v -and $v -notmatch '^[A-Za-z]{2}$') {
+        [System.Windows.Forms.MessageBox]::Show('Нужен код из двух букв (DE, RU, NL…) или пустое поле, чтобы не следить.', $AppName) | Out-Null
+        return
     }
+    Set-ExpectedCountry $v
+    $cfg.expectedCountry = (Get-ExpectedCountry)
+    Save-Config $cfg
+    $miRecCountry.Text = "Ожидаемая страна выхода: $(if ($cfg.expectedCountry) { $cfg.expectedCountry } else { 'не задана' })…"
+    $script:egressAt = [datetime]::MinValue   # перепроверить сразу
 })
 
 $miRecNow.Add_Click({
@@ -921,7 +1003,23 @@ $miAuto.Add_Click({
 
 $miRun.Add_Click({
     if ($miRun.Checked) {
+        # Частая ошибка при получении утилиты архивом: запустить её прямо из окна
+        # просмотра, не распаковав. Тогда папка лежит во временном каталоге, который
+        # Windows однажды вычистит, — автозапуск тихо перестанет работать, а в реестре
+        # останется ссылка в никуда. Поэтому такой путь не записываем.
+        if ($PSScriptRoot -like "*\Temp\*" -or $PSScriptRoot -like "$env:TEMP*") {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Утилита запущена из временной папки:`n$PSScriptRoot`n`nПохоже, архив открыт без распаковки. Автозапуск с такого пути сломается, когда Windows очистит папку.`n`nПеренесите папку в постоянное место (например, C:\Utils\net-monitor) и включите автозапуск оттуда.",
+                $AppName) | Out-Null
+            $miRun.Checked = $false
+            return
+        }
         $cmd = Join-Path $PSScriptRoot 'Запустить.cmd'
+        if (-not (Test-Path $cmd)) {
+            [System.Windows.Forms.MessageBox]::Show("Не найден файл запуска:`n$cmd", $AppName) | Out-Null
+            $miRun.Checked = $false
+            return
+        }
         Set-ItemProperty -Path $runKey -Name $AppName -Value "`"$cmd`""
     } else {
         Remove-ItemProperty -Path $runKey -Name $AppName -ErrorAction SilentlyContinue
@@ -945,9 +1043,25 @@ $miExit.Add_Click({
 })
 
 Write-Log 'запуск'
+
+# Первое знакомство: если на машине есть VPN, один раз спрашиваем, следить ли за
+# страной выхода. Так у человека без VPN вопроса не возникает вовсе, а тот, кто ради
+# страны VPN и держит, не должен искать эту настройку в подменю.
+#
+# Сам вопрос задаётся в тике, а не здесь: модальное окно до запуска цикла сообщений
+# повисло бы поверх ещё не ожившего интерфейса.
+$script:askCountry = (-not $cfg.setupDone)
+$script:startedAt = Get-Date
+
+# Первый тик — почти сразу, но уже внутри цикла сообщений. Раньше здесь стоял ручной
+# вызов OnTick до Application::Run: тик проходил вне цикла сообщений, и открытое им
+# модальное окно приводило к вложенным тикам, перезаписывающим состояние.
+$timer.Interval = 300
 $timer.Start()
-# первый тик сразу, не через 5 с
-$timer.GetType().GetMethod('OnTick', [System.Reflection.BindingFlags]'NonPublic,Instance').Invoke($timer, @([System.EventArgs]::Empty)) | Out-Null
+$firstTick = {
+    if ($timer.Interval -ne 5000) { $timer.Interval = 5000 }
+}.GetNewClosure()
+$timer.Add_Tick($firstTick)
 
 [System.Windows.Forms.Application]::Run()
 $mutex.ReleaseMutex()

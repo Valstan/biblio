@@ -35,6 +35,20 @@ function Test-IsAdminR {
     (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
+function Get-VpnServiceName {
+    # Имя службы VPN-клиента у каждого своё, поэтому ищем по признакам среди
+    # запущенных служб. Возвращаем первую подходящую или пусто — тогда ступень
+    # перезапуска VPN просто пропускается.
+    param([string]$Configured = '')
+    if ($Configured) { return $Configured }
+    $svc = Get-Service -ErrorAction SilentlyContinue |
+           Where-Object { $_.Status -eq 'Running' -and
+                          (("$($_.Name) $($_.DisplayName)") -match 'happ|xray|sing-?box|wireguard|openvpn|amnezia|outline|proton|nordvpn|expressvpn|mullvad|tunnel') -and
+                          ("$($_.Name)" -notmatch '^(RasMan|SstpSvc|IKEEXT|PolicyAgent)$') } |
+           Select-Object -First 1
+    if ($svc) { $svc.Name }
+}
+
 function Test-IsTunnelAdapter {
     # Туннельный адаптер принадлежит ядру VPN: перезапускать его напрямую нельзя.
     param([string]$Name, [string]$Description)
@@ -243,9 +257,15 @@ function Invoke-StepRestartVpn {
     # страну. Поэтому: страна фиксируется до, сверяется после, и при расхождении вся
     # автоматика останавливается. Утилита не пытается «вернуть как было» — выбор узла
     # не её решение.
-    param([string]$ServiceName = 'HappService', [int]$WaitSec = 20)
+    param([string]$ServiceName = '', [int]$WaitSec = 20)
     if (-not (Test-IsAdminR)) {
         return Add-RecoveryLog 'restart-vpn' '—' '—' 'ПРОПУСК: нужны права администратора'
+    }
+    # Имя службы не зашито: у разных VPN-клиентов оно своё. Если не задано в настройках,
+    # ищем среди запущенных служб ту, что похожа на VPN-клиента.
+    if (-not $ServiceName) { $ServiceName = Get-VpnServiceName }
+    if (-not $ServiceName) {
+        return Add-RecoveryLog 'restart-vpn' '—' '—' 'ПРОПУСК: служба VPN-клиента не найдена'
     }
     $svc = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
     if (-not $svc) {
@@ -267,10 +287,10 @@ function Invoke-StepRestartVpn {
     # через чужую страну.
     $after = Test-Egress
     $res = if (-not $tun.Ok) { 'служба перезапущена, туннель ещё не поднялся' }
-           elseif (-not $after.Verified) { 'СТОП: страну выхода подтвердить не удалось' }
-           elseif (-not $after.Ok) { "СТОП: страна выхода $($after.Country) вместо $($after.Expected)" }
-           elseif ($before.Verified -and $before.Country -ne $after.Country) { 'СТОП: страна выхода сменилась' }
-           else { "выполнено, выход прежний ($($after.Country))" }
+           elseif ($after.Expected -and -not $after.Verified) { 'СТОП: страну выхода подтвердить не удалось' }
+           elseif ($after.Expected -and -not $after.Ok) { "СТОП: страна выхода $($after.Country) вместо $($after.Expected)" }
+           elseif ($after.Expected -and $before.Verified -and $before.Country -ne $after.Country) { 'СТОП: страна выхода сменилась' }
+           else { "выполнено" + $(if ($after.Country) { ", выход $($after.Country)" } else { '' }) }
     Add-RecoveryLog 'restart-vpn' "страна: $(if ($before.Verified) { $before.Country } else { 'не определена' })" `
                     "страна: $($after.Country) ($($after.Ip))" $res
 }
@@ -310,12 +330,14 @@ function Invoke-StepRestartPhysical {
     # успехом нельзя — иначе владелец продолжит работать не через ту страну.
     $tun   = Get-TunnelState
     $after = Test-Egress
+    # Требования про туннель и страну применяются только там, где VPN вообще ожидается:
+    # на машине без него успешный перезапуск адаптера иначе всегда объявлялся бы «СТОП».
     $res = if (-not $link.Ok) { 'адаптер перезапущен, связи ещё нет' }
-           elseif (-not $tun.ViaTunnel) { 'СТОП: связь вернулась МИМО туннеля — выход не через VPN' }
-           elseif (-not $after.Verified) { 'СТОП: страну выхода подтвердить не удалось' }
-           elseif (-not $after.Ok) { "СТОП: страна выхода $($after.Country) вместо $($after.Expected)" }
-           elseif ($before.Verified -and $before.Country -ne $after.Country) { 'СТОП: страна выхода сменилась' }
-           else { "выполнено, выход прежний ($($after.Country))" }
+           elseif ($tun.Configured -and -not $tun.ViaTunnel) { 'СТОП: связь вернулась МИМО туннеля — выход не через VPN' }
+           elseif ($after.Expected -and -not $after.Verified) { 'СТОП: страну выхода подтвердить не удалось' }
+           elseif ($after.Expected -and -not $after.Ok) { "СТОП: страна выхода $($after.Country) вместо $($after.Expected)" }
+           elseif ($after.Expected -and $before.Verified -and $before.Country -ne $after.Country) { 'СТОП: страна выхода сменилась' }
+           else { "выполнено" + $(if ($after.Country) { ", выход $($after.Country)" } else { '' }) }
     Add-RecoveryLog 'restart-physical' "$($phys.Name): $ip" "линк: $($link.Ok), туннель: $($tun.ViaTunnel), страна: $($after.Country)" $res
 }
 
@@ -354,12 +376,12 @@ function Invoke-RecoveryStep {
     # Выполняет ОДИН шаг лестницы. Нужен пошаговый режим, потому что вызывающая
     # сторона — таймер трея: длинная синхронная лестница заморозила бы значок и меню
     # на всё время аварии, ровно когда владельцу нужнее всего на них смотреть.
-    param([string]$Step, $Snapshot)
+    param([string]$Step, $Snapshot, [string]$VpnService = '')
     switch ($Step) {
         'flush-dns'        { Invoke-StepFlushDns }
         'restore-dns'      { Invoke-StepRestoreDns $Snapshot }
         'physical-dns'     { Invoke-StepPhysicalDns }
-        'restart-vpn'      { Invoke-StepRestartVpn }
+        'restart-vpn'      { Invoke-StepRestartVpn -ServiceName $VpnService }
         'restart-physical' { Invoke-StepRestartPhysical }
         default            { Add-RecoveryLog $Step '—' '—' 'неизвестный шаг' }
     }

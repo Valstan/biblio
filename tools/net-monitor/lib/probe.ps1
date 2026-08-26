@@ -6,13 +6,26 @@
 
 # ---------------- эталон выхода ----------------
 # Ожидаемая страна выхода. Сверка с ней — защита от случайной смены страны при
-# переподключении VPN.
+# переподключении VPN. **Пустая строка = не следить за страной**, и это умолчание:
+# на машине без VPN «страна не та» — не авария, а просто место, где человек живёт.
 #
 # Проверять надо именно СТРАНУ, а не диапазон адресов: замер 2026-08-26 показал, что
-# клиент Happ держит несколько узлов и переключается между ними сам (за одну сессию
-# выход сменился с 103.109.234.211 на 185.136.243.42 — оба Германия). Привязка к
-# префиксу давала бы ложную тревогу на каждом штатном переключении.
-$script:EgressExpectedCountry = 'DE'
+# клиент VPN держит несколько узлов и переключается между ними сам (за одну сессию
+# выход сменился с одного адреса на другой — оба Германия). Привязка к префиксу давала
+# бы ложную тревогу на каждом штатном переключении.
+$script:EgressExpectedCountry = ''
+
+# Режимы наблюдения. 'auto' — определить по машине, 'on' — следить всегда,
+# 'off' — не следить. Нужны, чтобы утилита не изобретала аварии там, где функции нет:
+# без VPN отсутствие туннеля — норма, без Claude Code его канал никого не волнует.
+$script:VpnMode    = 'auto'
+$script:ClaudeMode = 'auto'
+
+# Запомненный факт «VPN на этой машине есть» (сохраняется в настройках). Нужен, чтобы
+# выключение VPN-клиента не выглядело как «VPN тут не настроен»: иначе утилита ровно в
+# момент падения туннеля перестала бы следить за страной и утечкой — то есть замолчала
+# бы там, где обязана кричать.
+$script:VpnSeen = $false
 
 # Локальный HTTP-эндпоинт статистики xray (Go expvar). Даёт счётчики трафика по
 # inbound/outbound без единого внешнего запроса.
@@ -69,52 +82,107 @@ function Get-AnthropicBaseUrl {
 # ---------------- 1. link: есть ли интернет вообще ----------------
 
 function Test-Link {
-    param([string[]]$IpAnchors = @('77.88.8.8','1.1.1.1'), [string]$HostAnchor = 'ya.ru')
+    # Якоря нарочно из разных «миров»: в одних сетях режут западные сервисы, в других —
+    # российские. Если бы все якоря были одного происхождения, блокировка именно их
+    # выглядела бы как «интернета нет».
+    param(
+        [string[]]$IpAnchors = @('1.1.1.1','77.88.8.8','8.8.8.8'),
+        [string[]]$HostAnchors = @('cloudflare.com','ya.ru')
+    )
     $ipOk = $false
-    foreach ($a in $IpAnchors) { if (Test-TcpPort $a 443 1500) { $ipOk = $true; break } }
+    foreach ($a in $IpAnchors) { if (Test-TcpPort $a 443 1200) { $ipOk = $true; break } }
     $dnsOk = $false
-    try {
-        $ans = Resolve-DnsName -Name $HostAnchor -Type A -DnsOnly -QuickTimeout -ErrorAction Stop |
-               Where-Object { $_.IPAddress } | Select-Object -First 1
-        if ($ans -and (Test-TcpPort $ans.IPAddress 443 1500)) { $dnsOk = $true }
-    } catch {}
+    foreach ($h in $HostAnchors) {
+        try {
+            $ans = Resolve-DnsName -Name $h -Type A -DnsOnly -QuickTimeout -ErrorAction Stop |
+                   Where-Object { $_.IPAddress } | Select-Object -First 1
+            if ($ans -and (Test-TcpPort $ans.IPAddress 443 1200)) { $dnsOk = $true; break }
+        } catch {}
+    }
     [pscustomobject]@{ IpOk = $ipOk; DnsOk = $dnsOk; Ok = ($ipOk -and $dnsOk) }
 }
 
 # ---------------- 2. tunnel: жив ли туннель VPN ----------------
 
 function Get-TunnelState {
-    # Туннельный адаптер ищем по признакам sing-tun/Wintun, а не по жёсткому имени:
-    # адаптер пересоздаётся при каждом переподключении клиента.
+    # Туннельный адаптер ищем по признакам, а не по имени: адаптер пересоздаётся при
+    # каждом переподключении клиента, а называться может по-разному у разных клиентов.
+    # Radmin/TeamViewer/Hamachi исключены намеренно: их адаптеры постоянно в состоянии
+    # Up и никогда не бывают маршрутом по умолчанию — приняв их за туннель, утилита
+    # показывала бы «туннель лёг» круглосуточно.
     $tun = Get-NetAdapter -ErrorAction SilentlyContinue |
            Where-Object { $_.Status -eq 'Up' -and
-                          (($_.InterfaceDescription + ' ' + $_.Name) -match 'sing-tun|wintun|wireguard|tun\b|tap-|openvpn') }
+                          (($_.InterfaceDescription + ' ' + $_.Name) -match 'sing-tun|wintun|wireguard|tun\b|tap-|openvpn|amnezia|proton|outline|warp|vpn') -and
+                          (($_.InterfaceDescription + ' ' + $_.Name) -notmatch 'radmin|teamviewer|hamachi|virtualbox|vmware|hyper-v|bluetooth') }
     $def = Get-DefaultRouteInfo
     $viaTunnel = $false
     if ($tun -and $def) { $viaTunnel = @($tun.Name) -contains $def.Alias }
 
-    # Внешний канал держит не адаптер, а процесс ядра (xray/sing-box): его
-    # установленные соединения наружу — прямое доказательство живого uplink.
-    $core = Get-Process -Name xray, sing-box -ErrorAction SilentlyContinue
+    # Соединения ядра VPN наружу — полезная подробность, но НЕ признак здоровья:
+    # у WireGuard трафик несёт драйвер ядра, и процесса с сокетами нет вовсе. Если
+    # требовать их наличия, живой туннель объявляется мёртвым.
+    $core = Get-Process -Name xray, sing-box, v2ray, hysteria, openvpn, wireguard, wg,
+                              tun2socks, nekobox, Happ, amneziawg -ErrorAction SilentlyContinue
+
+    # Штатные подключения Windows (IKEv2/L2TP/SSTP) не имеют ни своего процесса, ни
+    # адаптера с узнаваемым именем — их видно только через Get-VpnConnection.
+    $builtIn = @(Get-VpnConnection -ErrorAction SilentlyContinue) +
+               @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue) |
+               Where-Object { $_.ConnectionStatus -eq 'Connected' }
     $upstream = @()
     foreach ($p in $core) {
         $conns = Get-NetTCPConnection -OwningProcess $p.Id -State Established -ErrorAction SilentlyContinue |
                  Where-Object { $_.RemoteAddress -notmatch '^(127\.|::1|192\.168\.|10\.|172\.(1[6-9]|2\d|3[01])\.)' }
         foreach ($c in $conns) { $upstream += "$($c.RemoteAddress):$($c.RemotePort)" }
     }
-    $upstream = $upstream | Select-Object -Unique
+    $upstream = @($upstream | Select-Object -Unique)
+
+    # Ожидается ли здесь VPN. Без этого «туннеля нет» на домашнем компьютере без VPN
+    # выглядело бы как поломка — вечный оранжевый значок.
+    #
+    # Внимание на два слагаемых: заданная страна выхода и запомненный факт «VPN тут
+    # был». Именно они удерживают контроль включённым, когда клиент VPN выключился
+    # целиком: без них падение туннеля выключало бы надзор за страной ровно в тот
+    # момент, когда трафик пошёл напрямую. Системный прокси в признаки НЕ входит —
+    # прокси есть у многих и без всякого VPN.
+    $configured = switch ($script:VpnMode) {
+        'off'     { $false }
+        'require' { $true }
+        'on'      { $true }
+        default   { [bool]($tun -or $core -or $builtIn -or $script:VpnSeen -or $script:EgressExpectedCountry) }
+    }
+
+    # Штатное подключение Windows считается поднятым туннелем: адаптера с узнаваемым
+    # именем у него может не быть, но связь через него идёт.
+    $adapterUp = [bool]($tun -or $builtIn)
+    $name = if ($tun) { @($tun.Name)[0] } elseif ($builtIn) { @($builtIn)[0].Name } else { $null }
 
     [pscustomobject]@{
-        AdapterUp   = [bool]$tun
-        AdapterName = if ($tun) { @($tun.Name)[0] } else { $null }
-        ViaTunnel   = $viaTunnel
+        Configured  = $configured
+        AdapterUp   = $adapterUp
+        AdapterName = $name
+        ViaTunnel   = ($viaTunnel -or [bool]$builtIn)
         CoreRunning = [bool]$core
         Upstream    = $upstream
-        Ok          = ([bool]$tun -and $viaTunnel -and $upstream.Count -gt 0)
+        Ok          = ($adapterUp -and ($viaTunnel -or [bool]$builtIn))
     }
 }
 
 # ---------------- 3. claude: жив ли канал до Anthropic ----------------
+
+function Test-ClaudePresent {
+    # Есть ли на машине Claude Code. Нужно, чтобы не проверять — и уж точно не бить
+    # тревогу про — канал сервиса, которым человек не пользуется.
+    switch ($script:ClaudeMode) {
+        'off' { return $false }
+        'on'  { return $true }
+    }
+    if ($env:CLAUDE_PID -or $env:ANTHROPIC_BASE_URL -or $env:ANTHROPIC_API_KEY) { return $true }
+    if (Test-Path (Join-Path $env:USERPROFILE '.claude')) { return $true }
+    if (Get-Command claude -ErrorAction SilentlyContinue) { return $true }
+    if (Get-Process -Name claude -ErrorAction SilentlyContinue) { return $true }
+    $false
+}
 
 function Test-ClaudeChannel {
     # Единственная честная проверка: идёт ТЕМ ЖЕ путём, что и Claude Code — через его
@@ -190,7 +258,18 @@ function Get-EgressInfo {
 }
 
 function Get-ExpectedCountry { $script:EgressExpectedCountry }
-function Set-ExpectedCountry([string]$cc) { if ($cc) { $script:EgressExpectedCountry = $cc.ToUpper() } }
+function Set-ExpectedCountry([string]$cc) {
+    # Пустое значение допустимо и означает «не следить за страной» — иначе контроль
+    # нельзя было бы выключить, только сменить на другую страну.
+    $script:EgressExpectedCountry = if ($cc) { $cc.ToUpper() } else { '' }
+}
+function Set-WatchModes([string]$vpn, [string]$claude) {
+    if ($vpn)    { $script:VpnMode    = $vpn }
+    if ($claude) { $script:ClaudeMode = $claude }
+}
+function Set-VpnSeen([bool]$seen) { $script:VpnSeen = $seen }
+function Get-VpnSeen { $script:VpnSeen }
+function Get-WatchModes { [pscustomobject]@{ Vpn = $script:VpnMode; Claude = $script:ClaudeMode } }
 
 function Test-Egress {
     # Три состояния, и путать их нельзя:
@@ -210,8 +289,17 @@ function Test-Egress {
                                   Expected = $ExpectedCountry
                                   Reason = "выход $($info.Ip), страну проверить не удалось" }
     }
-    $match = ($info.Country -eq $ExpectedCountry)
     $where = if ($info.City) { "$($info.Country), $($info.City)" } else { $info.Country }
+
+    # Контроль страны не задан — просто сообщаем, где выход. Без ожидания «сменилась»
+    # быть не может: человеку без VPN незачем читать, что его страна «не та».
+    if (-not $ExpectedCountry) {
+        return [pscustomobject]@{ Ok = $true; Verified = $true; Ip = $info.Ip; Country = $info.Country
+                                  City = $info.City; Expected = ''
+                                  Reason = "выход $($info.Ip) — $where" }
+    }
+
+    $match = ($info.Country -eq $ExpectedCountry)
     [pscustomobject]@{
         Ok       = $match
         Verified = $true
@@ -270,8 +358,11 @@ function Get-HealthVerdict {
     # выход стал домашним) выглядел бы как смена узла VPN. Это разные аварии: первую
     # лечить нельзя вообще, вторую лечит перезапуск VPN.
     $viaTunnel = [bool]($Tunnel -and $Tunnel.ViaTunnel)
+    # Функции, которых на машине нет, не могут быть сломаны. Без этого утилита на
+    # компьютере без VPN круглосуточно показывала бы «туннель не поднят».
+    $vpnWatched = [bool]($Tunnel -and $Tunnel.Configured)
 
-    if ($Egress -and $Egress.Verified -and -not $Egress.Ok -and $viaTunnel) {
+    if ($Egress -and $Egress.Expected -and $Egress.Verified -and -not $Egress.Ok -and $viaTunnel) {
         return [pscustomobject]@{ Class = 'egress-changed'; Severity = 'alarm'
             Text = $Egress.Reason }
     }
@@ -279,7 +370,7 @@ function Get-HealthVerdict {
     # Порог в байтах в секунду, а не в байтах: часть трафика идёт напрямую штатно
     # (так настроена маршрутизация клиента), и накопление за долгую паузу между
     # замерами не должно выглядеть как авария.
-    if (-not $viaTunnel -and $Flow -and $Flow.Seconds -gt 0 -and
+    if ($vpnWatched -and -not $viaTunnel -and $Flow -and $Flow.Seconds -gt 0 -and
         (($Flow.DirectBytes / $Flow.Seconds) -gt 20KB)) {
         return [pscustomobject]@{ Class = 'leak'; Severity = 'alarm'
             Text = 'трафик пошёл МИМО туннеля — выход с домашнего адреса' }
@@ -292,10 +383,9 @@ function Get-HealthVerdict {
         return [pscustomobject]@{ Class = 'dns-down'; Severity = 'partial'
             Text = 'IP-связь есть, DNS молчит' }
     }
-    if ($Tunnel -and -not $Tunnel.Ok -and $Link.Ok) {
-        $why = if (-not $Tunnel.AdapterUp) { 'туннель не поднят' }
-               elseif (-not $Tunnel.ViaTunnel) { 'туннель поднят, но трафик идёт мимо него' }
-               else { 'туннель поднят, но связи с узлом VPN нет' }
+    if ($vpnWatched -and -not $Tunnel.Ok -and $Link.Ok) {
+        $why = if (-not $Tunnel.AdapterUp) { 'туннель VPN не поднят' }
+               else { 'трафик идёт мимо туннеля VPN' }
         return [pscustomobject]@{ Class = 'tunnel-down'; Severity = 'partial'
             Text = "интернет есть, но $why" }
     }
@@ -314,7 +404,9 @@ function Get-FullHealth {
     param($PrevStats)
     $link   = Test-Link
     $tunnel = Get-TunnelState
-    $claude = Test-ClaudeChannel
+    # Канал Claude Code проверяем только если он тут используется: иначе на чужой
+    # машине это была бы десятисекундная пауза ради тревоги о ненужном сервисе.
+    $claude = if (Test-ClaudePresent) { Test-ClaudeChannel } else { $null }
     $stats  = Get-XrayStats
     $flow   = Get-FlowDelta $PrevStats $stats
     $egress = if ($link.Ok) { Test-Egress } else { $null }
