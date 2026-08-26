@@ -1,4 +1,4 @@
-﻿# kaspersky-matrica.ps1 — настройка Касперского под «Матрица РМЗ» (biblio/tools, 2026-08-26)
+﻿# kaspersky-matrica.ps1 — настройка Касперского под «Матрица РМЗ» (2026-08-26)
 #
 # Что делает: находит на ЭТОМ компьютере Касперского, клиент Матрицы, сторож (watchdog)
 # и адрес прод-сервера; печатает/показывает ГОТОВЫЕ строки для внесения в Касперский,
@@ -12,7 +12,7 @@
 #   * не пытается «переписать настройки, пока защита выключена»: Самозащита Касперского
 #     — отдельный механизм, она НЕ выключается вместе с защитой в реальном времени и
 #     блокирует правку своих файлов/реестра извне в любом состоянии защиты.
-#   Проверено на Kaspersky Standard 21.26.4.406: `avp.com HELP` → есть EXPORT/IMPORT,
+#   Проверено на Kaspersky Standard 21.26: `avp.com HELP` → есть EXPORT/IMPORT,
 #   команд EXCLUSION/TRUSTED/ADD нет.
 #
 # Режимы:
@@ -82,7 +82,7 @@ function ConvertTo-WinPath {
 }
 
 function ConvertTo-UserMask {
-    # C:\Users\Valstan\AppData\Local\... -> C:\Users\*\AppData\Local\...
+    # C:\Users\<имя>\AppData\Local\... -> C:\Users\*\AppData\Local\...
     # Маска нужна, чтобы одно исключение подходило любому пользователю на любом компе.
     param([string]$Path)
     if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
