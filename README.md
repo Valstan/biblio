@@ -16,7 +16,6 @@
 | [audio-to-text](tools/audio-to-text/) | Русская речь → текст локально на CPU (GigaAM v2 + Silero), оффлайн |
 | [video-downloader](tools/video-downloader/) | Скачать все видео со страницы (yt-dlp + ffmpeg из pip) |
 | [net-monitor](tools/net-monitor/) | Трей Windows: жив ли интернет (IP и DNS раздельно), статус VPN, смена DNS |
-| [kaspersky-matrica](tools/kaspersky-matrica/) | Помощник по исключениям Kaspersky для клиента Матрицы |
 
 ## Музей: старые наработки
 
