@@ -31,6 +31,26 @@ $script:VpnSeen = $false
 # inbound/outbound без единого внешнего запроса.
 $script:XrayStatsUrl = 'http://127.0.0.1:11111/debug/vars'
 
+# Признаки VPN-адаптеров (для Get-VpnState). Radmin и прочие «вечно Up» исключены
+# на уровне Get-TunnelState; здесь фильтр шире — это просто список имён.
+$script:VpnNameRegex = 'wireguard|openvpn|tap-|\btun\b|tunnel|vpn|proton|outline|amnezia|warp|radmin'
+$script:VpnExclude   = 'teredo|isatap|6to4|loopback'
+
+# Кандидаты DNS для теста (имя = подпись в таблице) и домены замера.
+$script:DnsCandidates = [ordered]@{
+    'Yandex 77.88.8.8'      = '77.88.8.8'
+    'Yandex 77.88.8.1'      = '77.88.8.1'
+    'Google 8.8.8.8'        = '8.8.8.8'
+    'Google 8.8.4.4'        = '8.8.4.4'
+    'Cloudflare 1.1.1.1'    = '1.1.1.1'
+    'Cloudflare 1.0.0.1'    = '1.0.0.1'
+    'Quad9 9.9.9.9'         = '9.9.9.9'
+    'AdGuard 94.140.14.14'  = '94.140.14.14'
+    'OpenDNS 208.67.222.222'= '208.67.222.222'
+}
+$script:BenchDomains = @('ya.ru','vk.com','wikipedia.org')
+function Get-DnsBenchDomains { $script:BenchDomains }
+
 # Сервис определения выходного адреса и его страны. ipinfo.io отдаёт country и city
 # и на замере 2026-08-26 ответил верно (DE, Frankfurt); ifconfig.co на том же адресе
 # выдал заведомо неверную страну, поэтому в резерве стоит только определение самого
@@ -398,6 +418,214 @@ function Get-HealthVerdict {
             Text = 'канал жив, но Claude Code сейчас ничего не шлёт' }
     }
     [pscustomobject]@{ Class = 'ok'; Severity = 'ok'; Text = 'всё работает' }
+}
+
+# ---------------- вспомогательные индикаторы (только чтение) ----------------
+# Перенесены сюда из net-monitor.ps1: их гоняет фоновый исполнитель, которому
+# доступен только этот модуль. Инвариант файла сохраняется — всё читающее.
+
+function Get-VpnState {
+    # 1) штатные VPN-подключения Windows
+    $names = @()
+    foreach ($v in @(Get-VpnConnection -ErrorAction SilentlyContinue) + @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue)) {
+        if ($v.ConnectionStatus -eq 'Connected') { $names += $v.Name }
+    }
+    # 2) адаптеры сторонних VPN (WireGuard/OpenVPN/Proton/...)
+    $ifaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+        Where-Object { $_.OperationalStatus -eq 'Up' } |
+        Where-Object { ($_.Name + ' ' + $_.Description) -match $script:VpnNameRegex -and ($_.Name + ' ' + $_.Description) -notmatch $script:VpnExclude }
+    foreach ($i in $ifaces) { $names += $i.Name }
+    $names = $names | Select-Object -Unique
+    $defaultVia = $false
+    $def = Get-DefaultRouteInfo
+    if ($def -and ($names -contains $def.Alias)) { $defaultVia = $true }
+    [pscustomobject]@{ Active = [bool]$names; Names = $names; DefaultVia = $defaultVia; VpnAliases = $names }
+}
+
+function Get-CurrentDns {
+    $def = Get-DefaultRouteInfo
+    if (-not $def) { return @() }
+    (Get-DnsClientServerAddress -InterfaceIndex $def.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
+}
+
+function Get-NetSnapshot {
+    # суммарные байты по default-route интерфейсу (fallback: все Up кроме loopback)
+    $def = Get-DefaultRouteInfo
+    $all = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+        Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' }
+    $sel = $all
+    if ($def) {
+        $m = $all | Where-Object { $_.Name -eq $def.Alias }
+        if ($m) { $sel = $m }
+    }
+    $rx = 0L; $tx = 0L
+    foreach ($i in $sel) { $s = $i.GetIPv4Statistics(); $rx += $s.BytesReceived; $tx += $s.BytesSent }
+    [pscustomobject]@{ Rx = $rx; Tx = $tx; At = (Get-Date) }
+}
+
+function Format-Speed([double]$bps) {
+    if ($bps -ge 1MB) { '{0:0.0} МБ/с' -f ($bps/1MB) }
+    elseif ($bps -ge 1KB) { '{0:0} КБ/с' -f ($bps/1KB) }
+    else { '{0:0} Б/с' -f $bps }
+}
+
+function Format-Bytes([double]$b) {
+    if ($b -ge 1GB) { '{0:0.00} ГБ' -f ($b/1GB) }
+    elseif ($b -ge 1MB) { '{0:0.0} МБ' -f ($b/1MB) }
+    elseif ($b -ge 1KB) { '{0:0} КБ' -f ($b/1KB) }
+    else { '{0:0} Б' -f $b }
+}
+
+function Resolve-FirstIPv4([string]$name) {
+    try {
+        $r = Resolve-DnsName -Name $name -Type A -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -First 1
+        if ($r) { return $r.IPAddress }
+    } catch {}
+    $null
+}
+
+function Get-SiteRouteVerdict([string]$site) {
+    $ip = Resolve-FirstIPv4 $site
+    if (-not $ip) { return "«$site»: имя не резолвится (DNS не ответил)." }
+    $vpn = Get-VpnState
+    $alias = $null
+    try {
+        $rt = Find-NetRoute -RemoteIPAddress $ip -ErrorAction Stop
+        $alias = ($rt | Select-Object -ExpandProperty InterfaceAlias -Unique | Select-Object -First 1)
+    } catch {}
+    if (-not $alias) { return "«$site» → $ip : маршрут определить не удалось." }
+    if ($vpn.VpnAliases -contains $alias) {
+        "«$site» → $ip`nПойдёт ЧЕРЕЗ VPN (интерфейс: $alias)."
+    } else {
+        $tail = if ($vpn.Active) { "`n(VPN при этом активен: $($vpn.Names -join ', ') — но этот сайт идёт мимо него)" } else { '' }
+        "«$site» → $ip`nПойдёт НАПРЯМУЮ (интерфейс: $alias).$tail"
+    }
+}
+
+function Invoke-DnsBench {
+    # → массив [pscustomobject] Name, Ip, Ms (среднее по доменам; $null = не ответил)
+    $rows = @()
+    $list = [ordered]@{}
+    $curr = @(Get-CurrentDns)
+    for ($i = 0; $i -lt $curr.Count; $i++) { $list["Текущий #$($i+1) ($($curr[$i]))"] = $curr[$i] }
+    foreach ($k in $script:DnsCandidates.Keys) { if ($curr -notcontains $script:DnsCandidates[$k]) { $list[$k] = $script:DnsCandidates[$k] } }
+    foreach ($name in $list.Keys) {
+        $ip = $list[$name]
+        $times = @()
+        foreach ($d in $script:BenchDomains) {
+            $t = Measure-Command {
+                try { Resolve-DnsName -Name $d -Server $ip -Type A -DnsOnly -QuickTimeout -ErrorAction Stop | Out-Null; $script:__ok = $true }
+                catch { $script:__ok = $false }
+            }
+            if ($script:__ok) { $times += $t.TotalMilliseconds }
+        }
+        $ms = if ($times.Count -gt 0) { [math]::Round(($times | Measure-Object -Average).Average, 0) } else { $null }
+        $rows += [pscustomobject]@{ Name = $name; Ip = $ip; Ms = $ms; Answers = $times.Count }
+    }
+    $rows
+}
+
+# ---------------- готовые отчёты для окон ----------------
+# Текст собирается здесь, потому что сбор — это десятки секунд сетевых проверок:
+# исполняться они должны в фоне, а окно лишь показывает готовую строку.
+
+function Get-StatusReport {
+    param([string]$Version = '')
+    $inet = Test-Link
+    $vpn  = Get-VpnState
+    $def  = Get-DefaultRouteInfo
+    $dns  = @(Get-CurrentDns)
+    $sb = New-Object System.Text.StringBuilder
+    $vtag = if ($Version) { "  ·  net-monitor v$Version" } else { '' }
+    [void]$sb.AppendLine("=== Статус сети  $(Get-Date -Format 'HH:mm:ss')$vtag ===")
+    $inetLine = if ($inet.IpOk -and $inet.DnsOk) { 'ЕСТЬ (IP-связь + DNS работают)' }
+                elseif ($inet.IpOk) { 'ЧАСТИЧНО: IP-связь есть, но DNS не отвечает — похоже, проблема в DNS-сервере' }
+                elseif ($inet.DnsOk) { 'СТРАННО: DNS отвечает, IP-якоря нет' }
+                else { 'НЕТ (ни один якорь не отвечает)' }
+    [void]$sb.AppendLine("Интернет: $inetLine")
+    [void]$sb.AppendLine("Выход в сеть: " + $(if ($def) { $def.Alias } else { 'маршрут по умолчанию не найден!' }))
+    if ($vpn.Active) {
+        $via = if ($vpn.DefaultVia) { 'ВЕСЬ трафик идёт через VPN' } else { 'VPN активен, но трафик по умолчанию идёт МИМО него' }
+        [void]$sb.AppendLine("VPN: включён ($($vpn.Names -join ', ')) — $via")
+    } else {
+        [void]$sb.AppendLine('VPN: не активен, всё напрямую')
+    }
+    [void]$sb.AppendLine("DNS сейчас: " + $(if ($dns) { $dns -join ', ' } else { 'не задан / DHCP не выдал' }))
+    [void]$sb.AppendLine('')
+
+    # --- канал Claude Code и выходная точка ---
+    $tun = Get-TunnelState
+    if (Test-ClaudePresent) {
+        [void]$sb.AppendLine('--- канал Claude Code ---')
+        $cc = Test-ClaudeChannel
+        [void]$sb.AppendLine("Связь с Anthropic: " + $(if ($cc.Ok) { "ЕСТЬ ($($cc.Reason), $($cc.Ms) мс)" } else { "НЕТ — $($cc.Reason)" }))
+        [void]$sb.AppendLine("Путь Claude Code: " + $(if ($cc.Via) { $cc.Via } else { 'напрямую, без прокси' }))
+    }
+    if ($tun.AdapterUp) {
+        [void]$sb.AppendLine("Туннель: $($tun.AdapterName) — " + $(if ($tun.ViaTunnel) { 'трафик идёт через него' } else { 'поднят, но трафик идёт мимо' }))
+        if ($tun.Upstream) { [void]$sb.AppendLine("Узлы VPN: " + ($tun.Upstream -join ', ')) }
+    } elseif ($tun.Configured) {
+        [void]$sb.AppendLine('Туннель: не поднят')
+    } else {
+        [void]$sb.AppendLine('VPN: на этой машине не обнаружен — контроль туннеля выключен')
+    }
+    $eg = Test-Egress
+    [void]$sb.AppendLine("Выход в интернет: " + $eg.Reason)
+    $st = Get-XrayStats
+    if ($st) {
+        [void]$sb.AppendLine(("Всего через прокси: Claude Code {0}, туннель {1}, мимо туннеля {2}" -f
+            (Format-Bytes ($st.HttpIn + $st.HttpOut)), (Format-Bytes ($st.ProxyIn + $st.ProxyOut)), (Format-Bytes ($st.DirectIn + $st.DirectOut))))
+    }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('Интерфейсы (Up):')
+    foreach ($i in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
+             Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' }) {
+        $ips = ($i.GetIPProperties().UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.Address.ToString() }) -join ', '
+        [void]$sb.AppendLine("  $($i.Name) [$($i.NetworkInterfaceType)] $ips")
+    }
+    $sb.ToString()
+}
+
+function Get-ClaudeChannelReport {
+    # Отчёт окна «Канал Claude Code». Внутри полторы секунды замера трафика и сетевые
+    # проверки — вызывать только из фонового исполнителя.
+    $sb = New-Object System.Text.StringBuilder
+    $cc  = Test-ClaudeChannel
+    $tun = Get-TunnelState
+    $eg  = Test-Egress
+    $s1 = Get-XrayStats; Start-Sleep -Milliseconds 1500; $s2 = Get-XrayStats
+    $fl = Get-FlowDelta $s1 $s2
+
+    [void]$sb.AppendLine("=== Канал Claude Code  $(Get-Date -Format 'HH:mm:ss') ===")
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine("Связь с Anthropic: " + $(if ($cc.Ok) { "ЕСТЬ — $($cc.Reason), отклик $($cc.Ms) мс" } else { "НЕТ — $($cc.Reason)" }))
+    [void]$sb.AppendLine("Проверено тем же путём, которым ходит Claude Code: " + $(if ($cc.Via) { $cc.Via } else { 'напрямую' }))
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine("Туннель: " + $(if ($tun.Ok) { "$($tun.AdapterName), трафик идёт через него" }
+                                         elseif ($tun.AdapterUp) { "$($tun.AdapterName) поднят, но трафик идёт мимо" }
+                                         else { 'не поднят' }))
+    if ($tun.Upstream) { [void]$sb.AppendLine("Узлы VPN: " + ($tun.Upstream -join ', ')) }
+    [void]$sb.AppendLine("Выход: $($eg.Reason)")
+    [void]$sb.AppendLine('')
+    if ($fl) {
+        [void]$sb.AppendLine("--- за последние $([int]$fl.Seconds) с ---")
+        [void]$sb.AppendLine("Трафик Claude Code: $(Format-Bytes $fl.ClaudeBytes)")
+        [void]$sb.AppendLine("Через туннель:      $(Format-Bytes $fl.TunnelBytes)")
+        # «Утечка» — только когда трафик перестал идти через туннель. Часть трафика
+        # штатно ходит напрямую (так настроена маршрутизация клиента), и подписывать
+        # это утечкой значило бы пугать владельца при каждой открытой странице.
+        $leakMark = if (-not $tun.ViaTunnel -and $fl.DirectBytes -gt 0) { '   ← мимо туннеля!' } else { '' }
+        [void]$sb.AppendLine("Мимо туннеля:       $(Format-Bytes $fl.DirectBytes)$leakMark")
+        [void]$sb.AppendLine('')
+        # Тот самый вопрос: Клод завис или интернет отвалился.
+        $answer = if (-not $cc.Ok) { 'СЕТЬ: канал до Anthropic не отвечает — Claude Code ждёт впустую.' }
+                  elseif ($fl.ClaudeBytes -gt 0) { 'РАБОТАЕТ: канал жив и токены идут прямо сейчас.' }
+                  else { 'КАНАЛ ЖИВ, но обмена нет: либо Claude Code сейчас думает/ждёт вас, либо он подвис — сеть тут не виновата.' }
+        [void]$sb.AppendLine("Вердикт: $answer")
+    } else {
+        [void]$sb.AppendLine('Счётчики xray недоступны (порт 11111 не отвечает) — трафик по процессам не виден.')
+    }
+    $sb.ToString()
 }
 
 function Get-FullHealth {
