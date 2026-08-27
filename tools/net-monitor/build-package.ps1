@@ -24,6 +24,14 @@ $ErrorActionPreference = 'Stop'
 $here = $PSScriptRoot
 if (-not $OutDir) { $OutDir = $here }
 
+# Версия релиза — из константы главного скрипта (единственного места, где она
+# задаётся). Она попадает в имя архива: получатель и владелец всегда видят, ЧТО
+# именно за файл у них лежит, а установщик покажет её при обновлении.
+$verMatch = [regex]::Match([System.IO.File]::ReadAllText((Join-Path $here 'net-monitor.ps1'), [System.Text.Encoding]::UTF8),
+                           "(?m)^\`$AppVersion\s*=\s*'([^']+)'")
+if (-not $verMatch.Success) { throw "В net-monitor.ps1 не нашлась строка `$AppVersion = '...' — сборщик не знает версию." }
+$version = $verMatch.Groups[1].Value
+
 $stage = Join-Path ([System.IO.Path]::GetTempPath()) ("net-monitor-pkg-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $pkgDir = Join-Path $stage 'net-monitor'
 New-Item -ItemType Directory -Path $pkgDir -Force | Out-Null
@@ -42,17 +50,23 @@ function Copy-WithBom([string]$src, [string]$dst) {
 }
 
 if ($Single) {
-    # Склейка: вместо загрузки модулей вставляем их содержимое. Так папку lib нельзя
-    # потерять при распаковке. Результат — обычный читаемый .ps1, не «сборка».
+    # Склейка: вместо загрузки модулей с диска вставляем их текст here-string'ом в
+    # $script:LibSource. Так папку lib нельзя потерять при распаковке, а фоновый
+    # исполнитель получает тот же текст модулей, что и главный поток. Результат —
+    # обычный читаемый .ps1, не «сборка».
     $main = [System.IO.File]::ReadAllText((Join-Path $here 'net-monitor.ps1'), [System.Text.Encoding]::UTF8)
-    $libs = foreach ($m in @('probe.ps1', 'recovery.ps1')) {
-        $p = Join-Path $here "lib\$m"
+    $libText = (@(foreach ($m in @('probe.ps1', 'recovery.ps1')) {
         "# --- начало lib\$m (вставлено сборщиком) ---" + [Environment]::NewLine +
-        [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8) + [Environment]::NewLine +
+        [System.IO.File]::ReadAllText((Join-Path $here "lib\$m"), [System.Text.Encoding]::UTF8) + [Environment]::NewLine +
         "# --- конец lib\$m ---"
-    }
-    # Заменяем весь блок загрузки модулей на их тела.
-    $loader = [regex]'(?ms)^foreach \(\$m in @\(''probe\.ps1'',''recovery\.ps1''\)\) \{.*?^\}'
+    }) -join [Environment]::NewLine)
+    # Текст модулей не должен содержать строки-терминатора here-string — иначе
+    # склеенный файл оборвётся посреди модуля и перестанет парситься.
+    if ($libText -match "(?m)^'@") { throw "В модулях встретилась строка '@ — here-string склейки сломается." }
+    $inline = '$script:LibSource = @''' + [Environment]::NewLine + $libText + [Environment]::NewLine + '''@' +
+              [Environment]::NewLine + '. ([scriptblock]::Create($script:LibSource))'
+    # Заменяем весь блок загрузки модулей (от $script:LibSource = '' до выполнения).
+    $loader = [regex]'(?ms)^\$script:LibSource = ''''\r?\n.*?^\. \(\[scriptblock\]::Create\(\$script:LibSource\)\)'
     $m = $loader.Match($main)
     if (-not $m.Success) {
         throw 'Не нашёл блок загрузки модулей в net-monitor.ps1 — сборщик устарел, поправьте регулярное выражение.'
@@ -60,10 +74,13 @@ if ($Single) {
     # Склейка строк по индексам, а не Regex.Replace: в тексте замены полно знаков $
     # (это же код PowerShell), и .NET принял бы их за групповые подстановки — файл
     # раздувается и перестаёт парситься.
-    $main = $main.Substring(0, $m.Index) +
-            ($libs -join [Environment]::NewLine) +
-            $main.Substring($m.Index + $m.Length)
+    $main = $main.Substring(0, $m.Index) + $inline + $main.Substring($m.Index + $m.Length)
     [System.IO.File]::WriteAllText((Join-Path $pkgDir 'net-monitor.ps1'), $main, $utf8Bom)
+    # Контроль: склеенный файл обязан парситься — иначе получатель получит утилиту,
+    # которая молча не стартует.
+    $perr = $null
+    [System.Management.Automation.Language.Parser]::ParseInput($main, [ref]$null, [ref]$perr) | Out-Null
+    if ($perr) { throw "Склеенный net-monitor.ps1 не парсится: $($perr[0].Message)" }
 } else {
     Copy-WithBom (Join-Path $here 'net-monitor.ps1') (Join-Path $pkgDir 'net-monitor.ps1')
     New-Item -ItemType Directory -Path (Join-Path $pkgDir 'lib') -Force | Out-Null
@@ -76,13 +93,15 @@ if ($Single) {
 # OEM-кодировке и превратилась бы в мусор на чужой машине.
 # Все три файла обязательны: без инструкции получателю пакет неполон, а тихий пропуск
 # приводил к «Готово» и совету прочитать файл, которого в архиве нет.
-foreach ($f in @('Запустить.cmd', 'README.md', 'ДЛЯ-ПОЛУЧАТЕЛЯ.txt')) {
+foreach ($f in @('Запустить.cmd', 'Установить.cmd', 'README.md', 'ДЛЯ-ПОЛУЧАТЕЛЯ.txt')) {
     $src = Join-Path $here $f
     if (-not (Test-Path $src)) { throw "Не найден обязательный файл пакета: $f" }
     Copy-Item $src (Join-Path $pkgDir $f)
 }
+# Установщик — тоже .ps1, значит тоже обязан уехать с BOM.
+Copy-WithBom (Join-Path $here 'install.ps1') (Join-Path $pkgDir 'install.ps1')
 
-$zip = Join-Path $OutDir 'net-monitor.zip'
+$zip = Join-Path $OutDir "net-monitor-$version.zip"
 if (Test-Path $zip) { Remove-Item $zip -Force }
 # Упаковываем содержимое папки, а не саму папку: иначе после «Извлечь всё» в
 # C:\Utils\net-monitor получалось C:\Utils\net-monitor\net-monitor.
@@ -93,7 +112,7 @@ Compress-Archive -Path (Join-Path $pkgDir '*') -DestinationPath $zip -Compressio
     $files = (Get-ChildItem $pkgDir -Recurse -File | Measure-Object).Count
 
     Write-Host ''
-    Write-Host "Готово: $zip  ($size КБ, файлов: $files, режим: $(if ($Single) { 'один скрипт' } else { 'скрипт + папка lib' }))"
+    Write-Host "Готово: $zip  (v$version, $size КБ, файлов: $files, режим: $(if ($Single) { 'один скрипт' } else { 'скрипт + папка lib' }))"
     Write-Host "SHA256: $hash"
     Write-Host ''
     Write-Host 'Как передать:'

@@ -21,33 +21,19 @@ param(
 $ErrorActionPreference = 'SilentlyContinue'
 
 # ---------------- конфиг ----------------
+# Версия утилиты — ЕДИНСТВЕННОЕ место, где она задаётся. Показывается в меню трея,
+# логе и отчёте статуса; сборщик build-package.ps1 читает её отсюда для имени архива,
+# установщик install.ps1 — для сравнения «что стоит / что ставим».
+$AppVersion = '1.1.0'
 $AppName  = 'BrainNetMonitor'
 $DataDir  = Join-Path $env:LOCALAPPDATA 'net-monitor'
 $LogFile  = Join-Path $DataDir 'log.txt'
 $ConfFile = Join-Path $DataDir 'config.json'
 if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
-# Кандидаты DNS для теста (имя = подпись в таблице)
-$DnsCandidates = [ordered]@{
-    'Yandex 77.88.8.8'      = '77.88.8.8'
-    'Yandex 77.88.8.1'      = '77.88.8.1'
-    'Google 8.8.8.8'        = '8.8.8.8'
-    'Google 8.8.4.4'        = '8.8.4.4'
-    'Cloudflare 1.1.1.1'    = '1.1.1.1'
-    'Cloudflare 1.0.0.1'    = '1.0.0.1'
-    'Quad9 9.9.9.9'         = '9.9.9.9'
-    'AdGuard 94.140.14.14'  = '94.140.14.14'
-    'OpenDNS 208.67.222.222'= '208.67.222.222'
-}
-$BenchDomains = @('ya.ru','vk.com','wikipedia.org')
-
-# Якоря «интернет жив» заданы в lib/probe.ps1 (Test-Link): набор из разных «миров»,
-# чтобы блокировка сервисов одной страны не выглядела как «интернета нет». Здесь их
-# дубля быть не должно — иначе трей считал бы состояние по одному набору, а
-# диагностика по другому.
-
-$VpnNameRegex = 'wireguard|openvpn|tap-|\btun\b|tunnel|vpn|proton|outline|amnezia|warp|radmin'
-$VpnExclude   = 'teredo|isatap|6to4|loopback'
+# Якоря «интернет жив», список DNS-кандидатов и признаки VPN-адаптеров заданы в
+# lib/probe.ps1: их использует и трей, и фоновый исполнитель. Дубля здесь быть не
+# должно — иначе трей считал бы состояние по одному набору, а диагностика по другому.
 
 function Write-Log([string]$msg) {
     try { Add-Content -Path $LogFile -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg) -Encoding UTF8 } catch {}
@@ -93,116 +79,21 @@ function Test-IsAdmin {
 # probe.ps1  — индикаторы состояния (только читает: Test-TcpPort, Get-DefaultRouteInfo,
 #              Test-Link, Get-TunnelState, Test-ClaudeChannel, Test-Egress, Get-FullHealth)
 # recovery.ps1 — лестница восстановления, снапшот и откат (всё, что меняет систему)
+# Исходник модулей сохраняется СТРОКОЙ ($script:LibSource): его же выполняет у себя
+# фоновый исполнитель. Так один и тот же код работает и из папки lib, и в склеенной
+# сборке (build-package.ps1 -Single заменяет этот блок на встроенный текст модулей).
+$script:LibSource = ''
 foreach ($m in @('probe.ps1','recovery.ps1')) {
     $p = Join-Path $PSScriptRoot "lib\$m"
     if (-not (Test-Path $p)) { throw "Не найден модуль lib\$m рядом со скриптом ($PSScriptRoot)." }
-    . $p
+    $script:LibSource += [System.IO.File]::ReadAllText($p, [System.Text.Encoding]::UTF8) + [Environment]::NewLine
 }
+. ([scriptblock]::Create($script:LibSource))
 
 # ---------------- сетевые проверки ----------------
-
-function Get-VpnState {
-    # 1) штатные VPN-подключения Windows
-    $names = @()
-    foreach ($v in @(Get-VpnConnection -ErrorAction SilentlyContinue) + @(Get-VpnConnection -AllUserConnection -ErrorAction SilentlyContinue)) {
-        if ($v.ConnectionStatus -eq 'Connected') { $names += $v.Name }
-    }
-    # 2) адаптеры сторонних VPN (WireGuard/OpenVPN/Proton/...)
-    $ifaces = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
-        Where-Object { $_.OperationalStatus -eq 'Up' } |
-        Where-Object { ($_.Name + ' ' + $_.Description) -match $VpnNameRegex -and ($_.Name + ' ' + $_.Description) -notmatch $VpnExclude }
-    foreach ($i in $ifaces) { $names += $i.Name }
-    $names = $names | Select-Object -Unique
-    $defaultVia = $false
-    $def = Get-DefaultRouteInfo
-    if ($def -and ($names -contains $def.Alias)) { $defaultVia = $true }
-    [pscustomobject]@{ Active = [bool]$names; Names = $names; DefaultVia = $defaultVia; VpnAliases = $names }
-}
-
-function Get-CurrentDns {
-    $def = Get-DefaultRouteInfo
-    if (-not $def) { return @() }
-    (Get-DnsClientServerAddress -InterfaceIndex $def.IfIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue).ServerAddresses
-}
-
-function Get-NetSnapshot {
-    # суммарные байты по default-route интерфейсу (fallback: все Up кроме loopback)
-    $def = Get-DefaultRouteInfo
-    $all = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
-        Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' }
-    $sel = $all
-    if ($def) {
-        $m = $all | Where-Object { $_.Name -eq $def.Alias }
-        if ($m) { $sel = $m }
-    }
-    $rx = 0L; $tx = 0L
-    foreach ($i in $sel) { $s = $i.GetIPv4Statistics(); $rx += $s.BytesReceived; $tx += $s.BytesSent }
-    [pscustomobject]@{ Rx = $rx; Tx = $tx; At = (Get-Date) }
-}
-
-function Test-Internet { Test-Link }   # якоря живут в probe.ps1 — там их набор из разных «миров»
-
-function Format-Speed([double]$bps) {
-    if ($bps -ge 1MB) { '{0:0.0} МБ/с' -f ($bps/1MB) }
-    elseif ($bps -ge 1KB) { '{0:0} КБ/с' -f ($bps/1KB) }
-    else { '{0:0} Б/с' -f $bps }
-}
-
-function Format-Bytes([double]$b) {
-    if ($b -ge 1GB) { '{0:0.00} ГБ' -f ($b/1GB) }
-    elseif ($b -ge 1MB) { '{0:0.0} МБ' -f ($b/1MB) }
-    elseif ($b -ge 1KB) { '{0:0} КБ' -f ($b/1KB) }
-    else { '{0:0} Б' -f $b }
-}
-
-function Resolve-FirstIPv4([string]$name) {
-    try {
-        $r = Resolve-DnsName -Name $name -Type A -DnsOnly -QuickTimeout -ErrorAction Stop | Where-Object { $_.IPAddress } | Select-Object -First 1
-        if ($r) { return $r.IPAddress }
-    } catch {}
-    $null
-}
-
-function Get-SiteRouteVerdict([string]$site) {
-    $ip = Resolve-FirstIPv4 $site
-    if (-not $ip) { return "«$site»: имя не резолвится (DNS не ответил)." }
-    $vpn = Get-VpnState
-    $alias = $null
-    try {
-        $rt = Find-NetRoute -RemoteIPAddress $ip -ErrorAction Stop
-        $alias = ($rt | Select-Object -ExpandProperty InterfaceAlias -Unique | Select-Object -First 1)
-    } catch {}
-    if (-not $alias) { return "«$site» → $ip : маршрут определить не удалось." }
-    if ($vpn.VpnAliases -contains $alias) {
-        "«$site» → $ip`nПойдёт ЧЕРЕЗ VPN (интерфейс: $alias)."
-    } else {
-        $tail = if ($vpn.Active) { "`n(VPN при этом активен: $($vpn.Names -join ', ') — но этот сайт идёт мимо него)" } else { '' }
-        "«$site» → $ip`nПойдёт НАПРЯМУЮ (интерфейс: $alias).$tail"
-    }
-}
-
-function Invoke-DnsBench {
-    # → массив [pscustomobject] Name, Ip, Ms (среднее по доменам; $null = не ответил)
-    $rows = @()
-    $list = [ordered]@{}
-    $curr = @(Get-CurrentDns)
-    for ($i = 0; $i -lt $curr.Count; $i++) { $list["Текущий #$($i+1) ($($curr[$i]))"] = $curr[$i] }
-    foreach ($k in $DnsCandidates.Keys) { if ($curr -notcontains $DnsCandidates[$k]) { $list[$k] = $DnsCandidates[$k] } }
-    foreach ($name in $list.Keys) {
-        $ip = $list[$name]
-        $times = @()
-        foreach ($d in $BenchDomains) {
-            $t = Measure-Command {
-                try { Resolve-DnsName -Name $d -Server $ip -Type A -DnsOnly -QuickTimeout -ErrorAction Stop | Out-Null; $script:__ok = $true }
-                catch { $script:__ok = $false }
-            }
-            if ($script:__ok) { $times += $t.TotalMilliseconds }
-        }
-        $ms = if ($times.Count -gt 0) { [math]::Round(($times | Measure-Object -Average).Average, 0) } else { $null }
-        $rows += [pscustomobject]@{ Name = $name; Ip = $ip; Ms = $ms; Answers = $times.Count }
-    }
-    $rows
-}
+# Все читающие проверки (Get-VpnState, Get-NetSnapshot, Invoke-DnsBench, отчёты…)
+# живут в lib/probe.ps1 — их выполняет и фоновый исполнитель. Здесь остаётся только
+# то, что МЕНЯЕТ систему (DNS) и потому исполняется в потоке интерфейса.
 
 function Get-DnsTargetInterface {
     # Куда писать DNS. НЕ «интерфейс маршрута по умолчанию»: при активном VPN это сам
@@ -251,61 +142,6 @@ function Reset-DnsToDhcp {
     }
 }
 
-function Get-StatusReport {
-    $inet = Test-Internet
-    $vpn  = Get-VpnState
-    $def  = Get-DefaultRouteInfo
-    $dns  = @(Get-CurrentDns)
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine("=== Статус сети  $(Get-Date -Format 'HH:mm:ss') ===")
-    $inetLine = if ($inet.IpOk -and $inet.DnsOk) { 'ЕСТЬ (IP-связь + DNS работают)' }
-                elseif ($inet.IpOk) { 'ЧАСТИЧНО: IP-связь есть, но DNS не отвечает — похоже, проблема в DNS-сервере' }
-                elseif ($inet.DnsOk) { 'СТРАННО: DNS отвечает, IP-якоря нет' }
-                else { 'НЕТ (ни один якорь не отвечает)' }
-    [void]$sb.AppendLine("Интернет: $inetLine")
-    [void]$sb.AppendLine("Выход в сеть: " + $(if ($def) { $def.Alias } else { 'маршрут по умолчанию не найден!' }))
-    if ($vpn.Active) {
-        $via = if ($vpn.DefaultVia) { 'ВЕСЬ трафик идёт через VPN' } else { 'VPN активен, но трафик по умолчанию идёт МИМО него' }
-        [void]$sb.AppendLine("VPN: включён ($($vpn.Names -join ', ')) — $via")
-    } else {
-        [void]$sb.AppendLine('VPN: не активен, всё напрямую')
-    }
-    [void]$sb.AppendLine("DNS сейчас: " + $(if ($dns) { $dns -join ', ' } else { 'не задан / DHCP не выдал' }))
-    [void]$sb.AppendLine('')
-
-    # --- канал Claude Code и выходная точка ---
-    $tun = Get-TunnelState
-    if (Test-ClaudePresent) {
-        [void]$sb.AppendLine('--- канал Claude Code ---')
-        $cc = Test-ClaudeChannel
-        [void]$sb.AppendLine("Связь с Anthropic: " + $(if ($cc.Ok) { "ЕСТЬ ($($cc.Reason), $($cc.Ms) мс)" } else { "НЕТ — $($cc.Reason)" }))
-        [void]$sb.AppendLine("Путь Claude Code: " + $(if ($cc.Via) { $cc.Via } else { 'напрямую, без прокси' }))
-    }
-    if ($tun.AdapterUp) {
-        [void]$sb.AppendLine("Туннель: $($tun.AdapterName) — " + $(if ($tun.ViaTunnel) { 'трафик идёт через него' } else { 'поднят, но трафик идёт мимо' }))
-        if ($tun.Upstream) { [void]$sb.AppendLine("Узлы VPN: " + ($tun.Upstream -join ', ')) }
-    } elseif ($tun.Configured) {
-        [void]$sb.AppendLine('Туннель: не поднят')
-    } else {
-        [void]$sb.AppendLine('VPN: на этой машине не обнаружен — контроль туннеля выключен')
-    }
-    $eg = Test-Egress
-    [void]$sb.AppendLine("Выход в интернет: " + $eg.Reason)
-    $st = Get-XrayStats
-    if ($st) {
-        [void]$sb.AppendLine(("Всего через прокси: Claude Code {0}, туннель {1}, мимо туннеля {2}" -f
-            (Format-Bytes ($st.HttpIn + $st.HttpOut)), (Format-Bytes ($st.ProxyIn + $st.ProxyOut)), (Format-Bytes ($st.DirectIn + $st.DirectOut))))
-    }
-    [void]$sb.AppendLine('')
-    [void]$sb.AppendLine('Интерфейсы (Up):')
-    foreach ($i in [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
-             Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' }) {
-        $ips = ($i.GetIPProperties().UnicastAddresses | Where-Object { $_.Address.AddressFamily -eq 'InterNetwork' } | ForEach-Object { $_.Address.ToString() }) -join ', '
-        [void]$sb.AppendLine("  $($i.Name) [$($i.NetworkInterfaceType)] $ips")
-    }
-    $sb.ToString()
-}
-
 # ---------------- режим -Once (диагностика в консоль) ----------------
 if ($Once) {
     try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -317,7 +153,7 @@ if ($Once) {
     Start-Sleep -Seconds 2
     $s2 = Get-NetSnapshot; $x2 = Get-XrayStats
     $dt = ($s2.At - $s1.At).TotalSeconds
-    Write-Host (Get-StatusReport)
+    Write-Host (Get-StatusReport -Version $AppVersion)
     Write-Host ("Скорость за 2 с:  ↓ {0}   ↑ {1}" -f (Format-Speed (($s2.Rx-$s1.Rx)/$dt)), (Format-Speed (($s2.Tx-$s1.Tx)/$dt)))
     $fl = Get-FlowDelta $x1 $x2
     if ($fl) {
@@ -334,7 +170,7 @@ if ($SelfTest) {
     Set-ExpectedCountry $cfgT.expectedCountry
     Set-WatchModes $cfgT.vpnMode $cfgT.claudeMode
     Set-VpnSeen ([bool]$cfgT.vpnSeen)
-    Write-Host '=== Самопроверка net-monitor (ничего не меняется) ==='
+    Write-Host "=== Самопроверка net-monitor v$AppVersion (ничего не меняется) ==="
     Write-Host ("Права администратора: {0}" -f $(if (Test-IsAdmin) { 'есть' } else { 'НЕТ — шаги восстановления будут пропускаться' }))
     Write-Host ("Автовосстановление: {0} · перезапуск VPN: {1} · перезапуск адаптера: {2} · пауза: {3} с · ожидаемая страна: {4}" -f
         $(if ($cfgT.autoRecover) { 'включено' } else { 'выключено' }),
@@ -412,6 +248,96 @@ Set-ExpectedCountry $cfg.expectedCountry
 Set-WatchModes $cfg.vpnMode $cfg.claudeMode
 Set-VpnSeen ([bool]$cfg.vpnSeen)
 
+# ---------------- фоновый исполнитель ----------------
+# ЛЕЧЕНИЕ ЗАВИСАНИЙ МЕНЮ. Раньше все сетевые проверки шли прямо в тике таймера, то
+# есть в потоке интерфейса: пока Test-ClaudeChannel ждал свои 10 секунд таймаута,
+# правый клик стоял в очереди — меню появлялось с опозданием, где попало, и висело
+# с курсором ожидания. Теперь долгие операции выполняет ОТДЕЛЬНЫЙ runspace, а поток
+# интерфейса только забирает готовые результаты и рисует.
+#
+# Устройство: один runspace + очередь заданий, строго по одному за раз. Сериализация
+# намеренная: пробы и шаги восстановления не должны толкаться (шаг меняет систему,
+# проба тут же мерила бы переходное состояние). Задание = скрипт (строка) + аргументы
+# + OnDone-обработчик, который выполняется в потоке интерфейса из тика.
+$script:workerRs = [runspacefactory]::CreateRunspace()
+$script:workerRs.Open()
+$initPs = [powershell]::Create()
+$initPs.Runspace = $script:workerRs
+# Внутри runspace — те же модули, что и здесь (текстом, см. $script:LibSource), плюс
+# свой Write-Log в тот же файл. Состояние probe-модуля (страна, режимы) там СВОЁ:
+# каждое задание получает свежие значения аргументами и выставляет их само — иначе
+# смена настроек в меню не доходила бы до фона.
+[void]$initPs.AddScript(@'
+param($libSource, $logFile)
+$ErrorActionPreference = 'SilentlyContinue'
+$script:WorkerLogFile = $logFile
+function Write-Log([string]$msg) {
+    # Путь — в script-переменной: параметры init-скрипта после его завершения
+    # недоступны, и лог из фоновых заданий молча пропадал бы.
+    try { Add-Content -Path $script:WorkerLogFile -Value ("{0}  {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $msg) -Encoding UTF8 } catch {}
+}
+. ([scriptblock]::Create($libSource))
+'@).AddArgument($script:LibSource).AddArgument($LogFile)
+[void]$initPs.Invoke()
+$initPs.Dispose()
+
+$script:jobQueue  = New-Object System.Collections.Queue
+$script:jobActive = $null
+
+# Каждое задание начинается с установки режимов — свежих, из текущих настроек.
+$JobPreamble = @'
+param($a)
+Set-ExpectedCountry $a.ExpectedCountry
+Set-WatchModes $a.VpnMode $a.ClaudeMode
+Set-VpnSeen $a.VpnSeen
+'@
+
+function Get-ModeArgs {
+    @{ ExpectedCountry = (Get-ExpectedCountry); VpnMode = $cfg.vpnMode
+       ClaudeMode = $cfg.claudeMode; VpnSeen = (Get-VpnSeen) }
+}
+
+function Add-WorkerJob([string]$Kind, [string]$Body, [hashtable]$Arg, [scriptblock]$OnDone) {
+    $script:jobQueue.Enqueue(@{ Kind = $Kind; Script = ($JobPreamble + $Body); Arg = $Arg; OnDone = $OnDone })
+}
+
+function Test-WorkerBusyWith([string]$Kind) {
+    if ($script:jobActive -and $script:jobActive.Kind -eq $Kind) { return $true }
+    foreach ($j in $script:jobQueue) { if ($j.Kind -eq $Kind) { return $true } }
+    $false
+}
+
+function Update-Worker {
+    # Вызывается из тика. Забирает готовый результат (и зовёт OnDone в потоке
+    # интерфейса), затем запускает следующее задание из очереди.
+    if ($script:jobActive -and $script:jobActive.Handle.IsCompleted) {
+        $j = $script:jobActive
+        $script:jobActive = $null
+        $res = $null
+        try {
+            # Один выход — отдаём как есть, несколько — массивом (DNS-тест
+            # возвращает строки таблицы; «последний элемент» потерял бы их).
+            $out = @($j.PS.EndInvoke($j.Handle))
+            $res = if ($out.Count -le 1) { $out[0] } else { $out }
+        }
+        catch { Write-Log "worker error ($($j.Kind)): $_" }
+        $j.PS.Dispose()
+        if ($j.OnDone) {
+            try { & $j.OnDone $res } catch { Write-Log "worker OnDone error ($($j.Kind)): $_" }
+        }
+    }
+    if (-not $script:jobActive -and $script:jobQueue.Count -gt 0) {
+        $j = $script:jobQueue.Dequeue()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $script:workerRs
+        [void]$ps.AddScript($j.Script)
+        [void]$ps.AddArgument($j.Arg)
+        $j.PS = $ps
+        $j.Handle = $ps.BeginInvoke()
+        $script:jobActive = $j
+    }
+}
+
 function New-TrayIcon([string]$state, [bool]$vpn, [bool]$egressAlarm = $false) {
     # state: green|orange|red|gray. Кольцо: синее = VPN активен,
     # красное = авария выхода (сменилась страна или трафик пошёл мимо туннеля).
@@ -450,10 +376,18 @@ function New-TrayIcon([string]$state, [bool]$vpn, [bool]$egressAlarm = $false) {
 
 $notify = New-Object System.Windows.Forms.NotifyIcon
 $notify.Icon = New-TrayIcon 'gray' $false
-$notify.Text = 'net-monitor: запуск…'
+$notify.Text = "net-monitor v$AppVersion — запуск…"
 $notify.Visible = $true
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
+
+# Заголовок с версией — чтобы всегда было видно, КАКАЯ сборка сейчас крутится
+# (наведение мышью показывает, из какой папки она запущена).
+$miVersion = New-Object System.Windows.Forms.ToolStripMenuItem("net-monitor v$AppVersion")
+$miVersion.Enabled = $false
+$miVersion.ToolTipText = $PSScriptRoot
+[void]$menu.Items.Add($miVersion)
+$menu.Items.Add('-') | Out-Null
 
 $miStatus  = $menu.Items.Add('Статус сети…')
 # Пункт про Claude Code показываем только тем, у кого он есть.
@@ -523,52 +457,75 @@ Write-Log ("режимы: VPN=$($cfg.vpnMode), Claude=$($cfg.claudeMode) (сле
 $timer = New-Object System.Windows.Forms.Timer
 $timer.Interval = 5000
 
-$timer.Add_Tick({
-    # Защита от повторного входа. Внутри тика открываются модальные окна и идут
-    # ожидания; пока они висят, WinForms продолжает качать сообщения, и таймер
-    # выстрелил бы снова — вложенный проход перезаписал бы состояние счётчиков и мог
-    # запустить второй шаг восстановления поверх первого.
-    if ($script:inTick) { return }
-    $script:inTick = $true
-    try {
-        $snap = Get-NetSnapshot
-        $dt = ($snap.At - $script:prev.At).TotalSeconds
-        if ($dt -le 0) { $dt = 5 }
-        $down = ($snap.Rx - $script:prev.Rx) / $dt
-        $up   = ($snap.Tx - $script:prev.Tx) / $dt
-        if ($down -lt 0) { $down = 0 }; if ($up -lt 0) { $up = 0 }
-        $script:prev = $snap
+# Скрипт периодического опроса — выполняется в фоновом runspace. Что мерить в этот
+# раз, решает тик (флаги *Due): канал Anthropic — раз в минуту, страну — раз в 5 минут,
+# снапшот — по здоровой серии.
+$ProbeJobBody = @'
+$snap  = Get-NetSnapshot
+$inet  = Test-Link
+$vpn   = Get-VpnState
+$tun   = Get-TunnelState
+$stats = Get-XrayStats
+$claude = $null
+if ($a.ClaudeWatched) {
+    if (-not $inet.IpOk) {
+        $claude = [pscustomobject]@{ Ok = $false; Status = $null; Ms = 0; Via = $null; Reason = 'нет связи' }
+    } elseif ($a.ClaudeDue) {
+        $claude = Test-ClaudeChannel
+    }
+}
+$egress = if ($a.EgressDue -and $inet.Ok) { Test-Egress } else { $null }
+$gold   = if ($a.SnapshotDue) { New-NetSnapshot } else { $null }
+[pscustomobject]@{ Snap = $snap; Inet = $inet; Vpn = $vpn; Tun = $tun; Stats = $stats
+                   Claude = $claude; Egress = $egress; Gold = $gold }
+'@
 
-        $inet = Test-Internet
-        $vpn  = Get-VpnState
-        $tun  = Get-TunnelState
+# Скрипт одного шага восстановления — тоже в фоне: restart-vpn ждёт поднятия туннеля
+# до 20 с, и в потоке интерфейса это снова заморозило бы меню.
+$StepJobBody = @'
+Invoke-RecoveryStep $a.Step $a.Snapshot $a.VpnService
+'@
 
-        # Счётчики xray: показывают, идут ли токены Claude Code и не течёт ли трафик
-        # мимо туннеля. Локально и мгновенно, без внешних запросов.
-        $stats = Get-XrayStats
-        $flow  = Get-FlowDelta $script:prevStats $stats
-        if ($stats) { $script:prevStats = $stats }
+function Invoke-ProbeResult {
+    # Обработка готового замера. Работает в потоке интерфейса, но только с готовыми
+    # данными — ни одного сетевого вызова здесь быть не должно.
+    param($r)
 
-        # Канал до Anthropic — раз в минуту, и только если Claude Code тут используется.
-        if (-not $script:claudeWatched) {
-            $script:claude = $null
-        } else {
-            $needClaude = ((Get-Date) - $script:claudeAt).TotalSeconds -ge 60 -or $null -eq $script:claude
-            if ($needClaude -and $inet.IpOk) {
-                $script:claude = Test-ClaudeChannel
-                $script:claudeAt = Get-Date
-            } elseif (-not $inet.IpOk) {
-                $script:claude = [pscustomobject]@{ Ok = $false; Status = $null; Ms = 0; Via = $null; Reason = 'нет связи' }
-            }
-        }
+    $snap = $r.Snap
+    $dt = ($snap.At - $script:prev.At).TotalSeconds
+    if ($dt -le 0) { $dt = 5 }
+    $down = ($snap.Rx - $script:prev.Rx) / $dt
+    $up   = ($snap.Tx - $script:prev.Tx) / $dt
+    if ($down -lt 0) { $down = 0 }; if ($up -lt 0) { $up = 0 }
+    $script:prev = $snap
 
-        # Страна выхода — раз в 5 минут; при живой связи.
-        if ($inet.Ok -and ((Get-Date) - $script:egressAt).TotalMinutes -ge 5) {
-            $script:egress = Test-Egress
-            $script:egressAt = Get-Date
-        }
+    $inet = $r.Inet
+    $vpn  = $r.Vpn
+    $tun  = $r.Tun
 
-        $verdict = Get-HealthVerdict $inet $tun $script:claude $script:egress $flow
+    $flow = Get-FlowDelta $script:prevStats $r.Stats
+    if ($r.Stats) { $script:prevStats = $r.Stats }
+
+    if (-not $script:claudeWatched) {
+        $script:claude = $null
+    } elseif ($r.Claude) {
+        $script:claude = $r.Claude
+        # Время замера обновляем только по настоящей проверке: синтетическое «нет
+        # связи» не должно откладывать настоящую на минуту после возврата линка.
+        if ($inet.IpOk) { $script:claudeAt = Get-Date }
+    }
+
+    if ($r.Egress) {
+        $script:egress = $r.Egress
+        $script:egressAt = Get-Date
+    }
+
+    if ($r.Gold) {
+        $script:goldSnapshot = $r.Gold
+        Write-Log "снят снапшот рабочей конфигурации (выход $($r.Gold.EgressIp)/$($r.Gold.Country))"
+    }
+
+    $verdict = Get-HealthVerdict $inet $tun $script:claude $script:egress $flow
         $script:lastVerdict = $verdict
 
         # Запоминаем, что VPN на этой машине есть. Иначе выключенный клиент выглядел бы
@@ -653,13 +610,9 @@ $timer.Add_Tick({
         if (-not $egressAlarm) { $script:ownerAlerted = '' }
 
         # --- снапшот «золотой» конфигурации: три здоровых тика подряд ---
+        # Сам снапшот снимает фоновый опрос (флаг SnapshotDue) — здесь только серия.
         if ($verdict.Severity -eq 'ok' -and $script:egress -and $script:egress.Verified -and $script:egress.Ok) {
             $script:healthyStreak++
-            if ($script:healthyStreak -ge 3 -and
-                (-not $script:goldSnapshot -or ((Get-Date) - $script:goldSnapshot.At).TotalMinutes -ge 30)) {
-                $script:goldSnapshot = New-NetSnapshot
-                Write-Log "снят снапшот рабочей конфигурации (выход $($script:goldSnapshot.EgressIp)/$($script:goldSnapshot.Country))"
-            }
         } else {
             $script:healthyStreak = 0
         }
@@ -676,7 +629,12 @@ $timer.Add_Tick({
         if ($script:recovery) {
             # --- идёт восстановление ---
             $r = $script:recovery
-            if ($verdict.Severity -eq 'ok') {
+            if ($r.Pending) {
+                # Шаг выполняется в фоне; пока он не вернулся, машину не двигаем —
+                # иначе следующий шаг лёг бы поверх работающего.
+                $notify.Text = "восстановление: $($r.Phase)…"
+            }
+            elseif ($verdict.Severity -eq 'ok') {
                 $notify.ShowBalloonTip(5000, 'Связь восстановлена',
                     $(if ($r.Steps.Count) { "Помогло: $($r.Steps -join ' → ')" } else { 'Вернулось само.' }), 'Info')
                 Write-Log "восстановление завершено: помогло [$($r.Steps -join ', ')]"
@@ -696,7 +654,11 @@ $timer.Add_Tick({
             }
             elseif ($r.Index -ge $r.Plan.Count) {
                 # Лестница пройдена без успеха — возвращаем известное рабочее состояние.
-                if ($script:goldSnapshot) { Invoke-StepRestoreDns $script:goldSnapshot }
+                if ($script:goldSnapshot) {
+                    $argR = Get-ModeArgs
+                    $argR.Step = 'restore-dns'; $argR.Snapshot = $script:goldSnapshot; $argR.VpnService = ''
+                    Add-WorkerJob 'step' $StepJobBody $argR $null
+                }
                 # Пауза перед следующей попыткой, нарастающая. Без неё утилита при
                 # стойкой поломке гоняла бы лестницу каждые полминуты — с балунами и,
                 # что хуже, с повторными перезапусками VPN, если они разрешены.
@@ -711,16 +673,24 @@ $timer.Add_Tick({
             else {
                 $step = $r.Plan[$r.Index]
                 $r.Index++
-                $notify.Text = "восстановление: $step"
-                Write-Log "шаг восстановления: $step"
-                $entry = Invoke-RecoveryStep $step $script:goldSnapshot $cfg.vpnService
                 $r.Steps += $step
                 $r.Phase = $step
-                $r.WaitUntil = (Get-Date).AddSeconds(5)   # дать сети устояться до проверки
-                if ($entry -and $entry.Result -like 'СТОП*') {
-                    $notify.ShowBalloonTip(10000, 'Восстановление остановлено', $entry.Result, 'Error')
-                    Write-Log "восстановление остановлено на шаге $step : $($entry.Result)"
-                    $script:recovery = $null
+                $r.Pending = $true
+                $notify.Text = "восстановление: $step"
+                Write-Log "шаг восстановления: $step"
+                $argS = Get-ModeArgs
+                $argS.Step = $step; $argS.Snapshot = $script:goldSnapshot; $argS.VpnService = $cfg.vpnService
+                Add-WorkerJob 'step' $StepJobBody $argS {
+                    param($entry)
+                    $rr = $script:recovery
+                    if (-not $rr) { return }
+                    $rr.Pending = $false
+                    $rr.WaitUntil = (Get-Date).AddSeconds(5)   # дать сети устояться до проверки
+                    if ($entry -and $entry.Result -like 'СТОП*') {
+                        $notify.ShowBalloonTip(10000, 'Восстановление остановлено', $entry.Result, 'Error')
+                        Write-Log "восстановление остановлено на шаге $($rr.Phase) : $($entry.Result)"
+                        $script:recovery = $null
+                    }
                 }
             }
         }
@@ -736,7 +706,7 @@ $timer.Add_Tick({
             if ($plan.Count) {
                 Write-Log "запускаю восстановление, класс: $($verdict.Class), план: [$($plan -join ', ')]"
                 $script:recovery = [pscustomobject]@{
-                    Class = $verdict.Class; Plan = @($plan); Index = 0; Steps = @()
+                    Class = $verdict.Class; Plan = @($plan); Index = 0; Steps = @(); Pending = $false
                     Phase = 'пауза'; WaitUntil = (Get-Date).AddSeconds([int]$cfg.graceSec)
                 }
                 $notify.Text = "восстановление: жду $($cfg.graceSec) с"
@@ -754,6 +724,28 @@ $timer.Add_Tick({
         }
         if ($txt.Length -gt 63) { $txt = $txt.Substring(0, 63) }   # лимит NotifyIcon.Text
         $notify.Text = $txt
+}
+
+$timer.Add_Tick({
+    # Тик лёгкий: забрать готовые результаты фона, обработать, заказать следующий
+    # замер. Сами сетевые проверки здесь не выполняются — меню и значок не замирают.
+    #
+    # Защита от повторного входа сохранена: OnDone может открыть модальное окно
+    # (вопрос про страну), и пока оно висит, WinForms продолжает качать сообщения.
+    if ($script:inTick) { return }
+    $script:inTick = $true
+    try {
+        Update-Worker
+        if (-not (Test-WorkerBusyWith 'probe') -and -not (Test-WorkerBusyWith 'step')) {
+            $arg = Get-ModeArgs
+            $arg.ClaudeWatched = [bool]$script:claudeWatched
+            $arg.ClaudeDue = [bool]($script:claudeWatched -and
+                (((Get-Date) - $script:claudeAt).TotalSeconds -ge 60 -or $null -eq $script:claude))
+            $arg.EgressDue = [bool](((Get-Date) - $script:egressAt).TotalMinutes -ge 5)
+            $arg.SnapshotDue = [bool]($script:healthyStreak -ge 3 -and
+                (-not $script:goldSnapshot -or ((Get-Date) - $script:goldSnapshot.At).TotalMinutes -ge 30))
+            Add-WorkerJob 'probe' $ProbeJobBody $arg { param($r) if ($r) { Invoke-ProbeResult $r } }
+        }
     } catch { Write-Log "tick error: $_" }
     finally { $script:inTick = $false }
 })
@@ -762,50 +754,74 @@ $timer.Add_Tick({
 $dnsTimer = New-Object System.Windows.Forms.Timer
 $dnsTimer.Interval = 3600 * 1000
 $dnsTimer.Add_Tick({
+    # Сам замер (десятки DNS-запросов) идёт в фоне; здесь только заказ и обработка.
     if (-not $miAuto.Checked) { return }
-    try {
-        $rows = Invoke-DnsBench
-        $best = $rows | Where-Object { $_.Ms -ne $null -and $_.Answers -ge 2 } | Sort-Object Ms | Select-Object -First 2
-        if (-not $best) { Write-Log 'авто-DNS: ни один сервер не ответил, ничего не меняю'; return }
-        $curr = @(Get-CurrentDns)
-        $want = @($best | ForEach-Object { $_.Ip })
-        if ($curr.Count -ge 1 -and $curr[0] -eq $want[0]) { Write-Log "авто-DNS: лучший уже стоит ($($want[0]))"; return }
-        if (-not (Test-IsAdmin)) { Write-Log 'авто-DNS: нет прав администратора, пропуск (запусти от админа)'; return }
-        $msg = Apply-Dns $want
-        $notify.ShowBalloonTip(4000, 'Авто-DNS', $msg, 'Info')
-    } catch { Write-Log "auto-dns error: $_" }
+    if (Test-WorkerBusyWith 'dnsbench') { return }
+    Add-WorkerJob 'dnsbench' 'Invoke-DnsBench' (Get-ModeArgs) {
+        param($rows)
+        try {
+            $best = @($rows) | Where-Object { $_.Ms -ne $null -and $_.Answers -ge 2 } | Sort-Object Ms | Select-Object -First 2
+            if (-not $best) { Write-Log 'авто-DNS: ни один сервер не ответил, ничего не меняю'; return }
+            $curr = @(Get-CurrentDns)
+            $want = @($best | ForEach-Object { $_.Ip })
+            if ($curr.Count -ge 1 -and $curr[0] -eq $want[0]) { Write-Log "авто-DNS: лучший уже стоит ($($want[0]))"; return }
+            if (-not (Test-IsAdmin)) { Write-Log 'авто-DNS: нет прав администратора, пропуск (запусти от админа)'; return }
+            $msg = Apply-Dns $want
+            $notify.ShowBalloonTip(4000, 'Авто-DNS', $msg, 'Info')
+        } catch { Write-Log "auto-dns error: $_" }
+    }
 })
 $dnsTimer.Start()
 
 # ---- обработчики меню ----
+# Окна собирают текст в фоне: сбор — это те же десятки секунд сетевых проверок, и в
+# потоке интерфейса он снова заморозил бы меню (ровно та жалоба, ради которой фоновый
+# исполнитель и появился). Окно открывается сразу с заглушкой, текст доезжает следом.
 $miStatus.Add_Click({
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = 'Статус сети'
+    $f.Text = "Статус сети — net-monitor v$AppVersion"
     $f.Size = New-Object System.Drawing.Size(620, 440)
     $f.StartPosition = 'CenterScreen'
     $tb = New-Object System.Windows.Forms.TextBox
     $tb.Multiline = $true; $tb.ReadOnly = $true; $tb.ScrollBars = 'Vertical'
     $tb.Dock = 'Fill'; $tb.Font = New-Object System.Drawing.Font('Consolas', 10)
-    $tb.Text = (Get-StatusReport) -replace "`n", "`r`n"
     $btn = New-Object System.Windows.Forms.Button
     $btn.Text = 'Обновить'; $btn.Dock = 'Bottom'
-    $btn.Add_Click({ $tb.Text = (Get-StatusReport) -replace "`n", "`r`n" })
+    $refresh = {
+        $tb.Text = 'Собираю данные… (окно можно закрыть, проверки продолжатся в фоне)'
+        $btn.Enabled = $false
+        $arg = Get-ModeArgs
+        $arg.Version = $AppVersion
+        Add-WorkerJob 'status' 'Get-StatusReport -Version $a.Version' $arg {
+            param($text)
+            if ($f.IsDisposed) { return }
+            $tb.Text = "$text" -replace "`n", "`r`n"
+            $btn.Enabled = $true
+        }.GetNewClosure()
+    }.GetNewClosure()
+    $btn.Add_Click($refresh)
     $f.Controls.Add($tb); $f.Controls.Add($btn)
     $f.Show()
+    & $refresh
 })
 
 $miSite.Add_Click({
     $site = [Microsoft.VisualBasic.Interaction]::InputBox('Адрес сайта (без https://), например: гоньба.рф или github.com', 'Через что идёт сайт', '')
     if ($site) {
         $site = $site -replace '^https?://', '' -replace '/.*$', ''
-        $v = Get-SiteRouteVerdict $site
-        [System.Windows.Forms.MessageBox]::Show($v, 'Маршрут сайта') | Out-Null
+        $arg = Get-ModeArgs
+        $arg.Site = $site
+        Add-WorkerJob 'site' 'Get-SiteRouteVerdict $a.Site' $arg {
+            param($v)
+            [System.Windows.Forms.MessageBox]::Show("$v", 'Маршрут сайта') | Out-Null
+        }
     }
 })
 
 $miBench.Add_Click({
+    $benchDomains = @(Get-DnsBenchDomains)
     $f = New-Object System.Windows.Forms.Form
-    $f.Text = 'Тест DNS-серверов (среднее по: ' + ($BenchDomains -join ', ') + ')'
+    $f.Text = 'Тест DNS-серверов (среднее по: ' + ($benchDomains -join ', ') + ')'
     $f.Size = New-Object System.Drawing.Size(560, 460)
     $f.StartPosition = 'CenterScreen'
     $lv = New-Object System.Windows.Forms.ListView
@@ -819,25 +835,31 @@ $miBench.Add_Click({
     $panel.Controls.AddRange(@($bRun, $bApply, $bDhcp))
     $f.Controls.Add($lv); $f.Controls.Add($panel)
     $doRun = {
+        # Замер идёт в фоне: это десятки DNS-запросов, окно и меню не должны замирать.
         $lv.Items.Clear()
-        $f.Cursor = 'WaitCursor'
-        [System.Windows.Forms.Application]::DoEvents()
-        $script:benchRows = Invoke-DnsBench
-        foreach ($r in ($script:benchRows | Sort-Object { if ($_.Ms -eq $null) { 99999 } else { $_.Ms } })) {
-            $it = New-Object System.Windows.Forms.ListViewItem($r.Name)
-            [void]$it.SubItems.Add($r.Ip)
-            [void]$it.SubItems.Add($(if ($r.Ms -ne $null) { "$($r.Ms)" } else { '—' }))
-            [void]$it.SubItems.Add("$($r.Answers)/$($BenchDomains.Count)")
-            if ($r.Ms -eq $null) { $it.ForeColor = [System.Drawing.Color]::Gray }
-            [void]$lv.Items.Add($it)
-        }
-        $f.Cursor = 'Default'
-    }
+        [void]$lv.Items.Add((New-Object System.Windows.Forms.ListViewItem('Меряю… (можно пользоваться меню)')))
+        $bRun.Enabled = $false
+        Add-WorkerJob 'dnsbench' 'Invoke-DnsBench' (Get-ModeArgs) {
+            param($rows)
+            if ($f.IsDisposed) { return }
+            $lv.Items.Clear()
+            foreach ($r in (@($rows) | Sort-Object { if ($_.Ms -eq $null) { 99999 } else { $_.Ms } })) {
+                $it = New-Object System.Windows.Forms.ListViewItem($r.Name)
+                [void]$it.SubItems.Add($r.Ip)
+                [void]$it.SubItems.Add($(if ($r.Ms -ne $null) { "$($r.Ms)" } else { '—' }))
+                [void]$it.SubItems.Add("$($r.Answers)/$($benchDomains.Count)")
+                if ($r.Ms -eq $null) { $it.ForeColor = [System.Drawing.Color]::Gray }
+                [void]$lv.Items.Add($it)
+            }
+            $bRun.Enabled = $true
+        }.GetNewClosure()
+    }.GetNewClosure()
     $bRun.Add_Click($doRun)
     $bApply.Add_Click({
         $ip = $null
-        if ($lv.SelectedItems.Count -gt 0) { $ip = $lv.SelectedItems[0].SubItems[1].Text }
-        elseif ($lv.Items.Count -gt 0) { $ip = $lv.Items[0].SubItems[1].Text }
+        # SubItems.Count: во время замера в списке строка-заглушка без колонки IP.
+        if ($lv.SelectedItems.Count -gt 0 -and $lv.SelectedItems[0].SubItems.Count -gt 1) { $ip = $lv.SelectedItems[0].SubItems[1].Text }
+        elseif ($lv.Items.Count -gt 0 -and $lv.Items[0].SubItems.Count -gt 1) { $ip = $lv.Items[0].SubItems[1].Text }
         if (-not $ip) { return }
         # вторым — следующий живой из таблицы
         $second = $null
@@ -860,55 +882,26 @@ if ($miClaude) { $miClaude.Add_Click({
     $tb.Multiline = $true; $tb.ReadOnly = $true; $tb.ScrollBars = 'Vertical'
     $tb.Dock = 'Fill'; $tb.Font = New-Object System.Drawing.Font('Consolas', 10)
 
-    $build = {
-        $sb = New-Object System.Text.StringBuilder
-        $cc  = Test-ClaudeChannel
-        $tun = Get-TunnelState
-        $eg  = Test-Egress
-        $s1 = Get-XrayStats; Start-Sleep -Milliseconds 1500; $s2 = Get-XrayStats
-        $fl = Get-FlowDelta $s1 $s2
-
-        [void]$sb.AppendLine("=== Канал Claude Code  $(Get-Date -Format 'HH:mm:ss') ===")
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine("Связь с Anthropic: " + $(if ($cc.Ok) { "ЕСТЬ — $($cc.Reason), отклик $($cc.Ms) мс" } else { "НЕТ — $($cc.Reason)" }))
-        [void]$sb.AppendLine("Проверено тем же путём, которым ходит Claude Code: " + $(if ($cc.Via) { $cc.Via } else { 'напрямую' }))
-        [void]$sb.AppendLine('')
-        [void]$sb.AppendLine("Туннель: " + $(if ($tun.Ok) { "$($tun.AdapterName), трафик идёт через него" }
-                                             elseif ($tun.AdapterUp) { "$($tun.AdapterName) поднят, но трафик идёт мимо" }
-                                             else { 'не поднят' }))
-        if ($tun.Upstream) { [void]$sb.AppendLine("Узлы VPN: " + ($tun.Upstream -join ', ')) }
-        [void]$sb.AppendLine("Выход: $($eg.Reason)")
-        [void]$sb.AppendLine('')
-        if ($fl) {
-            [void]$sb.AppendLine("--- за последние $([int]$fl.Seconds) с ---")
-            [void]$sb.AppendLine("Трафик Claude Code: $(Format-Bytes $fl.ClaudeBytes)")
-            [void]$sb.AppendLine("Через туннель:      $(Format-Bytes $fl.TunnelBytes)")
-            # «Утечка» — только когда трафик перестал идти через туннель. Часть трафика
-            # штатно ходит напрямую (так настроена маршрутизация клиента), и подписывать
-            # это утечкой значило бы пугать владельца при каждой открытой странице.
-            $leakMark = if (-not $tun.ViaTunnel -and $fl.DirectBytes -gt 0) { '   ← мимо туннеля!' } else { '' }
-            [void]$sb.AppendLine("Мимо туннеля:       $(Format-Bytes $fl.DirectBytes)$leakMark")
-            [void]$sb.AppendLine('')
-            # Тот самый вопрос: Клод завис или интернет отвалился.
-            $answer = if (-not $cc.Ok) { 'СЕТЬ: канал до Anthropic не отвечает — Claude Code ждёт впустую.' }
-                      elseif ($fl.ClaudeBytes -gt 0) { 'РАБОТАЕТ: канал жив и токены идут прямо сейчас.' }
-                      else { 'КАНАЛ ЖИВ, но обмена нет: либо Claude Code сейчас думает/ждёт вас, либо он подвис — сеть тут не виновата.' }
-            [void]$sb.AppendLine("Вердикт: $answer")
-        } else {
-            [void]$sb.AppendLine('Счётчики xray недоступны (порт 11111 не отвечает) — трафик по процессам не виден.')
-        }
-        $sb.ToString()
-    }
-
-    $tb.Text = (& $build) -replace "`n", "`r`n"
     $btn = New-Object System.Windows.Forms.Button
     $btn.Text = 'Обновить'; $btn.Dock = 'Bottom'
-    # GetNewClosure обязателен: скриптблоки PowerShell не захватывают локальные
-    # переменные, и к моменту клика по немодальному окну $f/$tb/$build были бы уже
-    # недоступны — кнопка молча ничего не делала бы.
-    $btn.Add_Click({ $f.Cursor = 'WaitCursor'; $tb.Text = (& $build) -replace "`n", "`r`n"; $f.Cursor = 'Default' }.GetNewClosure())
+    # Отчёт собирается фоном (Get-ClaudeChannelReport в probe.ps1): внутри полторы
+    # секунды замера трафика и сетевые проверки. GetNewClosure обязателен: скриптблоки
+    # PowerShell не захватывают локальные переменные, и к моменту клика по немодальному
+    # окну $f/$tb были бы уже недоступны — кнопка молча ничего не делала бы.
+    $refresh = {
+        $tb.Text = 'Собираю данные… (окно можно закрыть, проверки продолжатся в фоне)'
+        $btn.Enabled = $false
+        Add-WorkerJob 'claude-report' 'Get-ClaudeChannelReport' (Get-ModeArgs) {
+            param($text)
+            if ($f.IsDisposed) { return }
+            $tb.Text = "$text" -replace "`n", "`r`n"
+            $btn.Enabled = $true
+        }.GetNewClosure()
+    }.GetNewClosure()
+    $btn.Add_Click($refresh)
     $f.Controls.Add($tb); $f.Controls.Add($btn)
     $f.Show()
+    & $refresh
 }) }
 
 $miRec.Add_Click({
@@ -985,8 +978,8 @@ $miRecNow.Add_Click({
     if ($r -ne 'Yes') { return }
     # Запускаем тот же автомат, что и автоматика: шаги пойдут по тикам, трей не замрёт.
     $script:recovery = [pscustomobject]@{
-        Class = $cls; Plan = @($plan); Index = 0; Steps = @(); Phase = 'запуск вручную'
-        WaitUntil = (Get-Date)
+        Class = $cls; Plan = @($plan); Index = 0; Steps = @(); Pending = $false
+        Phase = 'запуск вручную'; WaitUntil = (Get-Date)
     }
     # Ручной запуск снимает паузу после прошлых неудач: владелец решил попробовать ещё.
     $script:recoveryCooldownUntil = [datetime]::MinValue
@@ -1039,10 +1032,16 @@ $miLog.Add_Click({ if (Test-Path $LogFile) { Start-Process notepad $LogFile } el
 $miExit.Add_Click({
     $timer.Stop(); $dnsTimer.Stop()
     $notify.Visible = $false
+    # Работающее фоновое задание не ждём: это читающая проверка, а шаг восстановления
+    # при выходе владелец останавливает осознанно. Runspace закрываем асинхронно.
+    try {
+        if ($script:jobActive) { $script:jobActive.PS.Stop() }
+        $script:workerRs.CloseAsync()
+    } catch {}
     [System.Windows.Forms.Application]::Exit()
 })
 
-Write-Log 'запуск'
+Write-Log "запуск net-monitor v$AppVersion (из $PSScriptRoot)"
 
 # Первое знакомство: если на машине есть VPN, один раз спрашиваем, следить ли за
 # страной выхода. Так у человека без VPN вопроса не возникает вовсе, а тот, кто ради
