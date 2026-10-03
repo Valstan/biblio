@@ -43,7 +43,9 @@ Internal reasoning, commit messages, идентификаторы — English.
    запушенным и чистым.
 
 Исполняемые памятки — `.claude/commands/start.md`, `close_session.md`, `obriv.md`;
-несмотря на имя каталога, их workflow применим к любому агенту.
+несмотря на имя каталога, их workflow применим к любому агенту. Для OpenCode те же
+памятки продублированы в `.opencode/commands/` (формат OpenCode: `description` во
+frontmatter, тело — шаблон промпта): правь обе копии синхронно.
 
 ## Git и совместная работа нескольких агентов
 
@@ -75,6 +77,6 @@ SSH-алиасы, порты, пути на серверах, состав жи�
 ## Какие AI-файлы хранить в Git
 
 Коммитить: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.claude/commands/`,
-`.claude/settings.json`, `docs/SESSION_HANDOFF.md`, `mailbox/`.
+`.opencode/commands/`, `.claude/settings.json`, `docs/SESSION_HANDOFF.md`, `mailbox/`.
 Не коммитить: `.claude/settings.local.json`, кэши `.codex/`/`.gemini/`, `.env*`,
 ключи, токены, логи, тяжёлое в `tools/` (venv, модели, бинарники — gitignored).
