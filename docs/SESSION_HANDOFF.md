@@ -48,6 +48,29 @@ Updated: 2026-10-26
   `_probe_sources.py` ищет источники нод по GitHub, `_probe_fresh.py` гоняет пробу квоты
   по свежим нодам. Решение владельца: довести до команды утилиты или выбросить.
 
+## video-downloader: ffmpeg на склейке (2026-10-26)
+
+Входящая директива Мозга `2026-10-09-video-downloader-ffmpeg-path` разобрана в
+ту же сессию — **взяли** (PR #28). `download.py` отдавал в `ffmpeg_location`
+**папку** `imageio_ffmpeg/binaries/`, а бинарь там `ffmpeg-win-x86_64-v7.1.exe`:
+yt-dlp искал `ffmpeg.exe`, не находил и падал на склейке
+(`merging of multiple formats but ffmpeg is not installed`). Теперь отдаём полный
+путь (`imageio_ffmpeg.get_ffmpeg_exe()`), `_ffmpeg_dir()` → `_ffmpeg_exe()`.
+
+- **Проверка без сети и без YouTube**: до фикса `FFmpegPostProcessor.available =
+  False`, после — `True`; плюс настоящая склейка видео+аудио через
+  `FFmpegMergerPP` с теми же `opts` (out.mp4, 12323 байта на этой машине).
+- GUI не правился: он зовёт `download_urls()`, `opts` общие.
+- Подтверждение Мозгу — `mailbox/to-brain/2026-10-26-video-downloader-ffmpeg-path-taken.md`.
+  Неразобранных входящих в `from-brain/` больше нет.
+
+**Инсайт**: `ffmpeg_location` у yt-dlp — это либо путь к **файлу**, либо каталог,
+в котором лежит именно `ffmpeg.exe`. Отдать каталог с бинарём под другим именем —
+значит сообщить yt-dlp «ffmpeg не установлен», причём молча и только на склейке:
+скачивание одной дорожки при этом работает, поэтому дефект не виден до первого
+`bv+ba`. Проверять такое надо не «видит ли yt-dlp ffmpeg», а настоящим
+merge-проходом.
+
 ## Сделано 2026-08-27
 
 ### Решения владельца по хвостам прошлой сессии
