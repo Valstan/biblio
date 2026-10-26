@@ -7,11 +7,19 @@
   },
   "sources": {
     "epodonios": "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
+    "jagger": "https://raw.githubusercontent.com/jagger235711/V2rayCollector/main/results/mixed.txt",
+    "radikal": "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/all/configs.txt",
+    "solvpn": "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/all_configs.txt",
+    "mahan": "https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/mix.txt",
+    "iboxz": "https://raw.githubusercontent.com/iboxz/free-v2ray-collector/main/main/mix.txt",
+    "bahemmat": "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/all_servers.txt",
+    "longlon": "https://raw.githubusercontent.com/longlon/v2ray-config/main/Splitted-By-Protocol/vless.txt",
+    "wlunlocker": "https://raw.githubusercontent.com/wlunlocker/vpn-configs/main/blacklist_all.txt",
     "mhdi": "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/mix",
     "aliilapro": "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
     "mahdibland": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt"
   },
-  "node_limit": 400,
+  "node_limit": 1500,
   "schemes": [
     "vless",
     "hysteria2",
@@ -32,9 +40,12 @@
   ],
   "probe_prompt": "Ответь одним словом: работаю",
   "probe_timeout_s": 180,
+  "harvest_budget": 6,
+  "burned_hours": 24,
   "rotate_after_limits": 3,
   "quota_cooldown_s": 20,
   "refresh_hours": 6,
   "happ_gate": "warn",
-  "log_level": "info"
+  "log_level": "info",
+  "check_workers": 60
 }
