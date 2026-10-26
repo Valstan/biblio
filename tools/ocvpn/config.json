@@ -1,0 +1,40 @@
+{
+  "ports": {
+    "proxy": 18080,
+    "api": 19090,
+    "dashboard": 18081,
+    "opencode": 18082
+  },
+  "sources": {
+    "epodonios": "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
+    "mhdi": "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/mix",
+    "aliilapro": "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
+    "mahdibland": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt"
+  },
+  "node_limit": 400,
+  "schemes": [
+    "vless",
+    "hysteria2",
+    "vmess",
+    "trojan",
+    "ss",
+    "tuic"
+  ],
+  "probe_url": "https://api.ipify.org",
+  "delay_url": "https://www.gstatic.com/generate_204",
+  "delay_timeout_ms": 3000,
+  "models": [
+    "opencode/deepseek-v4.1-flash-free#high",
+    "opencode/glm-5.3-flash-free#high",
+    "opencode/flint-40b-free#max",
+    "opencode/mimo-v2.6-flash-free#max",
+    "opencode/nemotron-3-ultra-free#max"
+  ],
+  "probe_prompt": "Ответь одним словом: работаю",
+  "probe_timeout_s": 180,
+  "rotate_after_limits": 3,
+  "quota_cooldown_s": 20,
+  "refresh_hours": 6,
+  "happ_gate": "warn",
+  "log_level": "info"
+}
