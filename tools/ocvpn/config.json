@@ -19,7 +19,7 @@
     "aliilapro": "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
     "mahdibland": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt"
   },
-  "node_limit": 1500,
+  "node_limit": 400,
   "schemes": [
     "vless",
     "hysteria2",
@@ -47,5 +47,6 @@
   "refresh_hours": 6,
   "happ_gate": "warn",
   "log_level": "info",
-  "check_workers": 60
+  "check_workers": 24,
+  "server_password": "ocvpn-local"
 }

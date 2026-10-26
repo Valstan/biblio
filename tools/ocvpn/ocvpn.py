@@ -92,6 +92,7 @@ DEFAULT_CONFIG = {
         "opencode/mimo-v2.6-flash-free#max",
         "opencode/nemotron-3-ultra-free#max",
     ],
+    "server_password": "ocvpn-local",
     "probe_prompt": "Ответь одним словом: работаю",
     "probe_timeout_s": 180,
     "harvest_budget": 6,
@@ -782,6 +783,10 @@ class OpenCode:
         env["no_proxy"] = env["NO_PROXY"]
         env.pop("ALL_PROXY", None)
         env.pop("all_proxy", None)
+        password = self.cfg.get("server_password")
+        if password:
+            # свой serve требует пароль; клиент читает его из того же env
+            env["OPENCODE_PASSWORD"] = password
         return env
 
     def start(self) -> None:
