@@ -68,6 +68,14 @@ DEFAULT_CONFIG = {
     },
     "sources": {
         "epodonios": "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
+        "jagger": "https://raw.githubusercontent.com/jagger235711/V2rayCollector/main/results/mixed.txt",
+        "radikal": "https://raw.githubusercontent.com/0xRadikal/Free-v2ray-Configs/main/all/configs.txt",
+        "solvpn": "https://raw.githubusercontent.com/SoliSpirit/SolVPN/main/all_configs.txt",
+        "mahan": "https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/mix.txt",
+        "iboxz": "https://raw.githubusercontent.com/iboxz/free-v2ray-collector/main/main/mix.txt",
+        "bahemmat": "https://raw.githubusercontent.com/MohammadBahemmat/V2ray-Collector/main/all_servers.txt",
+        "longlon": "https://raw.githubusercontent.com/longlon/v2ray-config/main/Splitted-By-Protocol/vless.txt",
+        "wlunlocker": "https://raw.githubusercontent.com/wlunlocker/vpn-configs/main/blacklist_all.txt",
         "mhdi": "https://raw.githubusercontent.com/MhdiTaheri/V2rayCollector/main/sub/mix",
         "aliilapro": "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/sub.txt",
         "mahdibland": "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
@@ -84,6 +92,7 @@ DEFAULT_CONFIG = {
         "opencode/mimo-v2.6-flash-free#max",
         "opencode/nemotron-3-ultra-free#max",
     ],
+    "server_password": "ocvpn-local",
     "probe_prompt": "Ответь одним словом: работаю",
     "probe_timeout_s": 180,
     "harvest_budget": 6,
@@ -188,10 +197,32 @@ def _truthy(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
+# sing-box знает только свой набор uTLS-отпечатков. Списки нод часто несут xray-значение
+# `unsafe` — ядро падает на нём («unknown uTLS fingerprint: unsafe»), и такие ноды молча
+# уходили в мусор. Подменяем неизвестное на chrome: это дефолт Xray для uTLS.
+SINGBOX_FINGERPRINTS = {
+    "chrome",
+    "firefox",
+    "safari",
+    "ios",
+    "android",
+    "edge",
+    "360",
+    "qq",
+    "random",
+    "randomized",
+}
+
+
+def _fix_fingerprint(fp: str) -> str:
+    fp = str(fp or "").strip().lower()
+    return fp if fp in SINGBOX_FINGERPRINTS else "chrome"
+
+
 def _tls_block(qs: dict, host: str, security: str, insecure: bool) -> dict | None:
     """TLS-блок для outbound. None — параметры неполные (ноду выкидываем)."""
     sni = _q(qs, "sni", "peer", "servername", "host") or host
-    fp = _q(qs, "fp") or "chrome"
+    fp = _fix_fingerprint(_q(qs, "fp") or "chrome")
     if security == "reality":
         pbk = _q(qs, "pbk")
         if not pbk:
@@ -470,12 +501,18 @@ def fetch_source(name: str, url: str, timeout: int = 40) -> list[str]:
 
 
 def fetch_nodes(cfg: dict) -> list[Node]:
-    uris: list[str] = []
+    per_source: list[list[str]] = []
     for name, url in cfg["sources"].items():
         try:
-            uris.extend(fetch_source(name, url))
+            per_source.append(fetch_source(name, url))
         except Exception as exc:  # noqa: BLE001 — один упавший источник не должен ломать остальные
             log(f"источник {name} не скачался: {exc}")
+    # чередуем источники, иначе первый большой список забирает весь лимит
+    uris: list[str] = []
+    for idx in range(max((len(s) for s in per_source), default=0)):
+        for source in per_source:
+            if idx < len(source):
+                uris.append(source[idx])
     allowed = set(cfg["schemes"])
     seen: set[tuple] = set()
     nodes: list[Node] = []
@@ -556,6 +593,11 @@ class Core:
                 "default": first,
             }
         ]
+        # пул мог быть сохранён до нормализации отпечатков — чиним и уже собранные ноды
+        for node in nodes:
+            utls = (node.outbound.get("tls") or {}).get("utls") or {}
+            if utls.get("fingerprint"):
+                utls["fingerprint"] = _fix_fingerprint(utls["fingerprint"])
         outbounds.extend(n.outbound for n in nodes)
         outbounds.append({"type": "direct", "tag": "direct"})
         config = {
@@ -741,6 +783,10 @@ class OpenCode:
         env["no_proxy"] = env["NO_PROXY"]
         env.pop("ALL_PROXY", None)
         env.pop("all_proxy", None)
+        password = self.cfg.get("server_password")
+        if password:
+            # свой serve требует пароль; клиент читает его из того же env
+            env["OPENCODE_PASSWORD"] = password
         return env
 
     def start(self) -> None:
@@ -963,7 +1009,7 @@ class Controller:
         def probe(tag: str) -> int | None:
             return self.core.delay(tag)
 
-        with ThreadPoolExecutor(max_workers=12) as pool:
+        with ThreadPoolExecutor(max_workers=int(self.cfg.get("check_workers", 24))) as pool:
             results = list(pool.map(probe, tags))
         alive = 0
         for node, latency in zip(nodes, results):
