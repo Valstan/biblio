@@ -27,10 +27,17 @@ def default_download_dir() -> Path:
     return d if d.is_dir() else Path.home()
 
 
-def _ffmpeg_dir() -> str | None:
+def _ffmpeg_exe() -> str | None:
+    """Путь к самому бинарнику ffmpeg, а не к его папке.
+
+    imageio-ffmpeg кладёт бинарь под именем `ffmpeg-win-x86_64-v7.1.exe`.
+    yt-dlp, получив каталог, ищет в нём `ffmpeg.exe` и, не найдя, считает,
+    что ffmpeg не установлен («merging of multiple formats but ffmpeg is not
+    installed»). Поэтому отдаём полный путь к файлу — его yt-dlp принимает.
+    """
     try:
         import imageio_ffmpeg
-        return str(Path(imageio_ffmpeg.get_ffmpeg_exe()).parent)
+        return str(imageio_ffmpeg.get_ffmpeg_exe())
     except Exception:
         return None  # yt-dlp поищет ffmpeg в PATH
 
@@ -89,9 +96,9 @@ def download_urls(urls, out_dir, log=print, progress=None, audio_only=False,
     if cookies_browser:
         # Сайты за логином: берём cookies из браузера владельца (локально).
         opts["cookiesfrombrowser"] = (cookies_browser,)
-    ffdir = _ffmpeg_dir()
-    if ffdir:
-        opts["ffmpeg_location"] = ffdir
+    ffe = _ffmpeg_exe()
+    if ffe:
+        opts["ffmpeg_location"] = ffe
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         for url in urls:
