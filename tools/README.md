@@ -8,6 +8,7 @@
 |---|---|---|
 | [audio-to-text](audio-to-text/) | Пакет аудио (ogg/mp3/…) → русский текст с пунктуацией → блоки → буфер/`.txt` | GigaAM v2 + Silero (CPU, локально) |
 | [video-downloader](video-downloader/) | Ссылка на страницу сайта → все видео с неё в выбранную папку (GUI + CLI) | yt-dlp + imageio-ffmpeg |
+| [ymusic](ymusic/) | Плейлист Яндекс.Музыки → все треки на диск: треклист без входа, скачивание с тегами и обложками (CLI) | API Яндекс.Музыки + OAuth device flow |
 | [net-monitor](net-monitor/) | Трей-значок «жив ли интернет» + VPN-статус + «через что идёт сайт» + тест/смена DNS | PowerShell + WinForms, ноль зависимостей |
 
 Тяжёлое (venv, модели) в git не кладётся — см. `.gitignore` внутри каждого инструмента;
