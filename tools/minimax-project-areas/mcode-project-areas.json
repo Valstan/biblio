@@ -1,0 +1,21 @@
+{
+  "note": "По одному изолированному экземпляру MiniMax Code на проект: свой каталог данных (свои сессии), своя рабочая папка, свой AUMID и своё имя окна в панели задач. Запуск: mcode-project-start.ps1 -Project <slug>; ярлыки: make-mcode-project-shortcuts.ps1.",
+  "authTemplate": "C:\\Users\\valstan\\.minimax-areas\\area1",
+  "projects": [
+    { "slug": "brain",      "title": "МОЗГ",                    "folder": "D:\\valstan\\REPO\\brain_matrica" },
+    { "slug": "matricarmz", "title": "Матрица РМЗ",             "folder": "D:\\valstan\\REPO\\MatricaRMZ" },
+    { "slug": "matrica4",   "title": "Матрица 4",               "folder": "D:\\valstan\\REPO\\Matrica4" },
+    { "slug": "gonba",      "title": "Гоньба",                  "folder": "D:\\valstan\\REPO\\Gonba" },
+    { "slug": "sarafan",    "title": "Сарафан",                 "folder": "D:\\valstan\\REPO\\sarafan" },
+    { "slug": "karman",     "title": "КАРМАН",                  "folder": "D:\\valstan\\REPO\\karman" },
+    { "slug": "sabantuy",   "title": "Сабантуй Малмыж",         "folder": "D:\\valstan\\REPO\\SabantuyMalmyzh" },
+    { "slug": "trener",     "title": "Интер (тренер)",          "folder": "D:\\valstan\\REPO\\trener" },
+    { "slug": "kazanskaya", "title": "Казанская",               "folder": "D:\\valstan\\REPO\\KazanskayaMalmyzh" },
+    { "slug": "rmz",        "title": "РМЗ (сайт завода)",       "folder": "D:\\valstan\\REPO\\RmzMalmyzh" },
+    { "slug": "vmalmyzhe",  "title": "ВМалмыже (портал)",        "folder": "D:\\valstan\\REPO\\vMalmyzhe" },
+    { "slug": "kultura",    "title": "Культура (портал)",        "folder": "D:\\valstan\\REPO\\KulturaMalmyzh" },
+    { "slug": "portfolio",  "title": "Портфолио",               "folder": "D:\\valstan\\REPO\\ValentinPortfolio" },
+    { "slug": "pozvoni",    "title": "ПОЗВОНИ",                 "folder": "D:\\valstan\\REPO\\Pozvoni" },
+    { "slug": "biblio",     "title": "biblio (дом утилит)",      "folder": "D:\\valstan\\REPO\\biblio" }
+  ]
+}
