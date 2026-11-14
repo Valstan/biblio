@@ -132,6 +132,7 @@ def write_meta(area: Path, email: str = "", karman_id=None) -> None:
         data["email"] = email
     if karman_id is not None:
         data["karman_account_id"] = int(karman_id)
+    data["project"] = area_project(area)
     data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -315,15 +316,25 @@ def karman_token() -> str:
     return os.environ.get("KARMAN_ROOM_TOKEN") or secrets().get("SECRETS_TOKEN") or ""
 
 
-def karman_available(tier: str = "") -> tuple:
-    """GET /api/minimax/accounts/available — отдаёт аккаунт вместе с парой (разово)."""
+def karman_available(tier: str = "", project: str = "", area: str = "") -> tuple:
+    """GET /api/minimax/accounts/available — отдаёт аккаунт вместе с парой (разово).
+
+    Проект передаём ЗАГОЛОВКОМ (X-MiniMax-Project / X-MiniMax-Area): заголовок не
+    проходит через валидацию тела, а значит не может обернуться 400 — а 400 на
+    выдаче пары стоит нам одноразового refresh и нового входа в браузере.
+    """
     base, token = karman_base(), karman_token()
     if not base or not token:
         return 0, {"error": "нет адреса КАРМАНА или room-токена"}
     url = "%s/api/minimax/accounts/available" % base
     if tier:
         url += "?tier=%s" % tier
-    req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
+    headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
+    if project:
+        headers["X-MiniMax-Project"] = project
+    if area:
+        headers["X-MiniMax-Area"] = area
+    req = urllib.request.Request(url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30, context=SSL_CTX) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
@@ -337,7 +348,8 @@ def karman_available(tier: str = "") -> tuple:
         return 0, {"error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
 
 
-def karman_report_activation(email: str, account_id, access: str, refresh: str, expires_ms) -> bool:
+def karman_report_activation(email: str, account_id, access: str, refresh: str, expires_ms,
+                             project: str = "", area: str = "") -> bool:
     """Вернуть обновлённую пару в Карман (иначе цепочка одноразового refresh умрёт)."""
     base, token = karman_base(), karman_token()
     if not base or not token or not email:
@@ -348,15 +360,25 @@ def karman_report_activation(email: str, account_id, access: str, refresh: str, 
     if expires_ms:
         body["expires_at_ms"] = expires_ms
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        "%s/api/minimax/activations" % base, data=data, method="POST",
-        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json", "Accept": "application/json"},
-    )
+    headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
+               "Accept": "application/json"}
+    if project:
+        headers["X-MiniMax-Project"] = project
+    if area:
+        headers["X-MiniMax-Area"] = area
+    req = urllib.request.Request("%s/api/minimax/activations" % base, data=data, method="POST",
+                                 headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30, context=SSL_CTX) as resp:
             return 200 <= resp.status < 300
     except Exception:  # noqa: BLE001
         return False
+
+
+def area_project(area: Path) -> str:
+    """Имя проекта по области: p-brain → brain."""
+    name = area.name
+    return name[2:] if name.startswith("p-") else name
 
 
 # ────────────────────────────── команды ──────────────────────────────
@@ -520,7 +542,7 @@ def cmd_pull(args) -> int:
         print("  Проба ничего не берёт. Реальный запрос к Карману отдаёт пару ОДИН раз —")
         print("  это цена проверки, поэтому её платим только при --apply.")
         return 0
-    status, payload = karman_available(args.tier or "")
+    status, payload = karman_available(args.tier or "", area_project(area), area.name)
     if status != 200:
         print("Карман ответил %s: %s" % (status, payload.get("error") or payload), file=sys.stderr)
         return 1
@@ -528,8 +550,9 @@ def cmd_pull(args) -> int:
     access = str(payload.get("access_token") or "")
     refresh = str(payload.get("refresh_token") or "")
     expires = payload.get("expires_at_ms")
-    print("Карман отдал: id=%s email=%s tier=%s why=%s" % (
-        account.get("id"), account.get("email"), payload.get("tier"), payload.get("why")))
+    print("Карман отдал: id=%s email=%s tier=%s why=%s (проект %s)" % (
+        account.get("id"), account.get("email"), payload.get("tier"), payload.get("why"),
+        area_project(area)))
     if not access:
         print("  пара не выдана (reason=%s) — готовых пар нет" % payload.get("reason"))
         return 2
@@ -539,7 +562,8 @@ def cmd_pull(args) -> int:
         return 0
     install_pair(area, access, refresh, expires, account.get("email") or "", account.get("id"))
     if args.report:
-        ok = karman_report_activation(account.get("email") or "", account.get("id"), access, refresh, expires)
+        ok = karman_report_activation(account.get("email") or "", account.get("id"), access, refresh,
+                                     expires, area_project(area), area.name)
         print("  обновлённая пара возвращена в Карман: %s" % ("да" if ok else "нет"))
     return 0
 
@@ -562,8 +586,8 @@ def cmd_repair(args) -> int:
     repaired = []
     for st in orphans:
         area = AREAS_ROOT / st["area"]
-        print("→ %s" % st["area"])
-        status, payload = karman_available(args.tier or "")
+        print("→ %s (проект %s)" % (st["area"], area_project(area)))
+        status, payload = karman_available(args.tier or "", area_project(area), area.name)
         if status != 200:
             print("  Карман ответил %s: %s" % (status, payload.get("error") or payload))
             break
@@ -576,7 +600,8 @@ def cmd_repair(args) -> int:
                      account.get("email") or "", account.get("id"))
         if args.report:
             ok = karman_report_activation(account.get("email") or "", account.get("id"), access,
-                                          str(payload.get("refresh_token") or ""), payload.get("expires_at_ms"))
+                                          str(payload.get("refresh_token") or ""), payload.get("expires_at_ms"),
+                                          area_project(area), area.name)
             print("  обновлённая пара возвращена в Карман: %s" % ("да" if ok else "нет"))
         repaired.append(st["area"])
     print("Починено: %s" % (", ".join(repaired) if repaired else "—"))
