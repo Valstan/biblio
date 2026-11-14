@@ -410,13 +410,18 @@ def karman_available(tier: str = "", project: str = "", area: str = "") -> tuple
 
 
 def karman_note_activation(email: str, account_id=None, activation_index=None,
-                           project: str = "", area: str = "") -> bool:
+                           project: str = "", area: str = "", points=None) -> bool:
     """Сообщить Карману, какой аккаунт мы активировали — БЕЗ токенов.
 
     Граница ответственности (решение владельца 15.11): панель только **просит**
     токен, **получает** его и **использует** для активации десктопа. Учёт,
     статистика, ротация и выдача — зона Кармана; токены туда не возвращаются
     (Карман ответил: «никаких refresh, работаем на access до отказа»).
+
+    `activation_index` и `points` — **показание с панели MiniMax** (клетка дня и
+    её номинальные очки), а не наша оценка: остаток очков MiniMax не отдаёт,
+    но клетку и её номинал видно в его же `signin/status`. Это и есть второе,
+    независимое показание для прогноза Кармана.
     """
     base, token = karman_base(), karman_token()
     if not base or not token or not email:
@@ -426,6 +431,8 @@ def karman_note_activation(email: str, account_id=None, activation_index=None,
         body["account_id"] = account_id
     if activation_index:
         body["activation_index"] = activation_index
+    if points:
+        body["points"] = points
     data = json.dumps(body).encode("utf-8")
     headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
                "Accept": "application/json"}
@@ -698,6 +705,51 @@ def cmd_repair(args) -> int:
     return 0
 
 
+def meta_update(area: Path, extra: dict) -> None:
+    p = area / META_NAME
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data.update(extra)
+    data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def cmd_report(args) -> int:
+    """Доложить Карману про активации, которые мы **увидели** на панели MiniMax.
+
+    Идёт только то, что прочитано у вендора его же `signin/status`: клетка дня
+    и её номинальные очки. Остаток очков MiniMax не отдаёт — его мы не знаем и
+    не выдумываем. Один раз на (аккаунт, день): повтор не шлём.
+    """
+    running = running_areas()
+    sent = []
+    for area in list_areas():
+        st = account_state(area, running)
+        if not st.get("live") or not st.get("claimed_today"):
+            continue
+        email = st.get("email")
+        day = st.get("day_no")
+        points = st.get("points_today")
+        if not email or not day:
+            continue
+        done = (read_meta(area) or {}).get("reported_activation") or {}
+        if done.get("day_no") == day and done.get("email") == email:
+            continue
+        ok = karman_note_activation(email, None, day, area_project(area), area.name, points)
+        meta_update(area, {"reported_activation": {
+            "day_no": day, "email": email, "points": points,
+            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}})
+        print("  %s: клетка %s, %s очков → Карману: %s" % (
+            area.name, day, points, "да" if ok else "нет"))
+        sent.append(area.name)
+    print("Доложено: %s" % (", ".join(sent) if sent else "—"))
+    return 0
+
+
 def cmd_verify(args) -> int:
     for name in args.areas:
         area = AREAS_ROOT / name
@@ -750,6 +802,9 @@ def main() -> int:
     p.add_argument("--note", action="store_true", help="отметить активации у Кармана (без токенов)")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_repair)
+
+    p = sub.add_parser("report", help="доложить Карману про увиденные активации (без токенов)")
+    p.set_defaults(func=cmd_report)
 
     p = sub.add_parser("verify", help="проверить область")
     p.add_argument("areas", nargs="+")
