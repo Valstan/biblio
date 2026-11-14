@@ -119,7 +119,7 @@ async function restartArea(slug) {
 
 // Поставить в область новую пару из Кармана и перезапустить область.
 async function newAccount(slug, tier) {
-  const args = ['pull', 'p-' + slug, '--apply', '--report'];
+  const args = ['pull', 'p-' + slug, '--apply'];
   if (tier) args.push('--tier', tier);
   const r = await tool(args);
   const ok = !/готовых пар нет|no_tokens_ready|не удалось|ERROR/i.test(r.out);
@@ -127,7 +127,7 @@ async function newAccount(slug, tier) {
     log('p-' + slug + ': новый аккаунт не получен — ' + (r.out || '').trim().split('\n').slice(-1)[0]);
     return { ok: false, out: r.out };
   }
-  log('p-' + slug + ': пара от КАРМАНА посажена');
+  log('p-' + slug + ': токен от КАРМАНА посажен (access, без пары)');
   const rs = await restartArea(slug);
   log('p-' + slug + ': область перезапущена (' + (rs.start || 'ок') + ')');
   return { ok: true, out: r.out };
@@ -142,15 +142,16 @@ async function swapAccount(from, to) {
   return { ok, out: r.out };
 }
 
-// Тихий ремонт: только ЗАПУЩЕННЫЕ области без живого входа.
+// Тихий ремонт: только ЗАПУЩЕННЫЕ области, которым нужен вход
+// (приложение само сказало «вышел из аккаунта» или токен не отвечает).
 async function autoRepair() {
   if (AUTO.busy) return;
   AUTO.busy = true;
   try {
     const list = await liveState(true);
-    const broken = list.filter((a) => a.running && !a.live);
+    const broken = list.filter((a) => a.running && !a.live && !a.authorizing);
     for (const a of broken) {
-      log('p-' + a.slug + ': запущена, но входа нет — чиню молча');
+      log('p-' + a.slug + ': ' + (a.state || 'нет входа') + ' — чиню молча');
       await newAccount(a.slug);
     }
   } finally {
@@ -210,10 +211,11 @@ const HTML = `<!DOCTYPE html>
 const tb=document.getElementById('tb'), box=document.getElementById('box');
 let ACC=[];
 function st(a){
-  if(a.live) return ['жив','on'];
-  if(a.state==='нет входа') return ['не вошёл','none'];
-  if(a.state==='токен не отвечает') return ['токен мёртв','off'];
-  return [a.state||'?','none'];
+  const s=a.state||'?';
+  if(s==='жив') return ['жив','on'];
+  if(s==='вход в процессе'||s==='код входа протух') return [s,'pend'];
+  if(s==='вышел из аккаунта'||s==='токен не отвечает') return [s,'off'];
+  return [s,'none'];
 }
 async function load(){
   const d=await (await fetch('/api/state')).json();
@@ -226,7 +228,8 @@ async function load(){
     const tr=document.createElement('tr');
     tr.innerHTML='<td><code>'+a.area+'</code></td>'+
       '<td>'+a.title+'<div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div></td>'+
-      '<td><span class="st '+cls+'">'+label+'</span>'+(a.email?'<div class="muted" style="font-size:11.5px">'+a.email+'</div>':'')+'</td>'+
+      '<td><span class="st '+cls+'">'+label+'</span>'+(a.email?'<div class="muted" style="font-size:11.5px">'+a.email+'</div>':'')+
+        (a.app_status&&a.app_status!=='authenticated'?'<div class="muted" style="font-size:11px">приложение: '+a.app_status+'</div>':'')+'</td>'+
       '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>'+
       '<td>'+(a.running?'<span class="st on">да</span>':'<span class="st none">нет</span>')+'</td>'+
       '<td>'+
@@ -304,7 +307,7 @@ const server = http.createServer(async (req, res) => {
       return json(200, { ok: r.ok, out: r.out });
     }
     const list = await liveState(true);
-    const broken = list.filter((a) => a.running && !a.live);
+    const broken = list.filter((a) => a.running && !a.live && !a.authorizing);
     for (const a of broken) await newAccount(a.slug);
     return json(200, { ok: true, out: 'обработано: ' + (broken.map((a) => a.area).join(', ') || 'нечего') });
   }

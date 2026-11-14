@@ -73,6 +73,48 @@ SSL_CTX = ssl.create_default_context()
 
 # ────────────────────────────── хранилище ──────────────────────────────
 
+APP_STATE_REL = Path("auth") / "prod" / "en" / "mcode-public" / "auth-state.json"
+
+
+def read_app_state(area: Path) -> dict:
+    """Состояние авторизации по мнению САМОГО приложения MiniMax Code.
+
+    Это единственный источник про «вышел из аккаунта»: после выхода приложение
+    пишет сюда `status: "logout_pending"` (или "none"), хотя access-токен в сторе
+    ещё живой и на панель MiniMax отвечает. Поэтому «жив» = приложение считает
+    себя вошедшим **И** токен отвечает.
+    """
+    p = area / APP_STATE_REL
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_app_state(area: Path, generation: int, expires_at_ms: int) -> None:
+    """Перевести состояние приложения в «вошёл» — иначе перезапущенный десктоп
+    продолжит считать себя вышедшим из аккаунта, даже с новым токеном в сторе."""
+    p = area / APP_STATE_REL
+    data = read_app_state(area) or {}
+    data.update({
+        "schemaVersion": 2,
+        "status": "authenticated",
+        "storeKind": "file",
+        "clientId": CLIENT_ID,
+        "scopes": list(SCOPES),
+        "audience": AUDIENCE,
+        "buildEnv": "prod",
+        "region": "en",
+        "generation": int(generation),
+        "expiresAtMs": int(expires_at_ms),
+    })
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(p)
+
+
 def store_path(area: Path) -> Path:
     return area / STORE_REL
 
@@ -251,6 +293,8 @@ def account_state(area: Path, running: set = None) -> dict:
     running = running if running is not None else running_areas()
     rec, payload = live_record(area)
     meta = read_meta(area)
+    app = read_app_state(area)
+    app_status = app.get("status") or ""
     slug = area.name.replace("p-", "")
     st = {
         "area": area.name,
@@ -258,24 +302,41 @@ def account_state(area: Path, running: set = None) -> dict:
         "title": area_titles().get(slug, slug),
         "running": area.name in running,
         "has_record": rec is not None,
+        "app_status": app_status or "нет файла",
+        "app_generation": app.get("generation"),
     }
     if rec:
         st["has_refresh"] = bool(rec.get("refreshToken"))
         st["expires_at"] = rec.get("expiresAtMs")
     st["email"] = meta.get("email") or (rec or {}).get("email") or ""
     st["karman_id"] = meta.get("karman_account_id")
-    if payload is None:
+
+    # «Жив» = приложение считает себя вошедшим И токен отвечает.
+    # Приложение — источник истины про выход из аккаунта: после logout оно
+    # пишет status=logout_pending, хотя access ещё отвечает.
+    if app_status and app_status != "authenticated":
+        if app_status == "authorizing":
+            st["state"] = "вход в процессе"
+        elif app_status == "lease-expired":
+            st["state"] = "код входа протух"
+        else:
+            st["state"] = "вышел из аккаунта"
+    elif payload is None:
         st["state"] = "нет входа" if rec is None else "токен не отвечает"
-        st["live"] = False
     else:
-        cell = today_cell(payload)
         st["state"] = "жив"
-        st["live"] = True
+
+    st["live"] = st["state"] == "жив"
+    st["authorizing"] = app_status == "authorizing"
+    if payload is not None:
+        cell = today_cell(payload)
         st["day_no"] = cell.get("day_no")
         st["points_today"] = cell.get("points")
         st["claimed_today"] = claimed(cell)
         st["next_points"] = next_points(payload)
-    st["orphan"] = (not st["live"]) and (not st["running"])
+    # «Сломан» = нужен новый вход. Во время входа по коду (authorizing) — не ломаем.
+    st["broken"] = (not st["live"]) and (not st["authorizing"])
+    st["orphan"] = st["broken"] and (not st["running"])
     return st
 
 
@@ -348,17 +409,23 @@ def karman_available(tier: str = "", project: str = "", area: str = "") -> tuple
         return 0, {"error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
 
 
-def karman_report_activation(email: str, account_id, access: str, refresh: str, expires_ms,
-                             project: str = "", area: str = "") -> bool:
-    """Вернуть обновлённую пару в Карман (иначе цепочка одноразового refresh умрёт)."""
+def karman_note_activation(email: str, account_id=None, activation_index=None,
+                           project: str = "", area: str = "") -> bool:
+    """Сообщить Карману, какой аккаунт мы активировали — БЕЗ токенов.
+
+    Граница ответственности (решение владельца 15.11): панель только **просит**
+    токен, **получает** его и **использует** для активации десктопа. Учёт,
+    статистика, ротация и выдача — зона Кармана; токены туда не возвращаются
+    (Карман ответил: «никаких refresh, работаем на access до отказа»).
+    """
     base, token = karman_base(), karman_token()
     if not base or not token or not email:
         return False
-    body = {"email": email, "access_token": access, "refresh_token": refresh}
+    body = {"email": email}
     if account_id is not None:
         body["account_id"] = account_id
-    if expires_ms:
-        body["expires_at_ms"] = expires_ms
+    if activation_index:
+        body["activation_index"] = activation_index
     data = json.dumps(body).encode("utf-8")
     headers = {"Authorization": "Bearer " + token, "Content-Type": "application/json",
                "Accept": "application/json"}
@@ -383,7 +450,8 @@ def area_project(area: Path) -> str:
 
 # ────────────────────────────── команды ──────────────────────────────
 
-def build_record(access: str, refresh: str, expires_ms, previous: dict, email: str = "") -> dict:
+def build_record(access: str, refresh: str, expires_ms, previous: dict, email: str = "",
+                 generation=None) -> dict:
     """Запись токен-стора для рантайма MiniMax Code.
 
     ВАЖНО: рантайм **требует** непустой `refresh_token` в записи — без него он
@@ -401,7 +469,8 @@ def build_record(access: str, refresh: str, expires_ms, previous: dict, email: s
         "scopes": list(SCOPES),
         "audience": AUDIENCE,
         "expiresAtMs": int(expires_ms or (time.time() * 1000 + DEFAULT_TTL_MS)),
-        "generation": int((previous or {}).get("generation") or 1),
+        "generation": int(generation if generation is not None
+                           else ((previous or {}).get("generation") or 1)),
         "loginEpoch": str(uuid.uuid4()),
     }
     if refresh:
@@ -414,11 +483,19 @@ def build_record(access: str, refresh: str, expires_ms, previous: dict, email: s
     return rec
 
 
-def install_pair(area: Path, access: str, refresh: str, expires_ms, email: str = "", karman_id=None) -> bool:
+def install_pair(area: Path, access: str, refresh: str, expires_ms, email: str = "",
+                 karman_id=None) -> bool:
     store = read_store(area)
     previous = (store.get("records") or {}).get(store_key(area)) or {}
-    record = build_record(access, refresh, expires_ms, previous, email)
+    app = read_app_state(area)
+    # Новая авторизация = новый вход: поколение выше всего, что видели и стор,
+    # и приложение (иначе оно может считать запись устаревшей).
+    gen = max(int(previous.get("generation") or 0), int(app.get("generation") or 0)) + 1
+    record = build_record(access, refresh, expires_ms, previous, email, generation=gen)
     write_store(area, {"schemaVersion": 1, "records": {store_key(area): record}})
+    # Состояние приложения тоже — иначе перезапущенный десктоп продолжит
+    # считать себя вышедшим из аккаунта, даже с новым токеном в сторе.
+    write_app_state(area, record["generation"], record["expiresAtMs"])
     if email or karman_id is not None:
         write_meta(area, email=email, karman_id=karman_id)
     status, payload = panel(access)
@@ -535,11 +612,13 @@ def cmd_move(args) -> int:
 
 
 def cmd_pull(args) -> int:
-    """Взять пару у КАРМАНА и поставить её в область.
+    """Взять ОДИН токен у КАРМАНА и поставить его в область.
 
-    ⚠ Пара отдаётся ОДИН раз: Карман больше её не отдаст, пока проект не
-    вернёт обновлённую пару. Поэтому после установки обновлённую пару надо
-    вернуть (см. --report).
+    Граница ответственности (решение владельца 15.11): панель только **просит**
+    токен, **получает** и **использует** для активации десктопа. Пару не просим
+    (Карман отдаёт её только по отдельному заголовку `X-MiniMax-Refresh: 1`, а
+    ответил: «никаких refresh, работаем на access до отказа»), токены обратно не
+    возвращаем — учёт, статистика и ротация в зоне Кармана.
     """
     area = AREAS_ROOT / args.area
     if not area.exists():
@@ -566,17 +645,17 @@ def cmd_pull(args) -> int:
         account.get("id"), account.get("email"), payload.get("tier"), payload.get("why"),
         area_project(area)))
     if not access:
-        print("  пара не выдана (reason=%s) — готовых пар нет" % payload.get("reason"))
+        print("  готовых токенов нет (reason=%s) — нужен вход владельца в браузере" % payload.get("reason"))
         return 2
     print("  ⚠ пара отдаётся ОДИН раз — её надо вернуть обновлённой")
     if not args.apply:
         print("  (проба — перезапусти с --apply, чтобы поставить в %s)" % area.name)
         return 0
     install_pair(area, access, refresh, expires, account.get("email") or "", account.get("id"))
-    if args.report:
-        ok = karman_report_activation(account.get("email") or "", account.get("id"), access, refresh,
-                                     expires, area_project(area), area.name)
-        print("  обновлённая пара возвращена в Карман: %s" % ("да" if ok else "нет"))
+    if args.note:
+        ok = karman_note_activation(account.get("email") or "", account.get("id"), None,
+                                   area_project(area), area.name)
+        print("  отметка активации у Кармана (без токенов): %s" % ("да" if ok else "нет"))
     return 0
 
 
@@ -610,11 +689,10 @@ def cmd_repair(args) -> int:
             break
         install_pair(area, access, str(payload.get("refresh_token") or ""), payload.get("expires_at_ms"),
                      account.get("email") or "", account.get("id"))
-        if args.report:
-            ok = karman_report_activation(account.get("email") or "", account.get("id"), access,
-                                          str(payload.get("refresh_token") or ""), payload.get("expires_at_ms"),
-                                          area_project(area), area.name)
-            print("  обновлённая пара возвращена в Карман: %s" % ("да" if ok else "нет"))
+        if args.note:
+            ok = karman_note_activation(account.get("email") or "", account.get("id"), None,
+                                       area_project(area), area.name)
+            print("  отметка активации у Кармана (без токенов): %s" % ("да" if ok else "нет"))
         repaired.append(st["area"])
     print("Починено: %s" % (", ".join(repaired) if repaired else "—"))
     return 0
@@ -659,16 +737,17 @@ def main() -> int:
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_move)
 
-    p = sub.add_parser("pull", help="взять пару у КАРМАНА и поставить в область")
+    p = sub.add_parser("pull", help="взять ОДИН токен у КАРМАНА и поставить в область")
     p.add_argument("area")
     p.add_argument("--tier", help="например 1000 — очки нужного класса")
-    p.add_argument("--report", action="store_true", help="вернуть обновлённую пару в КАРМАН")
+    p.add_argument("--note", action="store_true",
+                   help="сообщить Карману, какой аккаунт активирован (без токенов)")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_pull)
 
     p = sub.add_parser("repair", help="тихий ремонт незапущенных областей")
     p.add_argument("--tier", help="класс очков, который просим у Кармана")
-    p.add_argument("--report", action="store_true", help="возвращать обновлённую пару в КАРМАН")
+    p.add_argument("--note", action="store_true", help="отметить активации у Кармана (без токенов)")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_repair)
 
