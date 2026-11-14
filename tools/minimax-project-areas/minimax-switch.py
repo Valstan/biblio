@@ -384,6 +384,15 @@ def area_project(area: Path) -> str:
 # ────────────────────────────── команды ──────────────────────────────
 
 def build_record(access: str, refresh: str, expires_ms, previous: dict, email: str = "") -> dict:
+    """Запись токен-стора для рантайма MiniMax Code.
+
+    ВАЖНО: рантайм **требует** непустой `refresh_token` в записи — без него он
+    считает запись битой и отказывается работать вовсе («The stored OAuth
+    credential record is invalid»). Если Карман настоящий refresh не прислал
+    (он говорит, что ему хватает access), кладём **заглушку**: работает access,
+    продлить вход ею нельзя — по истечении срока берём следующий аккаунт
+    (так же поступает Сарафан, см. «Телефон» от 14.11).
+    """
     rec = {
         "schemaVersion": 1,
         "accessToken": access,
@@ -397,6 +406,9 @@ def build_record(access: str, refresh: str, expires_ms, previous: dict, email: s
     }
     if refresh:
         rec["refreshToken"] = refresh
+    else:
+        # заглушка: рантайму нужно непустое значение, чтобы принять запись
+        rec["refreshToken"] = "stub-" + uuid.uuid4().hex + uuid.uuid4().hex
     if email:
         rec["email"] = email
     return rec
