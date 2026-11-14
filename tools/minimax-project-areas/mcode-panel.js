@@ -162,7 +162,19 @@ async function autoRepair() {
 
 setInterval(() => {
   if (AUTO.enabled && Date.now() - AUTO.last > 45000) autoRepair().catch(() => {});
+  if (Date.now() - (AUTO.reported || 0) > 45000) reportActivations().catch(() => {});
 }, 20000);
+
+// Доложить Карману про активации, которые мы увидели на панели MiniMax:
+// клетка дня и её номинальные очки (остаток MiniMax не отдаёт — мы его не знаем).
+// Токены не отправляем: учёт и статистика — в зоне Кармана.
+async function reportActivations() {
+  AUTO.reported = Date.now();
+  const r = await tool(['report']);
+  for (const line of (r.out || '').split('\n')) {
+    if (/клетка/.test(line)) log(line.trim());
+  }
+}
 
 // ────────────────────────────── интерфейс ──────────────────────────────
 
