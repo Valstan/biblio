@@ -731,6 +731,7 @@ def cmd_report(args) -> int:
     """
     running = running_areas()
     sent = []
+    failed = []
     for area in list_areas():
         st = account_state(area, running)
         if not st.get("live") or not st.get("claimed_today"):
@@ -744,13 +745,21 @@ def cmd_report(args) -> int:
         if done.get("day_no") == day and done.get("email") == email:
             continue
         ok = karman_note_activation(email, None, day, area_project(area), area.name, points)
-        meta_update(area, {"reported_activation": {
-            "day_no": day, "email": email, "points": points,
-            "at": time.strftime("%Y-%m-%dT%H:%M:%S")}})
-        print("  %s: клетка %s, %s очков → Карману: %s" % (
-            area.name, day, points, "да" if ok else "нет"))
-        sent.append(area.name)
+        if ok:
+            meta_update(area, {"reported_activation": {
+                "day_no": day, "email": email, "points": points,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S")}})
+            print("  %s: клетка %s, %s очков → Карману: да" % (area.name, day, points))
+            sent.append(area.name)
+        else:
+            # Отметку НЕ пишем: иначе неудача считается выполненной и до конца
+            # суток не повторится — доклад молча пропадёт (G631).
+            failed.append(area.name)
+            print("  %s: клетка %s, %s очков → Карману: НЕТ — повторим позже" % (
+                area.name, day, points))
     print("Доложено: %s" % (", ".join(sent) if sent else "—"))
+    if failed:
+        print("Не доложено (повторим в следующий прогон): %s" % ", ".join(failed))
     return 0
 
 
