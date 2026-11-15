@@ -52,11 +52,21 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT", r"C:\Users\valstan\.minimax-areas"))
 PROJECTS_JSON = Path(os.environ.get("MINIMAX_PROJECTS_JSON", r"C:\Users\valstan\bin\mcode-project-areas.json"))
 SECRETS_ENV = Path(os.environ.get("MINIMAX_SECRETS_ENV", str(Path.home() / ".brain_matrica" / "secrets.env")))
+
+# Вывод — всегда UTF-8 (G632). Иначе Windows отдаёт в трубу cp1251: панель читает
+# вывод как UTF-8 → кракозябры в статусах, а на символе «⚠» печать падает с
+# UnicodeEncodeError и команда не отрабатывает (тихий ремонт без нового входа).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 — старый Python без reconfigure
+        pass
 
 STORE_REL = Path("auth") / "prod" / "en" / "mcode-public" / "auth.json"
 META_NAME = "profile.json"
@@ -185,7 +195,10 @@ def panel(token: str, action: str = "status") -> tuple:
     url = "%s/%s?timezone_id=%s" % (PANEL_BASE, action, SIGNIN_TZ)
     req = urllib.request.Request(url, headers={"Authorization": "Bearer " + token, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(req, timeout=25, context=SSL_CTX) as resp:
+        # 8 с, а не 25: вендор обычно отвечает за секунду, а «не отвечает» в
+        # панели нам и так означает «токен мёртв» — ждать дольше бессмысленно,
+        # из-за этих ожиданий страница панели висела по минуте (15.11).
+        with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, {}
@@ -277,6 +290,9 @@ def live_record(area: Path):
     own = records.get(store_key(area))
     candidates = [own] if own else []
     candidates += [r for k, r in records.items() if k != store_key(area)]
+    # Больше трёх записей не перебираем: каждая — запрос к вендору с таймаутом,
+    # и площадь «истёкших» записей делала опрос области в разы дольше.
+    candidates = candidates[:3]
     for rec in candidates:
         if not isinstance(rec, dict):
             continue
@@ -517,9 +533,24 @@ def install_pair(area: Path, access: str, refresh: str, expires_ms, email: str =
     return ok
 
 
+def states_all(running: set = None) -> list:
+    """Состояния всех областей — ОПРОС ПАРАЛЛЕЛЬНО.
+
+    Панель MiniMax отвечает небыстро, и по очереди 7 областей давали больше
+    минуты: страница панели висела, владелец думал, что всё зависло (15.11).
+    Потоки не мешают друг другу — это сетевые запросы, а не CPU.
+    """
+    areas = list_areas()
+    if not areas:
+        return []
+    running = running if running is not None else running_areas()
+    with ThreadPoolExecutor(max_workers=min(8, len(areas))) as pool:
+        return list(pool.map(lambda a: account_state(a, running), areas))
+
+
 def cmd_areas(args) -> int:
     running = running_areas()
-    states = [account_state(a, running) for a in list_areas()]
+    states = states_all(running)
     if args.json:
         print(json.dumps(states, ensure_ascii=False, indent=2))
         return 0
@@ -537,10 +568,9 @@ def cmd_areas(args) -> int:
 def cmd_accounts(args) -> int:
     running = running_areas()
     live = []
-    for area in list_areas():
-        st = account_state(area, running)
+    for st in states_all(running):
         if st.get("live"):
-            st["source"] = area.name
+            st["source"] = st["area"]
             live.append(st)
     if args.json:
         print(json.dumps(live, ensure_ascii=False, indent=2))
@@ -553,7 +583,7 @@ def cmd_accounts(args) -> int:
 
 
 def cmd_best(args) -> int:
-    rows = [s for s in (account_state(a) for a in list_areas()) if s.get("live")]
+    rows = [s for s in states_all(running_areas()) if s.get("live")]
     rows.sort(key=lambda s: (-(s.get("next_points") or 0), s.get("claimed_today") is True, s["area"]))
     print("Живые аккаунты по порядку «сколько очков на следующую активацию»:\n")
     for st in rows:
@@ -732,10 +762,10 @@ def cmd_report(args) -> int:
     running = running_areas()
     sent = []
     failed = []
-    for area in list_areas():
-        st = account_state(area, running)
+    for st in states_all(running):
         if not st.get("live") or not st.get("claimed_today"):
             continue
+        area = AREAS_ROOT / st["area"]
         email = st.get("email")
         day = st.get("day_no")
         points = st.get("points_today")
