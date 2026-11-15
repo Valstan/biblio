@@ -377,19 +377,23 @@ def karman_token() -> str:
     return os.environ.get("KARMAN_ROOM_TOKEN") or secrets().get("SECRETS_TOKEN") or ""
 
 
-def karman_available(tier: str = "", project: str = "", area: str = "") -> tuple:
+def karman_available(project: str = "", area: str = "") -> tuple:
     """GET /api/minimax/accounts/available — отдаёт аккаунт вместе с парой (разово).
 
     Проект передаём ЗАГОЛОВКОМ (X-MiniMax-Project / X-MiniMax-Area): заголовок не
     проходит через валидацию тела, а значит не может обернуться 400 — а 400 на
     выдаче пары стоит нам одноразового refresh и нового входа в браузере.
+
+    **Класс очков мы не задаём** (ответ Кармана, 15.11): выбор делает он сам, по
+    комнате потребителя — наша комната `brain` получает тысячные первыми,
+    `setka` — четырёхсоткие; нужного класса не осталось — отдаёт оставшиеся.
+    Параметра `?tier=` в его живом роуте нет, и лишний вопрос в запросе только
+    рискует 400 на выдаче пары. Заголовки оставляем — они идут в его аудит.
     """
     base, token = karman_base(), karman_token()
     if not base or not token:
         return 0, {"error": "нет адреса КАРМАНА или room-токена"}
     url = "%s/api/minimax/accounts/available" % base
-    if tier:
-        url += "?tier=%s" % tier
     headers = {"Authorization": "Bearer " + token, "Accept": "application/json"}
     if project:
         headers["X-MiniMax-Project"] = project
@@ -640,7 +644,7 @@ def cmd_pull(args) -> int:
         print("  Проба ничего не берёт. Реальный запрос к Карману отдаёт пару ОДИН раз —")
         print("  это цена проверки, поэтому её платим только при --apply.")
         return 0
-    status, payload = karman_available(args.tier or "", area_project(area), area.name)
+    status, payload = karman_available(area_project(area), area.name)
     if status != 200:
         print("Карман ответил %s: %s" % (status, payload.get("error") or payload), file=sys.stderr)
         return 1
@@ -685,7 +689,7 @@ def cmd_repair(args) -> int:
     for st in orphans:
         area = AREAS_ROOT / st["area"]
         print("→ %s (проект %s)" % (st["area"], area_project(area)))
-        status, payload = karman_available(args.tier or "", area_project(area), area.name)
+        status, payload = karman_available(area_project(area), area.name)
         if status != 200:
             print("  Карман ответил %s: %s" % (status, payload.get("error") or payload))
             break
@@ -791,14 +795,12 @@ def main() -> int:
 
     p = sub.add_parser("pull", help="взять ОДИН токен у КАРМАНА и поставить в область")
     p.add_argument("area")
-    p.add_argument("--tier", help="например 1000 — очки нужного класса")
     p.add_argument("--note", action="store_true",
                    help="сообщить Карману, какой аккаунт активирован (без токенов)")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_pull)
 
     p = sub.add_parser("repair", help="тихий ремонт незапущенных областей")
-    p.add_argument("--tier", help="класс очков, который просим у Кармана")
     p.add_argument("--note", action="store_true", help="отметить активации у Кармана (без токенов)")
     p.add_argument("--apply", action="store_true")
     p.set_defaults(func=cmd_repair)

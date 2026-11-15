@@ -118,9 +118,10 @@ async function restartArea(slug) {
 }
 
 // Поставить в область новую пару из Кармана и перезапустить область.
-async function newAccount(slug, tier) {
+// Класс очков не задаём: Карман выбирает его сам, по нашей комнате `brain`
+// (тысячные первыми) — параметра `?tier=` в его роуте нет (ответ 15.11).
+async function newAccount(slug) {
   const args = ['pull', 'p-' + slug, '--apply'];
-  if (tier) args.push('--tier', tier);
   const r = await tool(args);
   const ok = !/готовых пар нет|no_tokens_ready|не удалось|ERROR/i.test(r.out);
   if (!ok) {
@@ -315,7 +316,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/repair') {
     const slug = q.get('area');
     if (slug) {
-      const r = await newAccount(slug, q.get('tier') || '');
+      const r = await newAccount(slug);
       return json(200, { ok: r.ok, out: r.out });
     }
     const list = await liveState(true);
