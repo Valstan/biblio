@@ -1,13 +1,17 @@
 // Панель MiniMax Code — области проектов: живой вход, очки, смена аккаунта.
 //
-// Что умеет (2026-11-14):
+// Что умеет (2026-11-16):
 //   * показывает области p-<проект> с ЖИВЫМ статусом (панель MiniMax, не файл:
 //     auth-state.json врёт — у мёртвого токена написано "authenticated");
-//   * «Новый аккаунт» — берёт пару токенов у КАРМАНА и сажает её в область
+//   * «Новый вход (токен)» — берёт пару токенов у КАРМАНА и сажает её в область
 //     (ключ записи пересчитывается под путь области), область перезапускается;
+//     ЛЕЧЕНИЕ РУЧНОЕ (решение владельца 15.11): автоматика убрана — она брала
+//     у Кармана аккаунт за аккаунтом, пока область не оживёт;
 //   * «Перенести из…» — переставить аккаунт из другой области (одна копия!);
-//   * ТИХИЙ РЕМОНТ: запущенная область без живого входа чинится сама
-//     (владелец нажал «Выйти из аккаунта» — дальше без него);
+//   * кнопки самой панели: Запустить / Остановить / Перезапустить — идут в
+//     супервизор (порт 8098), который держит панель и поднимает её заново;
+//   * страница управления супервизором: http://127.0.0.1:8098 — работает, даже
+//     когда панель остановлена;
 //   * незапущенные области НЕ трогаются вообще.
 //
 // Факты, на которых стоит механика:
@@ -16,7 +20,7 @@
 //   * остаток очков MiniMax по API НЕ отдаётся → «кончились очки» ловится
 //     либо по кнопке, либо по ручному «Выйти из аккаунта».
 //
-// Запуск: node mcode-panel.js [порт]
+// Запуск: node mcode-panel.js [порт]   (в норме — через супервизор, тихо)
 // Логика — в minimax-switch.py (единственная реализация механики).
 
 const http = require('http');
@@ -34,7 +38,11 @@ const MCODE = path.join(HOME, 'AppData', 'Roaming', 'npm', 'mcode.cmd');
 const JOURNAL_DIR = path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'mcode-web');
 const JOURNAL_FILE = path.join(JOURNAL_DIR, 'journal.log');
 
-const AUTO = { enabled: true, last: 0, busy: false };
+// Автоматического лечения больше нет (решение владельца 15.11): панель брала
+// у Кармана новый аккаунт каждые 45 секунд, пока область не оживёт, — пул
+// оборачивался зря. Теперь новый вход даёт владелец руками: кнопка
+// «Новый вход (токен)» у нужной области.
+const AUTO = { reported: 0 };
 const journal = [];
 const stateCache = { ts: 0, data: null };
 const STATE_TTL_MS = 45000;   // опрос панели MiniMax небыстрый — держим кэш
@@ -56,17 +64,41 @@ function log(line) {
 }
 
 function run(cmd, args, opts = {}) {
+  const { timeout = 120000, ...spawnOpts } = opts;
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { windowsHide: true, ...opts });
+    const child = spawn(cmd, args, { windowsHide: true, ...spawnOpts });
     let out = '';
+    let settled = false;
+    const finish = (code, extra) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, out: out + (extra || '') });
+    };
+    // Таймаут: опрос панели MiniMax бывает вязким, и без него панель «залипает»
+    // — запрос /api/state не отвечает, страница выглядит повисшей.
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish(-2, '\n[таймаут ' + Math.round(timeout / 1000) + ' с — команда не ответила]');
+    }, timeout);
     child.stdout.on('data', (d) => { out += d.toString(); });
     child.stderr.on('data', (d) => { out += d.toString(); });
-    child.on('error', (e) => resolve({ code: -1, out: String(e) }));
-    child.on('close', (code) => resolve({ code, out }));
+    child.on('error', (e) => finish(-1, String(e)));
+    child.on('close', (code) => finish(code));
   });
 }
 
-function tool(args) { return run('python', [TOOL, ...args]); }
+// Python печатает в UTF-8 (сам инструмент перенастроил вывод): без этого Windows
+// отдаёт cp1251, панель читает байты как UTF-8 → кракозябры в статусах.
+function tool(args) {
+  const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+  // Один вызов инструмента за раз: два параллельных опроса MiniMax мешают друг
+  // другу (лимиты вендора, взаимные блокировки) — из-за этого панель «глючила».
+  const next = toolChain.then(() => run('python', [TOOL, ...args], { env, timeout: 150000 }));
+  toolChain = next.then(() => {}, () => {});
+  return next;
+}
+let toolChain = Promise.resolve();
 
 // ────────────────────────────── состояние ──────────────────────────────
 
@@ -83,19 +115,27 @@ function projectAreas() {
     .filter((a) => fs.existsSync(path.join(a.dir, 'auth')));
 }
 
+// Один опрос за раз: параллельные вызовы плодили процессы и тормозили опрос MiniMax.
+let stateFlight = null;
+
 async function liveState(force) {
   if (!force && stateCache.data && Date.now() - stateCache.ts < STATE_TTL_MS) return stateCache.data;
-  const r = await tool(['--json', 'areas']);
-  let areas = [];
-  try { areas = JSON.parse(r.out || '[]'); } catch { areas = []; }
-  const meta = new Map(projectAreas().map((a) => [a.dir, a]));
-  const list = areas.map((a) => {
-    const m = meta.get(path.join(AREAS_ROOT, a.area));
-    return Object.assign(a, { title: m ? m.title : a.slug, folder: m ? m.folder : '', slug: a.slug || a.area.replace(/^p-/, '') });
-  }).filter((a) => meta.has(path.join(AREAS_ROOT, a.area)));
-  stateCache.ts = Date.now();
-  stateCache.data = list;
-  return list;
+  if (stateFlight) return stateFlight;
+  stateFlight = (async () => {
+    const r = await tool(['--json', 'areas']);
+    let areas = [];
+    try { areas = JSON.parse(r.out || '[]'); } catch { areas = []; }
+    if (r.code === -2) log('опрос областей не ответил (таймаут) — показываю прошлые данные');
+    const meta = new Map(projectAreas().map((a) => [a.dir, a]));
+    const list = areas.map((a) => {
+      const m = meta.get(path.join(AREAS_ROOT, a.area));
+      return Object.assign(a, { title: m ? m.title : a.slug, folder: m ? m.folder : '', slug: a.slug || a.area.replace(/^p-/, '') });
+    }).filter((a) => meta.has(path.join(AREAS_ROOT, a.area)));
+    stateCache.ts = Date.now();
+    stateCache.data = list;
+    return list;
+  })();
+  try { return await stateFlight; } finally { stateFlight = null; }
 }
 
 // Живые аккаунты — это те же области (второй опрос не нужен: медленно и лишний трафик).
@@ -143,26 +183,11 @@ async function swapAccount(from, to) {
   return { ok, out: r.out };
 }
 
-// Тихий ремонт: только ЗАПУЩЕННЫЕ области, которым нужен вход
-// (приложение само сказало «вышел из аккаунта» или токен не отвечает).
-async function autoRepair() {
-  if (AUTO.busy) return;
-  AUTO.busy = true;
-  try {
-    const list = await liveState(true);
-    const broken = list.filter((a) => a.running && !a.live && !a.authorizing);
-    for (const a of broken) {
-      log('p-' + a.slug + ': ' + (a.state || 'нет входа') + ' — чиню молча');
-      await newAccount(a.slug);
-    }
-  } finally {
-    AUTO.busy = false;
-    AUTO.last = Date.now();
-  }
-}
+// Тихий ремонт удалён по решению владельца (15.11): область, которой нужен
+// вход владельца в браузере, не оживает от нового токена — а панель брала у
+// Кармана аккаунт за аккаунтом. Теперь новый вход даёт владелец руками.
 
 setInterval(() => {
-  if (AUTO.enabled && Date.now() - AUTO.last > 45000) autoRepair().catch(() => {});
   if (Date.now() - (AUTO.reported || 0) > 45000) reportActivations().catch(() => {});
 }, 20000);
 
@@ -210,10 +235,15 @@ const HTML = `<!DOCTYPE html>
 <h1>MiniMax Code — области проектов</h1>
 <div class="sub">Каждая область — отдельная копия приложения: свой проект, свой вход, свои сессии. Статус берётся живым запросом к панели MiniMax.</div>
 <div class="row">
-  <div class="sw" id="auto" onclick="toggleAuto()"></div>
-  <div><b>Тихий ремонт</b> <span class="muted">— запущенная область без входа чинится сама (незапущенные не трогаем)</span></div>
-  <button onclick="repairAll()">Починить все сломанные</button>
+  <div><b>Вход в область — лечение ручное</b> <span class="muted">— нажми «Новый вход (токен)» у нужной области: панель возьмёт свежую пару у Кармана, посадит её и перезапустит область</span></div>
   <button onclick="load()">Обновить</button>
+</div>
+<div class="row">
+  <div><b>Панель наблюдения за MiniMax</b> <span class="muted">— сама панель: остановить, запустить, перезапустить</span></div>
+  <button onclick="panelControl('start')">Запустить панель</button>
+  <button class="w" onclick="panelControl('stop')">Остановить панель</button>
+  <button onclick="panelControl('restart')">Перезапустить панель</button>
+  <a class="muted" style="font-size:12px" href="http://127.0.0.1:8098" target="_blank">страница управления</a>
 </div>
 <table><thead><tr>
 <th>Область</th><th>Проект</th><th>Вход</th><th>Очки</th><th>Запущена</th><th>Действия</th>
@@ -233,7 +263,6 @@ function st(a){
 async function load(){
   const d=await (await fetch('/api/state')).json();
   ACC=d.accounts||[];
-  document.getElementById('auto').className='sw'+(d.auto?' on':'');
   tb.innerHTML='';
   for(const a of d.areas){
     const [label,cls]=st(a);
@@ -246,7 +275,7 @@ async function load(){
       '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>'+
       '<td>'+(a.running?'<span class="st on">да</span>':'<span class="st none">нет</span>')+'</td>'+
       '<td>'+
-        '<button class="p" onclick="newAcc(\\''+a.slug+'\\')">Новый аккаунт</button>'+
+        '<button class="p" onclick="newAcc(\\''+a.slug+'\\')">Новый вход (токен)</button>'+
         (opts?'<select id="src_'+a.slug+'">'+opts+'</select><button onclick="swap(\\''+a.slug+'\\')">Перенести</button>':'')+
         '<button onclick="toggleArea(\\''+a.slug+'\\','+(a.running?'stop':'start')+'\\')">'+(a.running?'Остановить':'Запустить')+'</button>'+
       '</td>';
@@ -277,16 +306,24 @@ async function toggleArea(slug, what){
   await fetch('/api/'+what+'?area='+slug);
   setTimeout(load,2500);
 }
-async function toggleAuto(){
-  await fetch('/api/auto');
-  load();
-}
-async function repairAll(){
+// Автоматического лечения нет (решение владельца 15.11) — переключатель
+// «тихий ремонт» и кнопка «починить все» убраны: новый вход даёт владелец
+// руками, по одной области.
+// Панель живёт под супервизором (node mcode-panel-supervisor.js, порт 8098):
+// он её поднимает после падения и слушает эти кнопки. Идём напрямую к нему,
+// чтобы «Запустить» работала и когда панель уже лежит (страница в браузере жива).
+async function panelControl(what){
+  const w={start:'запуск',stop:'остановка',restart:'перезапуск'}[what]||what;
   box.classList.add('show');
-  box.innerHTML='<b>Ремонт:</b> чиню запущенные области без входа…';
-  const r=await (await fetch('/api/repair')).json();
-  box.innerHTML='<b>Ремонт:</b> '+(r.ok?'сделано.':'сделано частично: '+(r.error||''));
-  load();
+  box.innerHTML='<b>Панель наблюдения:</b> '+w+'…';
+  try{
+    const r=await (await fetch('http://127.0.0.1:8098/'+what)).json();
+    box.innerHTML='<b>Панель наблюдения: '+w+'</b> — '+(r.ok?'сделано.':'не вышло: '+(r.error||''))+
+      (what==='stop'?'<br><span class="muted">Панель остановлена. Вернуть — кнопкой «Запустить панель» или на странице управления http://127.0.0.1:8098</span>':'');
+  }catch(e){
+    box.innerHTML='<b>Панель наблюдения: '+w+'</b> — супервизор не отвечает.<br><span class="muted">Страница управления: http://127.0.0.1:8098</span>';
+  }
+  setTimeout(load,2500);
 }
 load(); setInterval(load,5000);
 </script></body></html>`;
@@ -310,19 +347,15 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/state') {
     const list = await liveState(false);
     const acc = await accounts();
-    return json(200, { areas: list, accounts: acc, auto: AUTO.enabled, journal });
+    return json(200, { areas: list, accounts: acc, journal });
   }
 
+  // Новый вход — только по одной области и только по команде владельца.
   if (p === '/api/repair') {
     const slug = q.get('area');
-    if (slug) {
-      const r = await newAccount(slug);
-      return json(200, { ok: r.ok, out: r.out });
-    }
-    const list = await liveState(true);
-    const broken = list.filter((a) => a.running && !a.live && !a.authorizing);
-    for (const a of broken) await newAccount(a.slug);
-    return json(200, { ok: true, out: 'обработано: ' + (broken.map((a) => a.area).join(', ') || 'нечего') });
+    if (!slug) return json(400, { error: 'лечение теперь ручное: укажи область' });
+    const r = await newAccount(slug);
+    return json(200, { ok: r.ok, out: r.out });
   }
 
   if (p === '/api/swap') {
@@ -330,12 +363,6 @@ const server = http.createServer(async (req, res) => {
     if (!from || !to) return json(400, { error: 'нужно from и to' });
     const r = await swapAccount(from, to);
     return json(200, { ok: r.ok, out: r.out });
-  }
-
-  if (p === '/api/auto') {
-    AUTO.enabled = !AUTO.enabled;
-    log('тихий ремонт ' + (AUTO.enabled ? 'включён' : 'выключен'));
-    return json(200, { ok: true, auto: AUTO.enabled });
   }
 
   if (p === '/api/start' || p === '/api/stop') {
