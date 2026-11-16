@@ -32,7 +32,7 @@ invalid»).
     python minimax-switch.py accounts --json
     python minimax-switch.py move p-gonba p-brain --apply
     python minimax-switch.py install p-brain --pair pair.json --apply
-    python minimax-switch.py pull  p-brain --apply          # пара от КАРМАНА (одна отдача!)
+    python minimax-switch.py pull  p-brain --apply          # access-токен от КАРМАНА (одна отдача, ничего не возвращаем)
     python minimax-switch.py repair --apply                  # тихий ремонт незапущенных
 """
 
@@ -398,13 +398,13 @@ def karman_available(project: str = "", area: str = "") -> tuple:
 
     Проект передаём ЗАГОЛОВКОМ (X-MiniMax-Project / X-MiniMax-Area): заголовок не
     проходит через валидацию тела, а значит не может обернуться 400 — а 400 на
-    выдаче пары стоит нам одноразового refresh и нового входа в браузере.
+    выдаче токена стоит нам нового входа в браузере.
 
     **Класс очков мы не задаём** (ответ Кармана, 15.11): выбор делает он сам, по
     комнате потребителя — наша комната `brain` получает тысячные первыми,
     `setka` — четырёхсоткие; нужного класса не осталось — отдаёт оставшиеся.
     Параметра `?tier=` в его живом роуте нет, и лишний вопрос в запросе только
-    рискует 400 на выдаче пары. Заголовки оставляем — они идут в его аудит.
+    рискует 400 на выдаче токена. Заголовки оставляем — они идут в его аудит.
     """
     base, token = karman_base(), karman_token()
     if not base or not token:
@@ -612,7 +612,7 @@ def cmd_install(args) -> int:
         print("          две копии делят одноразовый refresh и ломают друг друга ([G623])")
         print("          если это перенос — используй: move <src> <dst>")
         return 2
-    print("Установка пары в %s%s" % (area.name, "" if args.apply else " (проба, без записи)"))
+    print("Установка авторизации в %s%s" % (area.name, "" if args.apply else " (проба, без записи)"))
     if not args.apply:
         print("  перезапусти с --apply, чтобы записать")
         return 0
@@ -666,12 +666,12 @@ def cmd_pull(args) -> int:
         print("нет области %s" % area, file=sys.stderr)
         return 1
     if not args.apply:
-        # Проба НЕ ходит в Карман: пара отдаётся один раз, и «посмотреть» —
+        # Проба НЕ ходит в Карман: токен отдаётся один раз, и «посмотреть» —
         # это уже забрать. Проба показывает только местное состояние.
         st = account_state(area)
         print("Область %s: %s | запущена=%s | аккаунт=%s" % (
             area.name, st.get("state"), "да" if st.get("running") else "нет", st.get("email") or "—"))
-        print("  Проба ничего не берёт. Реальный запрос к Карману отдаёт пару ОДИН раз —")
+        print("  Проба ничего не берёт. Реальный запрос к Карману отдаёт access-токен ОДИН раз —")
         print("  это цена проверки, поэтому её платим только при --apply.")
         return 0
     status, payload = karman_available(area_project(area), area.name)
@@ -688,7 +688,8 @@ def cmd_pull(args) -> int:
     if not access:
         print("  готовых токенов нет (reason=%s) — нужен вход владельца в браузере" % payload.get("reason"))
         return 2
-    print("  ⚠ пара отдаётся ОДИН раз — её надо вернуть обновлённой")
+    print("  Карман отдал access-токен. Refresh не присылаем и токен обратно НЕ возвращаем:")
+    print("  учёт, статистика и ротация — в зоне Кармана (решение владельца 15.11).")
     if not args.apply:
         print("  (проба — перезапусти с --apply, чтобы поставить в %s)" % area.name)
         return 0
@@ -701,7 +702,7 @@ def cmd_pull(args) -> int:
 
 
 def cmd_repair(args) -> int:
-    """Тихий ремонт: незапущенные области без живого входа получают пару из Кармана."""
+    """Ремонт: незапущенные области без входа получают access-токен из Кармана."""
     running = running_areas()
     states = [account_state(a, running) for a in list_areas()]
     orphans = [s for s in states if s.get("orphan")]
