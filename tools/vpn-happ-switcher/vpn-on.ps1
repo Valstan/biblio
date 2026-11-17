@@ -29,8 +29,8 @@ $ok = $true
 # 1. Happ
 if (-not (Ensure-Happ)) { $ok = $false }
 
-# 2. Системный прокси
-Set-SystemProxy $true
+# 2. Системный прокси — на Happ
+Set-SystemProxy '127.0.0.1:10809'
 
 # 3. Маршрут RustDesk (мимо туннеля)
 if (-not (Add-RustDeskRoute)) { $ok = $false }
@@ -53,7 +53,7 @@ $msg = @"
 МиниГен — VPN включён (Happ).
 
 Прокси Happ: 10809 (http) / 10808 (socks)
-Системный прокси Windows: включён
+Системный прокси Windows: включён (127.0.0.1:10809)
 Маршрут RustDesk 92.51.22.114 -> 192.168.1.1: $(if (Test-RustDeskRoute) { 'проложен' } else { 'НЕ проложен (нужны права админа)' })
 Контур «МиниГен»: перезапущен
 MiniMax: $(if (Test-Api $HAPP_HTTP) { 'отвечает' } else { 'НЕ отвечает' })
