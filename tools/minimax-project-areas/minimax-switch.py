@@ -77,6 +77,10 @@ AUDIENCE = "agent-backend"
 PANEL_BASE = "https://agent.minimax.io/minimax-cloud/api/v1/signin"
 SIGNIN_TZ = "Europe%2FMoscow"
 DEFAULT_TTL_MS = 8 * 60 * 60 * 1000
+# Минимальный остаток жизни access-токена, который мы вообще ставим в область.
+# 17.11 КАРМАН отдал аккаунт, у которого access жил 9 минут: десктоп его
+# отверг и стёр запись входа, область осталась незалогиненной. Такой не ставим.
+MIN_TOKEN_LIFE_MIN = 30
 
 SSL_CTX = ssl.create_default_context()
 
@@ -469,10 +473,42 @@ def karman_note_activation(email: str, account_id=None, activation_index=None,
         return False
 
 
+_KARMAN_PROJECT_CACHE = {"ts": 0.0, "map": {}}
+
+
+def karman_projects() -> dict:
+    """Область → имя раздела проекта в КАРМАНе (из mcode-project-areas.json).
+
+    Канон имён разделов — `brain_matrica/docs/PROJECT_NAMES.md`. Имя едет в
+    Карман заголовком `X-MiniMax-Project`, и по нему идёт статистика расхода
+    по проектам, а не «всё на brain».
+    """
+    now = time.time()
+    if now - _KARMAN_PROJECT_CACHE["ts"] < 30:
+        return _KARMAN_PROJECT_CACHE["map"]
+    out = {}
+    try:
+        data = json.loads(PROJECTS_JSON.read_text(encoding="utf-8"))
+        for p in data.get("projects", []):
+            slug = p.get("slug")
+            if slug:
+                out[slug] = p.get("karman") or slug
+    except (OSError, ValueError):
+        out = {}
+    _KARMAN_PROJECT_CACHE["ts"] = now
+    _KARMAN_PROJECT_CACHE["map"] = out
+    return out
+
+
 def area_project(area: Path) -> str:
-    """Имя проекта по области: p-brain → brain."""
-    name = area.name
-    return name[2:] if name.startswith("p-") else name
+    """Имя проекта (раздел в КАРМАНе) по области: p-vmalmyzhe → vMalmyzhe.
+
+    Раньше здесь было отрезание префикса `p-` (p-brain → brain) — из-за
+    этого Карман видел все расходы под одним проектом. Теперь имя раздела
+    берётся из конфига областей, и у каждого проекта оно своё.
+    """
+    slug = area.name[2:] if area.name.startswith("p-") else area.name
+    return karman_projects().get(slug, slug)
 
 
 # ────────────────────────────── команды ──────────────────────────────
@@ -690,6 +726,23 @@ def cmd_pull(args) -> int:
         return 2
     print("  Карман отдал access-токен. Refresh не присылаем и токен обратно НЕ возвращаем:")
     print("  учёт, статистика и ротация — в зоне Кармана (решение владельца 15.11).")
+    # Страховка ДО установки (17.11): Карман отдал access с остатком 9 минут —
+    # десктоп его отверг и стёр запись входа, область осталась незалогиненной.
+    # Такой токен не ставим: сообщаем и выходим с кодом 3 (негодный аккаунт).
+    try:
+        exp = int(expires or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    if exp:
+        life = (exp - time.time() * 1000) / 60000.0
+        if life < MIN_TOKEN_LIFE_MIN:
+            print("  ВНИМАНИЕ: у выданного access осталось %.0f мин — НЕ ставлю его в область." % life)
+            print("  Такой токен десктоп отвергнет и сотрёт вход. Нужен другой аккаунт.")
+            return 3
+    status, _payload = panel(access)
+    if status != 200:
+        print("  ВНИМАНИЕ: вендор не принимает выданный токен (HTTP %s) — НЕ ставлю его." % status)
+        return 3
     if not args.apply:
         print("  (проба — перезапусти с --apply, чтобы поставить в %s)" % area.name)
         return 0

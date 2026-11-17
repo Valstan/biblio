@@ -1,4 +1,4 @@
-// Супервизор панели MiniMax — тихий, без окон.
+// Супервизор МиниГен — тихий, без окон.
 //
 // Зачем (15.11.2026, просьба владельца):
 //   * окно терминала от автозапуска пугало: закрыть его = убить и сторожа, и
@@ -24,6 +24,7 @@ const { spawn } = require('child_process');
 const HOME = process.env.USERPROFILE;
 const BIN = path.join(HOME, 'bin');
 const PANEL_SCRIPT = path.join(BIN, 'mcode-panel.js');
+const HEALER_SCRIPT = path.join(BIN, 'minimax-autheal.py');
 const PANEL_PORT = 8099;
 const CTRL_PORT = 8098;
 const LOCAL = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local');
@@ -86,6 +87,7 @@ function startPanel() {
   });
   const pid = panel.pid;
   log('панель запущена, pid ' + pid);
+  startHealer();
   panel.on('exit', (code, signal) => {
     log('панель завершилась (code=' + code + ', signal=' + signal + ')');
     panel = null;
@@ -105,8 +107,48 @@ function stopPanel() {
     try { panel.kill(); } catch {}
     panel = null;
   }
+  stopHealer();
   log('панель остановлена по команде владельца');
   return { ok: true };
+}
+
+// ────────────────────────────── авто-лечение областей ──────────────────────────────
+// Живёт рядом с панелью: поднимается вместе с ней, умирает вместе с ней и
+// поднимается заново, если упал. Решение владельца 16.11: лечим область, когда
+// у неё кончились очки (отказ «insufficient balance»), — новый аккаунт, бонус
+// активируется, области перезапускаются, в сессию уходит «Продолжай».
+let healer = null;
+
+function healerAlive() {
+  return !!(healer && healer.exitCode === null && !healer.killed);
+}
+
+function startHealer() {
+  if (healerAlive()) return;
+  try {
+    healer = spawn('python', [HEALER_SCRIPT], {
+      cwd: BIN,
+      windowsHide: true,
+      stdio: 'ignore',
+      env: { ...process.env },
+    });
+    log('авто-лечение запущено, pid ' + healer.pid);
+    healer.on('exit', (code, signal) => {
+      log('авто-лечение завершилось (code=' + code + ', signal=' + signal + ')');
+      healer = null;
+      if (desiredState() === 'running') setTimeout(startHealer, 5000);
+    });
+  } catch (e) {
+    log('авто-лечение не поднялось: ' + e.message);
+  }
+}
+
+function stopHealer() {
+  if (healer) {
+    try { healer.kill(); } catch {}
+    healer = null;
+    log('авто-лечение остановлено');
+  }
 }
 
 function restartPanel() {
@@ -122,7 +164,7 @@ function restartPanel() {
 
 const HTML = `<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
-<title>Панель MiniMax — управление</title>
+<title>МиниГен — управление</title>
 <style>
  body{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:#14141a;color:#e6e6e6;margin:0;padding:28px}
  h1{font-size:20px;margin:0 0 4px} .sub{color:#8b8b96;margin-bottom:20px;max-width:760px}
@@ -133,7 +175,7 @@ const HTML = `<!DOCTYPE html>
  code{background:#14141a;padding:2px 6px;border-radius:4px}
  a{color:#8ab4f8}
 </style></head><body>
-<h1>Панель наблюдения за MiniMax — управление</h1>
+<h1>МиниГен — управление</h1>
 <div class="sub">Эта страница работает всегда, даже когда сама панель остановлена или упала. Кнопки: остановить, запустить, перезапустить. «Остановлена» переживает перезагрузку компьютера — вернуть можно этой же страницей.</div>
 <div class="card">
   <div class="st" id="st">состояние: …</div>

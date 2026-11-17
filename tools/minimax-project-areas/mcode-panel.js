@@ -37,15 +37,39 @@ const AREAS_ROOT = path.join(HOME, '.minimax-areas');
 const MCODE = path.join(HOME, 'AppData', 'Roaming', 'npm', 'mcode.cmd');
 const JOURNAL_DIR = path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'mcode-web');
 const JOURNAL_FILE = path.join(JOURNAL_DIR, 'journal.log');
+const HEAL_STATE_FILE = path.join(JOURNAL_DIR, 'autheal-state.json');
 
-// Автоматического лечения больше нет (решение владельца 15.11): панель брала
+// Расход пула лечащим: сколько аккаунтов область забрала за сутки и до какого
+// времени она на паузе. Читаем файл состояния лечащего (он и пишет туда).
+function healState() {
+  try { return JSON.parse(fs.readFileSync(HEAL_STATE_FILE, 'utf8')); } catch { return {}; }
+}
+function pullsToday(state, slug) {
+  const pulls = (state && state.pulls && state.pulls[slug]) || [];
+  const dayAgo = Date.now() - 86400000;
+  return pulls.filter((t) => Number(t) * 1000 > dayAgo).length;
+}
+function backoffUntil(state, slug) {
+  const bo = (state && state.backoff && state.backoff[slug]) || {};
+  return Number(bo.until || 0) * 1000;
+}
+
+// Авто-лечение вернулось 17.11 (D-225), но живёт отдельным демоном под
+// супервизором (minimax-autheal.py) — панель только показывает состояние и
+// даёт ручной путь «Новый вход (токен)». Раньше автоматика жила здесь и брала
 // у Кармана новый аккаунт каждые 45 секунд, пока область не оживёт, — пул
-// оборачивался зря. Теперь новый вход даёт владелец руками: кнопка
-// «Новый вход (токен)» у нужной области.
+// оборачивался зря (G636).
 const AUTO = { reported: 0 };
 const journal = [];
 const stateCache = { ts: 0, data: null };
 const STATE_TTL_MS = 45000;   // опрос панели MiniMax небыстрый — держим кэш
+
+// Журнал подхватываем с диска: после перезапуска панели он иначе пустой
+// (в памяти — только то, что написано при текущем процессе).
+try {
+  const raw = fs.readFileSync(JOURNAL_FILE, 'utf8').split('\n').filter(Boolean);
+  for (const line of raw.slice(-60).reverse()) journal.push(line);
+} catch {}
 
 // ────────────────────────────── утилиты ──────────────────────────────
 
@@ -61,6 +85,38 @@ function log(line) {
     fs.appendFileSync(JOURNAL_FILE, entry + '\n');
   } catch {}
   console.log(entry);
+}
+
+// PowerShell печатает в кодировке консоли (cp1251), а панель читает UTF-8 —
+// в результатах было «◆◆◆» (тот же класс, что был с инструментом).
+// Имена параметров передаём как есть (иначе $Project получает '-Project'),
+// значения — в кавычках.
+function runPS(script, args) {
+  const quoted = [script].concat(args).map((a, i) => {
+    if (i === 0) return "'" + String(a).replace(/'/g, "''") + "'";
+    const s = String(a);
+    return s.startsWith('-') ? s : "'" + s.replace(/'/g, "''") + "'";
+  }).join(' ');
+  const cmd = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; & " + quoted;
+  return run('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', cmd], { timeout: 120000 });
+}
+
+// Добить всё, что осталось от десктопа области: окно могло зависнуть.
+// Ищем по точному пути каталога области (--user-data-dir=...\p-<slug>\electron),
+// чтобы не задеть соседние области и основной десктоп.
+async function killLeftovers(slug) {
+  const dir = path.join(AREAS_ROOT, 'p-' + slug, 'electron');
+  const ps = `$ErrorActionPreference='SilentlyContinue';` +
+    `$p=Get-CimInstance Win32_Process -Filter "Name='MiniMax Code.exe'" | Where-Object { $_.CommandLine -like '*${dir}*' };` +
+    `$n=0; foreach($x in $p){ Stop-Process -Id $x.ProcessId -Force -ErrorAction SilentlyContinue; $n++ };` +
+    `Start-Sleep -Milliseconds 700;` +
+    `$rest=Get-CimInstance Win32_Process -Filter "Name='MiniMax Code.exe'" | Where-Object { $_.CommandLine -like '*${dir}*' };` +
+    `Write-Output "$n|$($rest.Count)"`;
+  const r = await run('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command',
+    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + ps]);
+  const m = /(\d+)\|(\d+)/.exec(r.out || '');
+  if (m) return Number(m[2]);
+  return 0;
 }
 
 function run(cmd, args, opts = {}) {
@@ -111,8 +167,50 @@ function projectAreas() {
       title: p.title || p.slug,
       folder: p.folder,
       dir: path.join(AREAS_ROOT, 'p-' + p.slug),
+      autoheal: !!p.autoheal,
     }))
     .filter((a) => fs.existsSync(path.join(a.dir, 'auth')));
+}
+
+// ── Переключатель «Автомат / Вручную» ──────────────────────────────────────
+// Режим обслуживания области лежит в конфиге (поле `autoheal`): true —
+// отказ по очкам лечится сам (лечащий под супервизором), false — вход меняет
+// владелец руками, кнопкой «Новый вход (токен)». Лечащий перечитывает конфиг
+// на каждом проходе (раз в 3 мин) — переключатель действует без перезапуска.
+function renderConfig(cfg) {
+  const lines = ['{'];
+  const keys = Object.keys(cfg).filter((k) => k !== 'projects');
+  keys.forEach((k) => {
+    // Запятая после КАЖДОГО ключа: следом всегда идёт "projects" —
+    // без запятой получается невалидный JSON (файл никто бы не прочитал).
+    lines.push('  ' + JSON.stringify(k) + ': ' + JSON.stringify(cfg[k]) + ',');
+  });
+  lines.push('  "projects": [');
+  cfg.projects.forEach((p, i) => {
+    const flat = Object.keys(p).map((k) => JSON.stringify(k) + ': ' + JSON.stringify(p[k])).join(', ');
+    lines.push('    {' + flat + '}' + (i < cfg.projects.length - 1 ? ',' : ''));
+  });
+  lines.push('  ]');
+  lines.push('}');
+  return lines.join('\n') + '\n';
+}
+
+function setMode(slug, mode) {
+  const cfg = readJson(PROJECTS_FILE);
+  if (!cfg || !Array.isArray(cfg.projects)) return { ok: false, error: 'конфиг не читается' };
+  const proj = cfg.projects.find((p) => p.slug === slug);
+  if (!proj) return { ok: false, error: 'нет области ' + slug };
+  const want = mode === 'manual' ? false : true;
+  if (!!proj.autoheal === want) return { ok: true, autoheal: want, out: 'уже так' };
+  proj.autoheal = want;
+  try {
+    fs.copyFileSync(PROJECTS_FILE, PROJECTS_FILE + '.bak-mode');
+    fs.writeFileSync(PROJECTS_FILE, renderConfig(cfg), 'utf8');
+  } catch (e) {
+    return { ok: false, error: String(e && e.message || e) };
+  }
+  log(slug + ': режим обслуживания — ' + (want ? 'АВТОМАТ (лечится сам)' : 'ВРУЧНУЮ (вход меняет владелец)'));
+  return { ok: true, autoheal: want, out: 'записано' };
 }
 
 // Один опрос за раз: параллельные вызовы плодили процессы и тормозили опрос MiniMax.
@@ -127,9 +225,18 @@ async function liveState(force) {
     try { areas = JSON.parse(r.out || '[]'); } catch { areas = []; }
     if (r.code === -2) log('опрос областей не ответил (таймаут) — показываю прошлые данные');
     const meta = new Map(projectAreas().map((a) => [a.dir, a]));
+    const hstate = healState();
     const list = areas.map((a) => {
       const m = meta.get(path.join(AREAS_ROOT, a.area));
-      return Object.assign(a, { title: m ? m.title : a.slug, folder: m ? m.folder : '', slug: a.slug || a.area.replace(/^p-/, '') });
+      const slug = a.slug || a.area.replace(/^p-/, '');
+      return Object.assign(a, {
+        title: m ? m.title : a.slug,
+        folder: m ? m.folder : '',
+        slug: slug,
+        autoheal: m ? !!m.autoheal : false,
+        pulls_today: pullsToday(hstate, slug),
+        backoff_until: backoffUntil(hstate, slug),
+      });
     }).filter((a) => meta.has(path.join(AREAS_ROOT, a.area)));
     stateCache.ts = Date.now();
     stateCache.data = list;
@@ -149,11 +256,9 @@ async function accounts() {
 function areaDir(slug) { return path.join(AREAS_ROOT, 'p-' + slug); }
 
 async function restartArea(slug) {
-  const stop = await run('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-    path.join(BIN, 'mcode-project-stop.ps1'), '-Project', slug]);
+  const stop = await runPS(path.join(BIN, 'mcode-project-stop.ps1'), ['-Project', slug]);
   await new Promise((r) => setTimeout(r, 1500));
-  const start = await run('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-    path.join(BIN, 'mcode-project-start.ps1'), '-Project', slug]);
+  const start = await runPS(path.join(BIN, 'mcode-project-start.ps1'), ['-Project', slug]);
   return { stop: (stop.out || '').trim().split('\n').slice(-1)[0] || '', start: (start.out || '').trim().split('\n').slice(-1)[0] || '' };
 }
 
@@ -174,16 +279,7 @@ async function newAccount(slug) {
   return { ok: true, out: r.out };
 }
 
-// Переставить аккаунт из другой области (одна копия авторизации!)
-async function swapAccount(from, to) {
-  const r = await tool(['move', 'p-' + from, 'p-' + to, '--apply']);
-  const ok = /записано в/i.test(r.out);
-  log(ok ? ('аккаунт перенесён: ' + from + ' → ' + to) : ('перенос не удался: ' + (r.out || '').trim().split('\n').slice(-1)[0]));
-  if (ok) await restartArea(to);
-  return { ok, out: r.out };
-}
-
-// Тихий ремонт удалён по решению владельца (15.11): область, которой нужен
+// Тихий ремонт удалён по решению владельца (15.11):
 // вход владельца в браузере, не оживает от нового токена — а панель брала у
 // Кармана аккаунт за аккаунтом. Теперь новый вход даёт владелец руками.
 
@@ -206,53 +302,64 @@ async function reportActivations() {
 
 const HTML = `<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
-<title>MiniMax — области проектов</title>
+<title>МиниГен — области проектов</title>
 <style>
  body{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:#14141a;color:#e6e6e6;margin:0;padding:24px}
  h1{font-size:20px;margin:0 0 4px} .sub{color:#8b8b96;margin-bottom:18px}
- table{border-collapse:collapse;width:100%;max-width:1200px;background:#1c1c22;border-radius:8px;overflow:hidden;table-layout:auto}
+ table{border-collapse:collapse;width:auto;max-width:none;background:#1c1c22;border-radius:8px;overflow:hidden;table-layout:fixed}
  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #2a2a33;vertical-align:top}
  th{background:#232329;color:#a0a0ac;font-weight:600;font-size:12px;text-transform:uppercase;white-space:nowrap}
  .st{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;white-space:nowrap}
  .on{background:#1f4d2b;color:#6ee7a0} .off{background:#4d1f1f;color:#ff9a9a} .pend{background:#4d421f;color:#ffd479} .none{background:#33333d;color:#9a9aa8}
- button{padding:4px 8px;border:1px solid #3a3a46;background:#2a2a33;color:#e6e6e6;border-radius:6px;cursor:pointer;margin:0 4px 4px 0;font-size:12px;white-space:nowrap}
+ button{padding:3px 7px;border:1px solid #3a3a46;background:#2a2a33;color:#e6e6e6;border-radius:6px;cursor:pointer;margin:0 4px 4px 0;font-size:11.5px;white-space:nowrap}
  button:hover{background:#3a3a46} button.p{background:#1f4d2b;border-color:#2d6b3f} button.w{background:#4d421f;border-color:#6b5f2d}
  select{padding:3px 5px;border-radius:6px;border:1px solid #3a3a46;background:#2a2a33;color:#e6e6e6;font-size:12px;max-width:130px}
- code{background:#14141a;padding:2px 6px;border-radius:4px;font-size:12px;word-break:break-all}
- .path{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
+ code{background:#14141a;padding:2px 6px;border-radius:4px;font-size:12px;word-break:normal;white-space:nowrap}
+ .path{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
+ .burn{color:#ff9a9a;font-size:11px;white-space:nowrap}
  .pts{white-space:nowrap;font-size:12px}
+ .act{white-space:nowrap}
+ .act button{margin:0 6px 0 0}
  .box{max-width:1200px;margin-top:16px;padding:14px;background:#1c1c22;border:1px solid #2a2a33;border-radius:8px;display:none}
  .box.show{display:block}
  .jrn{max-width:1200px;margin-top:16px;padding:12px 14px;background:#1c1c22;border:1px solid #2a2a33;border-radius:8px;font-size:12.5px;color:#c9c9d2}
  .jrn div{padding:2px 0;border-bottom:1px solid #232329}
  .muted{color:#8b8b96}
  .row{display:flex;align-items:center;gap:12px;margin:10px 0}
- .sw{width:44px;height:22px;border-radius:11px;background:#33333d;position:relative;cursor:pointer;border:1px solid #3a3a46}
+ .modal{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:60}
+ .modal.show{display:flex}
+ .mbox{background:#2a1214;border:1px solid #ff9a9a;border-radius:10px;padding:22px 26px;max-width:560px;color:#ffd7d7;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+ .mbox h2{margin:0 0 10px;font-size:17px;color:#ff9a9a}
+ .mbox .muted{color:#e7b9b9}
+ .sw{display:inline-block;width:42px;height:22px;border-radius:11px;background:#3a3a46;border:1px solid #4c4c5a;position:relative;cursor:pointer;vertical-align:middle;transition:background .15s,border-color .15s}
  .sw.on{background:#1f4d2b;border-color:#2d6b3f}
- .sw:after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#9a9aa8;transition:.15s}
+ .sw:after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#9a9aa8;transition:left .15s,background .15s}
  .sw.on:after{left:22px;background:#6ee7a0}
+ .sw:hover{filter:brightness(1.25)}
 </style></head><body>
-<h1>MiniMax Code — области проектов</h1>
-<div class="sub">Каждая область — отдельная копия приложения: свой проект, свой вход, свои сессии. Статус берётся живым запросом к панели MiniMax.</div>
+<h1>МиниГен</h1>
+<div class="sub">Области проектов: каждая — отдельная копия приложения со своим проектом, своим входом и своими сессиями. Статус берётся живым запросом к панели MiniMax.</div>
 <div class="row">
-  <div><b>Вход в область — лечение ручное</b> <span class="muted">— нажми «Новый вход (токен)» у нужной области: панель возьмёт свежую пару у Кармана, посадит её и перезапустит область</span></div>
-  <button onclick="load()">Обновить</button>
-</div>
-<div class="row">
-  <div><b>Панель наблюдения за MiniMax</b> <span class="muted">— сама панель: остановить, запустить, перезапустить</span></div>
-  <button onclick="panelControl('start')">Запустить панель</button>
-  <button class="w" onclick="panelControl('stop')">Остановить панель</button>
-  <button onclick="panelControl('restart')">Перезапустить панель</button>
+  <div><b>Лечится само</b> <span class="muted">— при отказе по очкам МиниГен берёт аккаунт у Кармана, активирует бонус, перезапускает область и шлёт «Продолжай»</span></div>
+  <button onclick="reloadPanel()">Перезагрузить панель</button>
   <a class="muted" style="font-size:12px" href="http://127.0.0.1:8098" target="_blank">страница управления</a>
 </div>
-<table><thead><tr>
-<th>Область</th><th>Проект</th><th>Вход</th><th>Очки</th><th>Запущена</th><th>Действия</th>
+<table>
+<colgroup><col style="width:258px"><col style="width:168px"><col style="width:96px"><col style="width:104px"><col style="width:424px"><col style="width:172px"><col style="width:136px"></colgroup>
+<thead><tr>
+<th>Область</th><th>Проект</th><th>Запущена</th><th>Авто/Ручной</th><th>Действия</th><th>Аккаунт</th><th>Очки</th>
 </tr></thead><tbody id="tb"></tbody></table>
+<div class="modal" id="alarm"><div class="mbox">
+  <h2>Аларм МиниГена</h2>
+  <div id="alarmText"></div>
+  <div class="muted" style="font-size:12px;margin:10px 0 14px">Процесс активации остановлен автоматически — нужно разобраться, что происходит. Подробности — в журнале.</div>
+  <button onclick="ackAlarm()">Понятно, разбираюсь</button>
+</div></div>
 <div class="box" id="box"></div>
 <div class="jrn" id="jrn"></div>
 <script>
 const tb=document.getElementById('tb'), box=document.getElementById('box');
-let ACC=[];
+let MODES={};
 function st(a){
   const s=a.state||'?';
   if(s==='жив') return ['жив','on'];
@@ -260,25 +367,40 @@ function st(a){
   if(s==='вышел из аккаунта'||s==='токен не отвечает') return [s,'off'];
   return [s,'none'];
 }
+let ALARM=null;
+function showAlarm(a){
+  if(!a||!a.text) return;
+  if(localStorage.getItem('minigen_alarm_'+a.at)) return;
+  ALARM=a;
+  document.getElementById('alarmText').textContent=a.text;
+  document.getElementById('alarm').classList.add('show');
+}
+function ackAlarm(){
+  if(ALARM) localStorage.setItem('minigen_alarm_'+ALARM.at,'1');
+  document.getElementById('alarm').classList.remove('show');
+}
 async function load(){
   const d=await (await fetch('/api/state')).json();
-  ACC=d.accounts||[];
+  MODES={}; for(const a of d.areas) MODES[a.slug]=!!a.autoheal;
+  showAlarm(d.alarm);
   tb.innerHTML='';
   for(const a of d.areas){
     const [label,cls]=st(a);
-    const opts=ACC.filter(x=>x.area!==a.area).map(x=>'<option value="'+x.area+'">'+x.area+(x.email?' ('+x.email+')':'')+'</option>').join('');
     const tr=document.createElement('tr');
-    tr.innerHTML='<td><code>'+a.area+'</code></td>'+
-      '<td>'+a.title+'<div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div></td>'+
-      '<td><span class="st '+cls+'">'+label+'</span>'+(a.email?'<div class="muted" style="font-size:11.5px">'+a.email+'</div>':'')+
-        (a.app_status&&a.app_status!=='authenticated'?'<div class="muted" style="font-size:11px">приложение: '+a.app_status+'</div>':'')+'</td>'+
-      '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>'+
+    const burn=(a.pulls_today?'<div class="burn">сегодня '+a.pulls_today+' акк.</div>':'')+
+      (a.backoff_until>Date.now()?'<div class="muted" style="font-size:11px">пауза до '+
+        new Date(a.backoff_until).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+'</div>':'');
+    tr.innerHTML='<td style="white-space:nowrap"><code>'+a.area+'</code><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div>'+burn+'</td>'+
+      '<td style="white-space:nowrap">'+a.title+'</td>'+
       '<td>'+(a.running?'<span class="st on">да</span>':'<span class="st none">нет</span>')+'</td>'+
-      '<td>'+
-        '<button class="p" onclick="newAcc(\\''+a.slug+'\\')">Новый вход (токен)</button>'+
-        (opts?'<select id="src_'+a.slug+'">'+opts+'</select><button onclick="swap(\\''+a.slug+'\\')">Перенести</button>':'')+
-        '<button onclick="toggleArea(\\''+a.slug+'\\','+(a.running?'stop':'start')+'\\')">'+(a.running?'Остановить':'Запустить')+'</button>'+
-      '</td>';
+      '<td><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="'+(a.autoheal?'АВТОМАТ — область лечится сама':'РУЧНОЙ — вход меняете вы')+'"></span></td>'+
+      '<td class="act">'+
+        '<button class="p" data-slug="'+a.slug+'" onclick="newAcc(this.dataset.slug)">Новый вход (токен)</button>'+
+        '<button data-slug="'+a.slug+'" data-op="'+(a.running?'stop':'start')+'" onclick="toggleArea(this.dataset.slug,this.dataset.op)">'+(a.running?'Остановить десктоп':'Запустить десктоп')+'</button>'+
+        '<button data-slug="'+a.slug+'" onclick="revive(this.dataset.slug)">Оживить вход (браузер)</button>'+
+      '</td>'+
+      '<td class="muted" style="font-size:11.5px">'+(a.email||'—')+'</td>'+
+      '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>';
     tb.appendChild(tr);
   }
   const j=document.getElementById('jrn');
@@ -292,38 +414,41 @@ async function newAcc(slug){
     '<br><span class="muted">'+(r.out||'').replace(/\\n/g,'<br>')+'</span>';
   load();
 }
-async function swap(to){
-  const src=document.getElementById('src_'+to).value;
+async function reloadPanel(){
   box.classList.add('show');
-  box.innerHTML='<b>Перенос '+src+' → '+to+':</b> …';
-  const r=await (await fetch('/api/swap?from='+src+'&to='+to)).json();
-  box.innerHTML='<b>Перенос '+src+' → '+to+':</b> '+(r.ok?'готово.':'не вышло: '+(r.error||''));
+  box.innerHTML='<b>Панель:</b> сбрасываю состояние и пересканирую десктопы…';
+  const r=await (await fetch('/api/reload')).json();
+  box.innerHTML='<b>Панель перезагружена.</b> '+(r.ok?('Областей пересканировано: '+r.areas+'.'):('не вышло: '+(r.error||'')));
   load();
 }
-async function toggleArea(slug, what){
+async function setMode(slug){
+  const want=MODES[slug]?'manual':'auto';
   box.classList.add('show');
-  box.innerHTML='<b>'+slug+':</b> '+what+'…';
-  await fetch('/api/'+what+'?area='+slug);
-  setTimeout(load,2500);
-}
-// Автоматического лечения нет (решение владельца 15.11) — переключатель
-// «тихий ремонт» и кнопка «починить все» убраны: новый вход даёт владелец
-// руками, по одной области.
-// Панель живёт под супервизором (node mcode-panel-supervisor.js, порт 8098):
-// он её поднимает после падения и слушает эти кнопки. Идём напрямую к нему,
-// чтобы «Запустить» работала и когда панель уже лежит (страница в браузере жива).
-async function panelControl(what){
-  const w={start:'запуск',stop:'остановка',restart:'перезапуск'}[what]||what;
-  box.classList.add('show');
-  box.innerHTML='<b>Панель наблюдения:</b> '+w+'…';
-  try{
-    const r=await (await fetch('http://127.0.0.1:8098/'+what)).json();
-    box.innerHTML='<b>Панель наблюдения: '+w+'</b> — '+(r.ok?'сделано.':'не вышло: '+(r.error||''))+
-      (what==='stop'?'<br><span class="muted">Панель остановлена. Вернуть — кнопкой «Запустить панель» или на странице управления http://127.0.0.1:8098</span>':'');
-  }catch(e){
-    box.innerHTML='<b>Панель наблюдения: '+w+'</b> — супервизор не отвечает.<br><span class="muted">Страница управления: http://127.0.0.1:8098</span>';
+  box.innerHTML='<b>'+slug+':</b> переключаю режим…';
+  const r=await (await fetch('/api/mode?area='+slug+'&mode='+want)).json();
+  if(r.ok){
+    MODES[slug]=!!r.autoheal;
+    const on=MODES[slug];
+    document.querySelectorAll('.sw[data-slug="'+slug+'"]').forEach(function(el){
+      el.classList.toggle('on', on);
+      el.title=on?'АВТОМАТ — область лечится сама':'РУЧНОЙ — вход меняете вы';
+    });
   }
-  setTimeout(load,2500);
+  box.innerHTML='<b>'+slug+':</b> '+(r.ok?(r.autoheal?'режим — АВТОМАТ (лечится сама).':'режим — ВРУЧНОЙ (вход меняете вы).'):'не вышло: '+(r.error||''))+
+    '<br><span class="muted">Лечащий перечитывает режим на каждом проходе (раз в 3 мин).</span>';
+  load();
+}
+async function revive(slug){
+  box.classList.add('show');
+  box.innerHTML='<b>'+slug+':</b> прошу вендору код входа…';
+  try{
+    const r=await (await fetch('/api/login?area='+slug)).json();
+    box.innerHTML='<b>'+slug+': вход руками</b>'+
+      (r.url?('<br><a href="'+r.url+'" target="_blank">Открыть страницу входа</a><br><b>Код: '+(r.code||'—')+'</b>'):'<br>Ссылка не пришла: '+(r.error||'код не показан'))+
+      '<br><span class="muted">Войди в браузере аккаунтом этой области и подтверди код — рантайм сам сохранит свежий вход.</span>';
+  }catch(e){
+    box.innerHTML='<b>'+slug+': вход руками</b> — не получилось: '+e;
+  }
 }
 load(); setInterval(load,5000);
 </script></body></html>`;
@@ -347,7 +472,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/state') {
     const list = await liveState(false);
     const acc = await accounts();
-    return json(200, { areas: list, accounts: acc, journal });
+    return json(200, { areas: list, accounts: acc, journal, alarm: (healState().alarm || null) });
   }
 
   // Новый вход — только по одной области и только по команде владельца.
@@ -358,20 +483,50 @@ const server = http.createServer(async (req, res) => {
     return json(200, { ok: r.ok, out: r.out });
   }
 
-  if (p === '/api/swap') {
-    const from = q.get('from'), to = q.get('to');
-    if (!from || !to) return json(400, { error: 'нужно from и to' });
-    const r = await swapAccount(from, to);
-    return json(200, { ok: r.ok, out: r.out });
-  }
-
   if (p === '/api/start' || p === '/api/stop') {
     const slug = q.get('area');
     if (!slug) return json(400, { error: 'нужен area' });
-    const script = path.join(BIN, p === '/api/start' ? 'mcode-project-start.ps1' : 'mcode-project-stop.ps1');
-    const r = await run('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-Project', slug]);
-    log(slug + ': ' + (p === '/api/start' ? 'запуск' : 'остановка'));
-    return json(200, { ok: true, out: r.out });
+    if (p === '/api/start') {
+      const script = path.join(BIN, 'mcode-project-start.ps1');
+      const r = await runPS(script, ['-Project', slug]);
+      log(slug + ': запуск десктопа — ' + (r.out || '').trim().split('\n').slice(-1)[0]);
+      return json(200, { ok: true, out: r.out });
+    }
+    // Остановка: штатный стоп, потом ДОБИВАЕМ всё, что осталось — иначе
+    // зависшее окно продолжает кушать память (жалоба владельца 17.11).
+    const script = path.join(BIN, 'mcode-project-stop.ps1');
+    const r = await runPS(script, ['-Project', slug]);
+    const left = await killLeftovers(slug);
+    log(slug + ': десктоп остановлен, осталось процессов: ' + left);
+    return json(200, { ok: true, left: left, out: r.out });
+  }
+
+  // Режим обслуживания области: Автомат / Вручную.
+  if (p === '/api/mode') {
+    const slug = q.get('area');
+    const mode = q.get('mode');
+    if (!slug) return json(400, { error: 'нужен area' });
+    const r = setMode(slug, mode);
+    if (r.ok) {
+      // Кэш состояния живёт 45 с — без сброса переключатель откатывался бы
+      // на старый режим («ничего не меняется»). Обновляем кэш и заставляем
+      // следующий опрос взять свежие данные.
+      if (stateCache.data) {
+        for (const a of stateCache.data) if (a.slug === slug) a.autoheal = !!r.autoheal;
+      }
+      stateCache.ts = 0;
+    }
+    return json(r.ok ? 200 : 400, r);
+  }
+
+  // Перезагрузка панели: сбросить состояние и пересканировать десктопы.
+  if (p === '/api/reload') {
+    stateCache.ts = 0;
+    stateCache.data = null;
+    let list = [];
+    try { list = await liveState(true); } catch (e) { return json(200, { ok: false, error: String(e && e.message || e) }); }
+    log('панель перезагружена — областей пересканировано: ' + list.length);
+    return json(200, { ok: true, areas: list.length });
   }
 
   if (p === '/api/login') {
@@ -404,5 +559,5 @@ const server = http.createServer(async (req, res) => {
 });
 
 server.listen(PORT, '127.0.0.1', () => {
-  console.log('Панель MiniMax (области проектов): http://127.0.0.1:' + PORT);
+  console.log('МиниГен (области проектов): http://127.0.0.1:' + PORT);
 });
