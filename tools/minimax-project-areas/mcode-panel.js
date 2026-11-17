@@ -38,14 +38,22 @@ const MCODE = path.join(HOME, 'AppData', 'Roaming', 'npm', 'mcode.cmd');
 const JOURNAL_DIR = path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'mcode-web');
 const JOURNAL_FILE = path.join(JOURNAL_DIR, 'journal.log');
 
-// Автоматического лечения больше нет (решение владельца 15.11): панель брала
+// Авто-лечение вернулось 17.11 (D-225), но живёт отдельным демоном под
+// супервизором (minimax-autheal.py) — панель только показывает состояние и
+// даёт ручной путь «Новый вход (токен)». Раньше автоматика жила здесь и брала
 // у Кармана новый аккаунт каждые 45 секунд, пока область не оживёт, — пул
-// оборачивался зря. Теперь новый вход даёт владелец руками: кнопка
-// «Новый вход (токен)» у нужной области.
+// оборачивался зря (G636).
 const AUTO = { reported: 0 };
 const journal = [];
 const stateCache = { ts: 0, data: null };
 const STATE_TTL_MS = 45000;   // опрос панели MiniMax небыстрый — держим кэш
+
+// Журнал подхватываем с диска: после перезапуска панели он иначе пустой
+// (в памяти — только то, что написано при текущем процессе).
+try {
+  const raw = fs.readFileSync(JOURNAL_FILE, 'utf8').split('\n').filter(Boolean);
+  for (const line of raw.slice(-60).reverse()) journal.push(line);
+} catch {}
 
 // ────────────────────────────── утилиты ──────────────────────────────
 
@@ -278,17 +286,19 @@ const HTML = `<!DOCTYPE html>
 <style>
  body{font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif;background:#14141a;color:#e6e6e6;margin:0;padding:24px}
  h1{font-size:20px;margin:0 0 4px} .sub{color:#8b8b96;margin-bottom:18px}
- table{border-collapse:collapse;width:100%;max-width:1200px;background:#1c1c22;border-radius:8px;overflow:hidden;table-layout:auto}
+ table{border-collapse:collapse;width:auto;max-width:none;background:#1c1c22;border-radius:8px;overflow:hidden;table-layout:fixed}
  th,td{padding:8px 10px;text-align:left;border-bottom:1px solid #2a2a33;vertical-align:top}
  th{background:#232329;color:#a0a0ac;font-weight:600;font-size:12px;text-transform:uppercase;white-space:nowrap}
  .st{display:inline-block;padding:2px 8px;border-radius:10px;font-size:12px;white-space:nowrap}
  .on{background:#1f4d2b;color:#6ee7a0} .off{background:#4d1f1f;color:#ff9a9a} .pend{background:#4d421f;color:#ffd479} .none{background:#33333d;color:#9a9aa8}
- button{padding:4px 8px;border:1px solid #3a3a46;background:#2a2a33;color:#e6e6e6;border-radius:6px;cursor:pointer;margin:0 4px 4px 0;font-size:12px;white-space:nowrap}
+ button{padding:3px 7px;border:1px solid #3a3a46;background:#2a2a33;color:#e6e6e6;border-radius:6px;cursor:pointer;margin:0 4px 4px 0;font-size:11.5px;white-space:nowrap}
  button:hover{background:#3a3a46} button.p{background:#1f4d2b;border-color:#2d6b3f} button.w{background:#4d421f;border-color:#6b5f2d}
  select{padding:3px 5px;border-radius:6px;border:1px solid #3a3a46;background:#2a2a33;color:#e6e6e6;font-size:12px;max-width:130px}
- code{background:#14141a;padding:2px 6px;border-radius:4px;font-size:12px;word-break:break-all}
- .path{max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
+ code{background:#14141a;padding:2px 6px;border-radius:4px;font-size:12px;word-break:normal;white-space:nowrap}
+ .path{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
  .pts{white-space:nowrap;font-size:12px}
+ .act{white-space:nowrap}
+ .act button{margin:0 6px 0 0}
  .box{max-width:1200px;margin-top:16px;padding:14px;background:#1c1c22;border:1px solid #2a2a33;border-radius:8px;display:none}
  .box.show{display:block}
  .jrn{max-width:1200px;margin-top:16px;padding:12px 14px;background:#1c1c22;border:1px solid #2a2a33;border-radius:8px;font-size:12.5px;color:#c9c9d2}
@@ -307,8 +317,10 @@ const HTML = `<!DOCTYPE html>
   <button onclick="reloadPanel()">Перезагрузить панель</button>
   <a class="muted" style="font-size:12px" href="http://127.0.0.1:8098" target="_blank">страница управления</a>
 </div>
-<table><thead><tr>
-<th>Область</th><th>Проект</th><th>Вход</th><th>Очки</th><th>Запущена</th><th>Действия</th>
+<table>
+<colgroup><col style="width:140px"><col style="width:160px"><col style="width:108px"><col style="width:88px"><col style="width:200px"><col style="width:226px"><col style="width:420px"><col style="width:166px"><col style="width:130px"></colgroup>
+<thead><tr>
+<th>Область</th><th>Проект</th><th>Вход</th><th>Запущена</th><th>Папка</th><th>Режим</th><th>Действия</th><th>Аккаунт</th><th>Очки</th>
 </tr></thead><tbody id="tb"></tbody></table>
 <div class="box" id="box"></div>
 <div class="jrn" id="jrn"></div>
@@ -329,19 +341,21 @@ async function load(){
   for(const a of d.areas){
     const [label,cls]=st(a);
     const tr=document.createElement('tr');
-    tr.innerHTML='<td><code>'+a.area+'</code></td>'+
-      '<td>'+a.title+'<div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div></td>'+
-      '<td><span class="st '+cls+'">'+label+'</span>'+(a.email?'<div class="muted" style="font-size:11.5px">'+a.email+'</div>':'')+
+    tr.innerHTML='<td style="white-space:nowrap"><code>'+a.area+'</code></td>'+
+      '<td style="white-space:nowrap">'+a.title+'</td>'+
+      '<td><span class="st '+cls+'">'+label+'</span>'+
         (a.app_status&&a.app_status!=='authenticated'?'<div class="muted" style="font-size:11px">приложение: '+a.app_status+'</div>':'')+'</td>'+
-      '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>'+
       '<td>'+(a.running?'<span class="st on">да</span>':'<span class="st none">нет</span>')+'</td>'+
-      '<td>'+
+      '<td><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div></td>'+
+      '<td><div class="row" style="margin:0;white-space:nowrap"><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="Автомат / Вручную — как обслуживается область"></span>'+
+        '<span class="muted" style="font-size:12px">'+(a.autoheal?'Автомат — лечится сам':'Вручную — вход меняешь ты')+'</span></div></td>'+
+      '<td class="act">'+
         '<button class="p" data-slug="'+a.slug+'" onclick="newAcc(this.dataset.slug)">Новый вход (токен)</button>'+
-        '<div class="row" style="margin:0 0 6px"><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="Автомат / Вручную — как обслуживается область"></span>'+
-        '<span class="muted" style="font-size:12px">'+(a.autoheal?'Автомат — лечится сам':'Вручную — вход меняешь ты')+'</span></div>'+
         '<button data-slug="'+a.slug+'" data-op="'+(a.running?'stop':'start')+'" onclick="toggleArea(this.dataset.slug,this.dataset.op)">'+(a.running?'Остановить десктоп':'Запустить десктоп')+'</button>'+
         '<button data-slug="'+a.slug+'" onclick="revive(this.dataset.slug)">Оживить вход (браузер)</button>'+
-      '</td>';
+      '</td>'+
+      '<td class="muted" style="font-size:11.5px">'+(a.email||'—')+'</td>'+
+      '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>';
     tb.appendChild(tr);
   }
   const j=document.getElementById('jrn');

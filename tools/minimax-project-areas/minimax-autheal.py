@@ -547,8 +547,8 @@ def _continue_once(area_dir: Path, folder: str, logfile: Path):
         return "dead", "не запустилось: %s" % exc
     time.sleep(3)
     if proc.poll() is None:
-        return "ok", "отправлено (ход идёт в фоне, pid %s, лог %s)" % (proc.pid, logfile)
-    # Процесс умер сразу — читаем, что он написал.
+        return "ok", "отправлено (ход идёт в фоне, pid %s, лог %s)" % (
+            proc.pid, getattr(logfile, "name", logfile))    # Процесс умер сразу — читаем, что он написал.
     try:
         tail = "\n".join(logfile.read_text(encoding="utf-8", errors="replace").splitlines()[-3:])
     except OSError:
@@ -616,9 +616,15 @@ def say_continue(area: dict) -> str:
 
 def heal(area: dict, switch, force: bool = False) -> bool:
     slug = area["slug"]
+    # Сначала — есть ли что лечить. Иначе в журнал идёт «пропуск — кулдаун»
+    # даже для исправной области, и это выглядит как «автоматика пропустила».
+    diag = diagnose(area)
+    if diag["verdict"] not in ("ОТКАЗ ПО ОЧКАМ", "ПОТЕРЯН ВХОД", "подозрение"):
+        log("%s: лечить нечего (%s)" % (area["title"], diag["reason"]))
+        return False
+
     last = _state["last_heal"].get(slug, 0)
     gap = time.time() - last
-    diag = diagnose(area)
     if not force and gap < COOLDOWN:
         # Отказ **новее** нашего последнего лечения ⇒ тот аккаунт, который мы
         # поставили, уже мёртв, и ждать кулдаун нельзя: область стоит. Именно
