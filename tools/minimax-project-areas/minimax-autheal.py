@@ -60,6 +60,9 @@ BIN = Path(r"C:\Users\valstan\bin")
 CONFIG = BIN / "mcode-project-areas.json"
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT", r"C:\Users\valstan\.minimax-areas"))
 SWITCH = BIN / "minimax-switch.py"
+# Детектор оборванных субагентов: лечащий ссылается на него в самом «Продолжай».
+# Путь — в bin, а не в репозитории: файл нужен в любой области, а не только в Мозге.
+ORPHANS = BIN / "minimax-orphans.py"
 MCODE = Path(os.environ.get("APPDATA", "")) / "npm" / "mcode.cmd"
 JOURNAL = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" / "journal.log"
 # Кулдаун лечения хранится в файле, а не в памяти: перезапуск супервизора не должен
@@ -630,6 +633,75 @@ def restart_area(slug: str) -> None:
                    capture_output=True, text=True, timeout=180)
 
 
+def broken_subagents(area_dir: Path) -> list:
+    """Оборванные субагенты области: работа, которая пропала из-за обрыва.
+
+    Состояние ребёнка определяется его **последним ходом**: `completed` ⇒ работа
+    закончена (не трогаем), `failed`/`aborted` ⇒ работа оборвана (будим).
+
+    Факт (17.11): CLI не умеет открывать сессии субагентов («Sub-agent Sessions
+    are internal and cannot be opened») — будить ребёнка можно только
+    инструментом рантайма `task_append` по `task_id`; он поднимает ребёнка
+    с его же контекстом.
+    """
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return []
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return []
+    out = []
+    try:
+        for rec in _rows(con, "select record_json from local_runtime_background_tasks "
+                               "where kind = 'subagent' "
+                               "and status in ('failed','canceled','aborted')"):
+            try:
+                task = json.loads(rec[0] or "{}")
+            except ValueError:
+                continue
+            child = (task.get("metadata") or {}).get("childSessionId")
+            if not child:
+                continue
+            row = _rows(con, "select turn_id, status from local_runtime_turn_ingress "
+                             "where session_id = ? order by accepted_at_ms desc limit 1",
+                        (child,))
+            if not row:
+                continue
+            if row[0][1] == "completed":
+                continue                      # ребёнок закончил — не трогаем
+            out.append({"task_id": task.get("taskId"),
+                        "description": task.get("description") or "",
+                        "child_session": child,
+                        "last_turn": row[0][0],
+                        "last_turn_status": row[0][1]})
+    finally:
+        con.close()
+    return out
+
+
+def continue_prompt(area_dir: Path) -> str:
+    """«Продолжай» + список оборванных субагентов, которых надо поднять.
+
+    Лечащий вкладывает список в **само сообщение**: агент после перезахода
+    сразу видит, кого разбудить через `task_append`, а тех, чью работу он
+    уже сделал сам, — пропускает (у него свой контекст).
+    """
+    slug = area_dir.name.replace("p-", "")
+    kids = broken_subagents(area_dir)
+    if not kids:
+        return "Продолжай"
+    lines = ["Продолжай", "",
+             "Оборванные субагенты (последний ход failed/aborted — работа не закончена):"]
+    for kid in kids:
+        lines.append("- task_id=%s  «%s»" % (kid["task_id"], kid["description"][:80]))
+    lines += ["",
+              "Разбуди их через task_append (инструмент рантайма) по task_id; "
+              "тех, чью работу ты уже сделал, не буди. "
+              "Полный список — python %s %s" % (ORPHANS, slug)]
+    return "\n".join(lines)
+
+
 def _continue_once(area_dir: Path, folder: str, logfile: Path):
     """Одна попытка отправить «Продолжай» (фоном).
 
@@ -641,7 +713,7 @@ def _continue_once(area_dir: Path, folder: str, logfile: Path):
     env["MINIMAX_DATA_DIR"] = str(area_dir)
     env["MAVIS_DATA_DIR"] = str(area_dir)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    cmd = [str(MCODE), "exec", "--continue", "--cwd", folder, "Продолжай"]
+    cmd = [str(MCODE), "exec", "--continue", "--cwd", folder, continue_prompt(area_dir)]
     try:
         proc = subprocess.Popen(cmd, env=env, stdout=logfile, stderr=logfile,
                                 stdin=subprocess.DEVNULL, creationflags=flags)
@@ -701,7 +773,7 @@ def say_continue(area: dict) -> str:
         env["MINIMAX_DATA_DIR"] = str(area_dir)
         env["MAVIS_DATA_DIR"] = str(area_dir)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        proc = subprocess.Popen([str(MCODE), "exec", "--cwd", folder, "Продолжай"],
+        proc = subprocess.Popen([str(MCODE), "exec", "--cwd", folder, continue_prompt(area_dir)],
                                 env=env, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
                                 creationflags=flags)
         time.sleep(3)
