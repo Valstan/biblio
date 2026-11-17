@@ -66,12 +66,18 @@ JOURNAL = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" / "journal.log"
 # обнулять «уже лечили» — иначе пул Кармана выжигается повторными лечениями.
 STATE_FILE = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" / "autheal-state.json"
 
-INTERVAL = 180          # секунд между проходами
+FAST_INTERVAL = 10       # секунд между проверками области, которая жива
+HEAL_QUIET = 180         # секунд до следующей проверки области, которую только
+                        # что вылечили (сразу после лечения ловить нечего —
+                        # ход ещё идёт, очки только что начислены)
+INTERVAL = 180          # (обратная совместимость) пауза между проходами по умолчанию
 COOLDOWN = 1800         # секунд между лечениями одной области
 EARLY_REHEAL_GAP = 300  # минимальный пауз перед ПОВТОРНЫМ лечением, если тот
                         # аккаунт, который мы поставили, уже умер (17.11: Мозг
                         # сдох за 5 минут после лечения — ждать 30 минут нельзя,
                         # область всё это время стоит)
+PROBE_COOLDOWN = 600    # секунд между ЖИВЫМИ проверками (T2) одной области:
+                        # при паузе 15 с иначе проверка шла бы каждый проход
 ERROR_WINDOW = 86400    # окно отказа по очкам (сутки): сломанный аккаунт сам не
                         # восстановится до ночного сброса, а главная защита от
                         # повторного лечения — время установки ТЕКУЩЕГО аккаунта
@@ -82,7 +88,10 @@ MIN_TOKEN_LIFE_MIN = 30 # минимальный остаток жизни acces
 MAX_PULL_TRIES = 3      # сколько аккаунтов пробуем взять, пока не найдём живой токен
 LOST_LOGIN_STATES = ("logout_pending", "none", "lease-expired", "logged_out", "signed_out")
 
-_state = {"last_heal": {}, "install": {}}
+_state = {"last_heal": {}, "install": {}, "probe": {}}
+_last_verdict = {}      # прошлый вердикт по области — чтобы не писать в журнал
+                        # одно и то же «лечить нечего» каждые 15 секунд
+_next_check = {}        # slug → время следующей проверки области
 
 
 # ────────────────────────────────────────────────────────── журнал и утилиты
@@ -94,9 +103,11 @@ def load_cooldowns() -> None:
             _state["last_heal"] = {str(k): float(v) for k, v in (data.get("last_heal") or {}).items()}
             _state["install"] = {str(k): v for k, v in (data.get("install") or {}).items()
                                  if isinstance(v, dict)}
+            _state["probe"] = {str(k): float(v) for k, v in (data.get("probe") or {}).items()}
     except (OSError, ValueError, TypeError):
         _state["last_heal"] = {}
         _state["install"] = {}
+        _state["probe"] = {}
 
 
 def save_cooldowns() -> None:
@@ -620,8 +631,14 @@ def heal(area: dict, switch, force: bool = False) -> bool:
     # даже для исправной области, и это выглядит как «автоматика пропустила».
     diag = diagnose(area)
     if diag["verdict"] not in ("ОТКАЗ ПО ОЧКАМ", "ПОТЕРЯН ВХОД", "подозрение"):
-        log("%s: лечить нечего (%s)" % (area["title"], diag["reason"]))
+        # Молчим, если ничего не изменилось: при паузе 15 с иначе журнал
+        # забьётся одинаковыми строками и спрячет важное.
+        prev = _last_verdict.get(slug)
+        _last_verdict[slug] = diag["verdict"]
+        if force or prev != diag["verdict"]:
+            log("%s: лечить нечего (%s)" % (area["title"], diag["reason"]))
         return False
+    _last_verdict[slug] = diag["verdict"]
 
     last = _state["last_heal"].get(slug, 0)
     gap = time.time() - last
@@ -640,6 +657,15 @@ def heal(area: dict, switch, force: bool = False) -> bool:
                 area["title"], int(gap)))
 
     if diag["verdict"] == "подозрение" and not force:
+        # Живая проверка стоит реального хода — при паузе 15 с её нельзя
+        # делать каждый проход, иначе сама проверка станет источником нагрузки.
+        last_probe = _state["probe"].get(slug, 0)
+        if time.time() - last_probe < PROBE_COOLDOWN:
+            log("%s: подозрение, но живую проверку делали %d с назад — не повторяю" % (
+                area["title"], int(time.time() - last_probe)))
+            return False
+        _state["probe"][slug] = time.time()
+        save_cooldowns()
         verdict, why = probe_exhausted(area["dir"], area.get("folder", ""))
         log("%s: проверка вживую — %s (%s)" % (area["title"], verdict, why))
         if verdict != "да":
@@ -715,7 +741,8 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true", help="только диагностика, ничего не лечить")
     ap.add_argument("--status", action="store_true", help="показать состояние областей и выйти")
     ap.add_argument("--force", action="store_true", help="лечить принудительно (для проверки вручную)")
-    ap.add_argument("--interval", type=int, default=INTERVAL)
+    ap.add_argument("--interval", type=int, default=0,
+                    help="пауза между проходами, сек (0 = FAST_INTERVAL)")
     args = ap.parse_args()
 
     switch = load_switch()
