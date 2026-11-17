@@ -60,6 +60,9 @@ BIN = Path(r"C:\Users\valstan\bin")
 CONFIG = BIN / "mcode-project-areas.json"
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT", r"C:\Users\valstan\.minimax-areas"))
 SWITCH = BIN / "minimax-switch.py"
+# Детектор оборванных субагентов: лечащий ссылается на него в самом «Продолжай».
+# Путь — в bin, а не в репозитории: файл нужен в любой области, а не только в Мозге.
+ORPHANS = BIN / "minimax-orphans.py"
 MCODE = Path(os.environ.get("APPDATA", "")) / "npm" / "mcode.cmd"
 JOURNAL = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" / "journal.log"
 # Кулдаун лечения хранится в файле, а не в памяти: перезапуск супервизора не должен
@@ -87,6 +90,11 @@ POOL_EMPTY_BACKOFF = 1800 # Карман ответил «свободных а�
                           # возвращаются в оборот неизрасходованные аккаунты)
 BURST_WINDOW = 180         # окно подсчёта «активационной лавины», сек
 BURST_LIMIT = 5            # столько аккаунтов на проект за окно ⇒ аларм и стоп
+LIVE_SWITCH = True       # смена аккаунта без перезапуска десктопа (заказ владельца)
+PROBE_TTL = 1800          # сколько ждём разбора пробного хода, сек (30 мин)
+PROBE_NO_TURN_TIMEOUT = 120 # если нового хода нет дольше этого — откат: перезапуск
+PROBE_FAIL_FAST = 180      # падение пробного хода быстрее этого ⇒ десктоп
+                          # отверг токен (откат); дольше ⇒ очки кончились
 ACTIVATE_TIMEOUT = 150     # сколько ждём, пока десктоп поднимется и войдёт
 ACTIVATION_POLL = 5        # шаг опроса состояния десктопа, сек
 ERROR_WINDOW = 86400    # окно отказа по очкам (сутки): сломанный аккаунт сам не
@@ -99,7 +107,7 @@ MIN_TOKEN_LIFE_MIN = 30 # минимальный остаток жизни acces
 MAX_PULL_TRIES = 3      # сколько аккаунтов пробуем взять, пока не найдём живой токен
 LOST_LOGIN_STATES = ("logout_pending", "none", "lease-expired", "logged_out", "signed_out")
 
-_state = {"last_heal": {}, "install": {}, "probe": {}, "pulls": {}, "backoff": {}, "activated": {}, "burst": {}, "alarm": {}}
+_state = {"last_heal": {}, "install": {}, "probe": {}, "pulls": {}, "backoff": {}, "activated": {}, "burst": {}, "alarm": {}, "probe_turn": {}}
 _last_verdict = {}      # прошлый вердикт по области — чтобы не писать в журнал
                         # одно и то же «лечить нечего» каждые 15 секунд
 _next_check = {}        # slug → время следующей проверки области
@@ -123,6 +131,8 @@ def load_cooldowns() -> None:
             _state["burst"] = {str(k): [float(t) for t in v] for k, v in (data.get("burst") or {}).items()
                                 if isinstance(v, list)}
             _state["alarm"] = data.get("alarm") if isinstance(data.get("alarm"), dict) else {}
+            _state["probe_turn"] = {str(k): v for k, v in (data.get("probe_turn") or {}).items()
+                                   if isinstance(v, dict)}
     except (OSError, ValueError, TypeError):
         _state["last_heal"] = {}
         _state["install"] = {}
@@ -132,6 +142,7 @@ def load_cooldowns() -> None:
         _state["activated"] = {}
         _state["burst"] = {}
         _state["alarm"] = {}
+        _state["probe_turn"] = {}
 
 
 def save_cooldowns() -> None:
@@ -622,6 +633,75 @@ def restart_area(slug: str) -> None:
                    capture_output=True, text=True, timeout=180)
 
 
+def broken_subagents(area_dir: Path) -> list:
+    """Оборванные субагенты области: работа, которая пропала из-за обрыва.
+
+    Состояние ребёнка определяется его **последним ходом**: `completed` ⇒ работа
+    закончена (не трогаем), `failed`/`aborted` ⇒ работа оборвана (будим).
+
+    Факт (17.11): CLI не умеет открывать сессии субагентов («Sub-agent Sessions
+    are internal and cannot be opened») — будить ребёнка можно только
+    инструментом рантайма `task_append` по `task_id`; он поднимает ребёнка
+    с его же контекстом.
+    """
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return []
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return []
+    out = []
+    try:
+        for rec in _rows(con, "select record_json from local_runtime_background_tasks "
+                               "where kind = 'subagent' "
+                               "and status in ('failed','canceled','aborted')"):
+            try:
+                task = json.loads(rec[0] or "{}")
+            except ValueError:
+                continue
+            child = (task.get("metadata") or {}).get("childSessionId")
+            if not child:
+                continue
+            row = _rows(con, "select turn_id, status from local_runtime_turn_ingress "
+                             "where session_id = ? order by accepted_at_ms desc limit 1",
+                        (child,))
+            if not row:
+                continue
+            if row[0][1] == "completed":
+                continue                      # ребёнок закончил — не трогаем
+            out.append({"task_id": task.get("taskId"),
+                        "description": task.get("description") or "",
+                        "child_session": child,
+                        "last_turn": row[0][0],
+                        "last_turn_status": row[0][1]})
+    finally:
+        con.close()
+    return out
+
+
+def continue_prompt(area_dir: Path) -> str:
+    """«Продолжай» + список оборванных субагентов, которых надо поднять.
+
+    Лечащий вкладывает список в **само сообщение**: агент после перезахода
+    сразу видит, кого разбудить через `task_append`, а тех, чью работу он
+    уже сделал сам, — пропускает (у него свой контекст).
+    """
+    slug = area_dir.name.replace("p-", "")
+    kids = broken_subagents(area_dir)
+    if not kids:
+        return "Продолжай"
+    lines = ["Продолжай", "",
+             "Оборванные субагенты (последний ход failed/aborted — работа не закончена):"]
+    for kid in kids:
+        lines.append("- task_id=%s  «%s»" % (kid["task_id"], kid["description"][:80]))
+    lines += ["",
+              "Разбуди их через task_append (инструмент рантайма) по task_id; "
+              "тех, чью работу ты уже сделал, не буди. "
+              "Полный список — python %s %s" % (ORPHANS, slug)]
+    return "\n".join(lines)
+
+
 def _continue_once(area_dir: Path, folder: str, logfile: Path):
     """Одна попытка отправить «Продолжай» (фоном).
 
@@ -633,7 +713,7 @@ def _continue_once(area_dir: Path, folder: str, logfile: Path):
     env["MINIMAX_DATA_DIR"] = str(area_dir)
     env["MAVIS_DATA_DIR"] = str(area_dir)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    cmd = [str(MCODE), "exec", "--continue", "--cwd", folder, "Продолжай"]
+    cmd = [str(MCODE), "exec", "--continue", "--cwd", folder, continue_prompt(area_dir)]
     try:
         proc = subprocess.Popen(cmd, env=env, stdout=logfile, stderr=logfile,
                                 stdin=subprocess.DEVNULL, creationflags=flags)
@@ -693,7 +773,7 @@ def say_continue(area: dict) -> str:
         env["MINIMAX_DATA_DIR"] = str(area_dir)
         env["MAVIS_DATA_DIR"] = str(area_dir)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        proc = subprocess.Popen([str(MCODE), "exec", "--cwd", folder, "Продолжай"],
+        proc = subprocess.Popen([str(MCODE), "exec", "--cwd", folder, continue_prompt(area_dir)],
                                 env=env, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
                                 creationflags=flags)
         time.sleep(3)
@@ -706,6 +786,114 @@ def say_continue(area: dict) -> str:
                 fh.close()
             except OSError:
                 pass
+
+
+def latest_turn(area_dir: Path):
+    """Последний ход в рантайме области: (turn_id, status, accepted_at_ms)."""
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = _rows(con, "select turn_id, status, accepted_at_ms from local_runtime_turn_ingress "
+                           "order by accepted_at_ms desc limit 1")
+        return (rows[0][0], rows[0][1], int(rows[0][2] or 0)) if rows else None
+    finally:
+        con.close()
+
+
+def turn_after(area_dir: Path, before_ms: int):
+    """Ход, начавшийся ПОСЛЕ отметки before_ms (или None)."""
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = _rows(con, "select turn_id, status, accepted_at_ms from local_runtime_turn_ingress "
+                           "where accepted_at_ms > ? order by accepted_at_ms desc limit 1",
+                     (int(before_ms),))
+        return (rows[0][0], rows[0][1], int(rows[0][2] or 0)) if rows else None
+    finally:
+        con.close()
+
+
+def probe_pending(area: dict) -> bool:
+    """Разбираемся с пробным ходом после смены аккаунта без перезапуска.
+
+    True — область занята пробой (диагностику пропускаем), False — можно лечить.
+    """
+    slug = area["slug"]
+    pend = (_state.get("probe_turn") or {}).get(slug)
+    if not pend:
+        return False
+    if time.time() - float(pend.get("at") or 0) > PROBE_TTL:
+        _state["probe_turn"].pop(slug, None)
+        save_cooldowns()
+        log("%s: пробный ход устарел (%d мин) — возвращаюсь к обычной проверке" % (
+            area["title"], PROBE_TTL // 60))
+        return False
+    turn = turn_after(area["dir"], int(pend.get("before_ms") or 0))
+    if turn is None:
+        # Хода нет: то ли он ещё не начался (сессия была занята), то ли рантайм
+        # его не принял. Долго ждать нельзя — область стоит.
+        age = time.time() - float(pend.get("at") or 0)
+        if age < PROBE_NO_TURN_TIMEOUT:
+            return True      # ещё рано — подождём следующего прохода
+        _state["probe_turn"].pop(slug, None)
+        save_cooldowns()
+        log("%s: «Продолжай» без перезапуска не доставился (нового хода нет %d с) — "
+            "ОТКАТ: перезапускаю область и повторяю" % (area["title"], int(age)))
+        restart_area(slug)
+        ok, _at, why = wait_activation(area)
+        if not ok:
+            log("%s: после перезапуска вход не подтверждён — %s" % (area["title"], why))
+            return False
+        _state["activated"][slug] = int(time.time() * 1000)
+        save_cooldowns()
+        res = say_continue(area)
+        log("%s: «Продолжай» после перезапуска — %s" % (area["title"], res))
+        return False
+    status = turn[1]
+    if status == "completed":
+        _state["probe_turn"].pop(slug, None)
+        save_cooldowns()
+        log("%s: десктоп принял новый вход БЕЗ перезапуска (ход %s завершён) — сессия не прерывалась" % (
+            area["title"], turn[0][:8]))
+        return False
+    if status in ("failed", "aborted"):
+        _state["probe_turn"].pop(slug, None)
+        save_cooldowns()
+        # Сколько ход шёл до падения? Короткое падение ⇒ десктоп отверг старый
+        # токен (нужен откат). Долгое ⇒ новый аккаунт израсходовался (обычное
+        # лечение, перезапуск не нужен и только тратит время).
+        ran_ms = int(turn[2] or 0) - int(float(pend.get("at") or 0) * 1000)
+        if ran_ms > PROBE_FAIL_FAST * 1000:
+            log("%s: пробный ход %s шёл %d мин и упал — это не «десктоп отверг токен», "
+                "а очки кончились: лечу обычным порядком (следующий аккаунт), "
+                "перезапуск не нужен" % (area["title"], turn[0][:8], int(ran_ms // 60000)))
+            return False
+        log("%s: десктоп новый вход без перезапуска не взял (ход %s: %s, упал сразу) — "
+            "ОТКАТ: перезапускаю область и повторяю «Продолжай»" % (
+                area["title"], turn[0][:8], status))
+        restart_area(slug)
+        ok, _at, why = wait_activation(area)
+        if not ok:
+            log("%s: после перезапуска вход не подтверждён — %s" % (area["title"], why))
+            return False
+        # Отказы пробного хода — не про очки: двигаем якорь, чтобы лечащий
+        # не счёл их отказом по балансу и не покусил ещё один аккаунт.
+        _state["activated"][slug] = int(time.time() * 1000)
+        save_cooldowns()
+        res = say_continue(area)
+        log("%s: «Продолжай» после перезапуска — %s" % (area["title"], res))
+        return False
+    return True              # ход ещё идёт — ждём
 
 
 def heal(area: dict, switch, force: bool = False) -> bool:
@@ -812,21 +1000,20 @@ def heal(area: dict, switch, force: bool = False) -> bool:
     log("%s: бонусные очки — %s" % (area["title"], res))
 
     # 2) перезапуск области под новым аккаунтом
-    restart_area(slug)
-    log("%s: область перезапущена с новым аккаунтом" % area["title"])
-
-    # 3) ДОЖДАТЬСЯ входа: пока десктоп не поднялся и не вошёл, «Продолжай»
-    #    отправлять нельзя — второй рантайм сразу убьёт ход, и лечащий примет
-    #    это за «очки кончились» (17.11: так сгорели 77+ аккаунтов за день).
-    ok, _activated_at, why = wait_activation(area)
-    if not ok:
-        log("%s: ВХОД НЕ ПОДТВЕРЖДЁН — %s. «Продолжай» не отправляю." % (area["title"], why))
-        return True
-    log("%s: десктоп вошёл (%s)" % (area["title"], why))
-
-    # 4) «Продолжай» — чтобы работа над проектом возобновилась (в начало, не в очередь)
+    # 2) Смена аккаунта БЕЗ перезапуска десктопа: токен и состояние уже в
+    #    области (поколение выше, чем у приложения — десктоп подхватит его на
+    #    следующем запросе). Перезапуск оставляем ЗАПАСНЫМ путём: если пробный
+    #    ход упадёт, значит десктоп остался на старом токене.
+    _state["activated"][slug] = int(time.time() * 1000)
+    save_cooldowns()
+    before = latest_turn(area["dir"])
+    before_ms = before[2] if before else 0
     res = say_continue(area)
-    log("%s: «Продолжай» — %s" % (area["title"], res))
+    log("%s: «Продолжай» без перезапуска — %s" % (area["title"], res))
+    _state["probe_turn"][slug] = {"before_ms": before_ms, "at": time.time()}
+    save_cooldowns()
+    return True
+
     return True
 
 
@@ -898,6 +1085,8 @@ def main() -> int:
                     log("%s: диагностика не удалась: %s" % (area["title"], exc))
                 continue
             try:
+                if probe_pending(area):
+                    continue          # ждём разбора пробного хода
                 # diagnose() внутри heal() — второй раз не читаем: проверка
                 # локальная, но при короткой паузе лишние чтения не нужны.
                 healed = heal(area, switch, force=args.force)
