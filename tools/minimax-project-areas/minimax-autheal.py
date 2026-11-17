@@ -79,18 +79,14 @@ EARLY_REHEAL_GAP = 300  # минимальный пауз перед ПОВТО�
 PROBE_COOLDOWN = 600    # секунд между ЖИВЫМИ проверками (T2) одной области:
                         # при паузе 15 с иначе проверка шла бы каждый проход
 # ── Ограничители расхода пула (17.11: за день сгорело 77+ аккаунтов)
-PULL_LIMIT_HOUR = 2       # максимум выдач аккаунтов ОДНОЙ области в час
-PULL_LIMIT_DAY = 6        # максимум выдач одной области в сутки
-REJECT_BACKOFF = 900      # после отклонённого аккаунта НЕ тянем следующий сразу:
-                          # аккаунт уже сгорел, а следующий сгорит так же
-FAST_DEATH_GAP = 900      # если аккаунт, который мы поставили, прожил меньше
-                          # 15 минут — новый не поможет (умирает и он)
-FAST_DEATH_BACKOFF = 7200 # пауза после «быстрой смерти» аккаунта, сек (2 ч):
-                          # новый аккаунт при такой сессии всё равно умрёт, но
-                          # область не должна лежать сутки; суточный лимит
-                          # (PULL_LIMIT_DAY) ограничивает расход сверху
+REJECT_BACKOFF = 900      # (не используется: отклонённый аккаунт ⇒ берём следующий)
+FAST_DEATH_GAP = 900      # (не используется: быстрая смерть аккаунта — это норма)
+FAST_DEATH_BACKOFF = 7200 # (не используется)
 POOL_EMPTY_BACKOFF = 1800 # Карман ответил «свободных аккаунтов нет» — не
-                          # спрашивать 30 минут (иначе стучимся каждые 10 с)
+                          # спрашивать 30 минут (у Кармана каждые полчаса
+                          # возвращаются в оборот неизрасходованные аккаунты)
+BURST_WINDOW = 180         # окно подсчёта «активационной лавины», сек
+BURST_LIMIT = 5            # столько аккаунтов на проект за окно ⇒ аларм и стоп
 ACTIVATE_TIMEOUT = 150     # сколько ждём, пока десктоп поднимется и войдёт
 ACTIVATION_POLL = 5        # шаг опроса состояния десктопа, сек
 ERROR_WINDOW = 86400    # окно отказа по очкам (сутки): сломанный аккаунт сам не
@@ -103,7 +99,7 @@ MIN_TOKEN_LIFE_MIN = 30 # минимальный остаток жизни acces
 MAX_PULL_TRIES = 3      # сколько аккаунтов пробуем взять, пока не найдём живой токен
 LOST_LOGIN_STATES = ("logout_pending", "none", "lease-expired", "logged_out", "signed_out")
 
-_state = {"last_heal": {}, "install": {}, "probe": {}, "pulls": {}, "backoff": {}, "activated": {}}
+_state = {"last_heal": {}, "install": {}, "probe": {}, "pulls": {}, "backoff": {}, "activated": {}, "burst": {}, "alarm": {}}
 _last_verdict = {}      # прошлый вердикт по области — чтобы не писать в журнал
                         # одно и то же «лечить нечего» каждые 15 секунд
 _next_check = {}        # slug → время следующей проверки области
@@ -124,6 +120,9 @@ def load_cooldowns() -> None:
             _state["backoff"] = {str(k): v for k, v in (data.get("backoff") or {}).items()
                                  if isinstance(v, dict)}
             _state["activated"] = {str(k): float(v) for k, v in (data.get("activated") or {}).items()}
+            _state["burst"] = {str(k): [float(t) for t in v] for k, v in (data.get("burst") or {}).items()
+                                if isinstance(v, list)}
+            _state["alarm"] = data.get("alarm") if isinstance(data.get("alarm"), dict) else {}
     except (OSError, ValueError, TypeError):
         _state["last_heal"] = {}
         _state["install"] = {}
@@ -131,6 +130,8 @@ def load_cooldowns() -> None:
         _state["pulls"] = {}
         _state["backoff"] = {}
         _state["activated"] = {}
+        _state["burst"] = {}
+        _state["alarm"] = {}
 
 
 def save_cooldowns() -> None:
@@ -457,65 +458,57 @@ def account_anchor(area: dict) -> int:
 def pull_account(switch, area: dict):
     """Взять аккаунт у Кармана и посадить его в область.
 
-    **Отклонённый аккаунт всё равно сгорает** (токен у Кармана одноразовый), и
-    поэтому мы **НЕ берём следующий в том же проходе**: 17.11 так один цикл
-    съедал по 3–5 аккаунтов подряд, а за день сгорело 77+. Отклонили — отступаем
-    (`REJECT_BACKOFF`) и ждём следующего окна; в журнал пишем честно.
+    **Отклонённый аккаунт — не приговор:** возможно, выпал именно ошибочный, а
+    следующий или третий окажется живым (решение владельца 17.11) — поэтому
+    пробуем следующий, но не больше трёх попыток подряд. Если пул пуст — пауза
+    30 минут (у Кармана каждые полчаса возвращаются в оборот неизрасходованные
+    аккаунты, так что за это время что-то может появиться).
 
     Возвращает (rc, описание). rc = 0 — аккаунт стоит и годен.
     """
-    args = argparse.Namespace(area="p-" + area["slug"], apply=True, note=True)
-    buf = io.StringIO()
-    try:
-        with contextlib.redirect_stdout(buf):
-            rc = switch.cmd_pull(args)
-    except Exception as exc:  # noqa: BLE001
-        return 1, "сбой запроса аккаунта: %s" % exc
-    for line in buf.getvalue().strip().splitlines():
-        log("%s: %s" % (area["title"], line))
-    if rc != 0:
-        if rc == 2:
-            # Свободных аккаунтов нет: нужен вход владельца в браузере.
-            _state["backoff"][area["slug"]] = {
-                "until": time.time() + POOL_EMPTY_BACKOFF,
-                "why": "пул Кармана пуст — нужен вход владельца в браузере"}
-            save_cooldowns()
-            return rc, "пул Кармана пуст (нужен вход владельца в браузере), пауза %d мин" % (
-                POOL_EMPTY_BACKOFF // 60)
-        if rc == 3:
-            _state["backoff"][area["slug"]] = {
-                "until": time.time() + REJECT_BACKOFF,
-                "why": "Карман отдал негодный токен — следующий сгорит так же"}
-            save_cooldowns()
-            return rc, ("Карман отдал негодный аккаунт — пауза %d мин, следующий НЕ берём "
-                        "(сгорел бы и он)" % (REJECT_BACKOFF // 60))
-        return rc, "аккаунт не получен (пул Кармана пуст или отказ)"
-    rec = (switch.read_store(area["dir"]).get("records") or {}).get(switch.store_key(area["dir"])) or {}
-    exp = int(rec.get("expiresAtMs") or 0)
-    life = (exp - time.time() * 1000) / 60000.0
-    if life < MIN_TOKEN_LIFE_MIN:
-        log("%s: токен протухает (%.0f мин) — НЕ оставляем его" % (area["title"], life))
-        _state["backoff"][area["slug"]] = {
-            "until": time.time() + REJECT_BACKOFF,
-            "why": "токен протухает (%.0f мин)" % life}
-        save_cooldowns()
-        return 3, "токен протухает (%.0f мин) — пауза %d мин, следующий НЕ берём" % (
-            life, REJECT_BACKOFF // 60)
-    # Токен должен ещё и приниматься вендором: если Карман отдал «не тот»
-    # токен (или мёртвый), панель вендора ответит 401 — такой аккаунт тоже
-    # не оставляем (и следующий не берём: он сгорит так же).
-    tok = rec.get("accessToken") or ""
-    status, _payload = switch.panel(tok)
-    if status != 200:
-        log("%s: вендор не принимает выданный токен (HTTP %s)" % (area["title"], status))
-        _state["backoff"][area["slug"]] = {
-            "until": time.time() + REJECT_BACKOFF,
-            "why": "вендор не принял токен (HTTP %s)" % status}
-        save_cooldowns()
-        return 3, "вендор не принимает выданный токен (HTTP %s) — пауза %d мин" % (
-            status, REJECT_BACKOFF // 60)
-    return 0, "аккаунт %s, токен жив ещё %.0f мин, вендор отвечает 200" % (
-        rec.get("email"), life)
+    for attempt in range(1, MAX_PULL_TRIES + 1):
+        args = argparse.Namespace(area="p-" + area["slug"], apply=True, note=True)
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = switch.cmd_pull(args)
+        except Exception as exc:  # noqa: BLE001
+            return 1, "сбой запроса аккаунта: %s" % exc
+        for line in buf.getvalue().strip().splitlines():
+            log("%s: %s" % (area["title"], line))
+        if rc != 0:
+            if rc == 2:
+                # Свободных аккаунтов нет: ждём 30 минут (у Кармана каждые
+                # полчаса возвращаются в оборот неизрасходованные аккаунты).
+                _state["backoff"][area["slug"]] = {
+                    "until": time.time() + POOL_EMPTY_BACKOFF,
+                    "why": "пул Кармана пуст — ждём 30 мин (возвращаются неизрасходованные)"}
+                save_cooldowns()
+                return rc, "пул Кармана пуст, пауза %d мин" % (POOL_EMPTY_BACKOFF // 60)
+            if rc == 3:
+                # Карман отдал негодный токен — пробуем следующий: возможно, выпал
+                # именно ошибочный, а следующий будет живым.
+                log("%s: Карман отдал негодный токен — пробую следующий (попытка %s из %s)" % (
+                    area["title"], attempt, MAX_PULL_TRIES))
+                continue
+            return rc, "аккаунт не получен (пул Кармана пуст или отказ)"
+        rec = (switch.read_store(area["dir"]).get("records") or {}).get(switch.store_key(area["dir"])) or {}
+        exp = int(rec.get("expiresAtMs") or 0)
+        life = (exp - time.time() * 1000) / 60000.0
+        if life < MIN_TOKEN_LIFE_MIN:
+            log("%s: токен протухает (%.0f мин) — пробую следующий" % (area["title"], life))
+            continue
+        # Токен должен ещё и приниматься вендором: если Карман отдал «не тот»
+        # токен (или мёртвый), панель вендора ответит 401 — такой не оставляем.
+        tok = rec.get("accessToken") or ""
+        status, _payload = switch.panel(tok)
+        if status != 200:
+            log("%s: вендор не принимает выданный токен (HTTP %s) — пробую следующий" % (
+                area["title"], status))
+            continue
+        return 0, "аккаунт %s, токен жив ещё %.0f мин, вендор отвечает 200" % (
+            rec.get("email"), life)
+    return 4, "Карман %d раз подряд отдал негодный токен — нужен живой аккаунт" % MAX_PULL_TRIES
 
 
 def probe_exhausted(area_dir: Path, folder: str) -> str:
@@ -730,35 +723,27 @@ def heal(area: dict, switch, force: bool = False) -> bool:
         return False
     _last_verdict[slug] = diag["verdict"]
 
-    # ── Ограничители расхода пула ────────────────────────────────────────────
+    # ── Аларм на «активационную лавину» ───────────────────────────────────────
+    # Решение владельца 17.11: лимитов на выдачу НЕ вводим (нечего ждать
+    # столько), но если на один проект за 3 минуты активируются 5+ аккаунтов —
+    # это признак, что что-то пошло не так ⇒ активацию останавливаем и
+    # предупреждаем оператора (в панели — всплывающее окно).
     now = time.time()
     bo = _state["backoff"].get(slug) or {}
     if not force and float(bo.get("until") or 0) > now:
-        log("%s: пауза до %s (%s) — пул не жжём" % (
-            area["title"], _fmt(int(float(bo["until"]) * 1000)), bo.get("why", "ограничение")))
+        log("%s: пауза до %s (%s)" % (
+            area["title"], _fmt(int(float(bo["until"]) * 1000)), bo.get("why", "ожидание")))
         return False
-    pulls = [t for t in _state["pulls"].get(slug, []) if now - t < 86400]
-    per_hour = [t for t in pulls if now - t < 3600]
-    if not force and (len(per_hour) >= PULL_LIMIT_HOUR or len(pulls) >= PULL_LIMIT_DAY):
-        log("%s: СТОП — за час %d выдач, за сутки %d (лимит %d/%d). Пул не жжём." % (
-            area["title"], len(per_hour), len(pulls), PULL_LIMIT_HOUR, PULL_LIMIT_DAY))
-        _state["backoff"][slug] = {"until": now + FAST_DEATH_BACKOFF,
-                                    "why": "лимит выдач (%d/час, %d/сутки)" % (
-                                        PULL_LIMIT_HOUR, PULL_LIMIT_DAY)}
+    burst = [t for t in (_state.get("burst") or {}).get(slug, []) if now - t < BURST_WINDOW]
+    if len(burst) >= BURST_LIMIT and not force:
+        text = ("%s: за %d минут активировано %d аккаунтов — активация ОСТАНОВЛЕНА, "
+                "разберись, что происходит" % (area["title"], BURST_WINDOW // 60, len(burst) + 1))
+        _state["backoff"][slug] = {"until": now + POOL_EMPTY_BACKOFF,
+                                    "why": "аларм: активационная лавина"}
+        _state["alarm"] = {"slug": slug, "area": area["title"], "text": text,
+                           "at": int(now * 1000)}
         save_cooldowns()
-        return False
-    # «Быстрая смерть»: аккаунт, который мы поставили, прожил меньше 15 минут
-    # после того, как десктоп реально вошёл. Следующий не поможет (умирает и
-    # он) — отступаем на 12 часов и говорим об этом прямо.
-    activated_at = int(_state["activated"].get(slug, 0) or 0)
-    fail_at = diag.get("failure", 0)
-    if not force and activated_at and fail_at and 0 < (fail_at - activated_at) < FAST_DEATH_GAP * 1000:
-        _state["backoff"][slug] = {"until": now + FAST_DEATH_BACKOFF,
-                                    "why": "аккаунт прожил меньше %d мин" % (FAST_DEATH_GAP // 60)}
-        save_cooldowns()
-        log("%s: аккаунт прожил меньше %d мин после входа — новый не поможет "
-            "(нужна свежая сессия или аккаунт покрупнее), пауза %d мин, пул не жжём" % (
-                area["title"], FAST_DEATH_GAP // 60, FAST_DEATH_BACKOFF // 60))
+        log("АЛАРМ: %s" % text)
         return False
 
     last = _state["last_heal"].get(slug, 0)
@@ -807,6 +792,9 @@ def heal(area: dict, switch, force: bool = False) -> bool:
     log("%s: аккаунт получен (%s)" % (area["title"], why))
     _state["pulls"].setdefault(slug, []).append(time.time())
     _state["pulls"][slug] = [t for t in _state["pulls"][slug] if time.time() - t < 86400]
+    # Счётчик «активационной лавины»: 5+ аккаунтов на проект за 3 минуты ⇒
+    # аларм и остановка (см. проверку выше).
+    _state.setdefault("burst", {})[slug] = burst + [time.time()]
 
     _state["last_heal"][slug] = time.time()
     if last and gap < 900:

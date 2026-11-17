@@ -326,6 +326,11 @@ const HTML = `<!DOCTYPE html>
  .jrn div{padding:2px 0;border-bottom:1px solid #232329}
  .muted{color:#8b8b96}
  .row{display:flex;align-items:center;gap:12px;margin:10px 0}
+ .modal{position:fixed;inset:0;background:rgba(0,0,0,.65);display:none;align-items:center;justify-content:center;z-index:60}
+ .modal.show{display:flex}
+ .mbox{background:#2a1214;border:1px solid #ff9a9a;border-radius:10px;padding:22px 26px;max-width:560px;color:#ffd7d7;box-shadow:0 10px 40px rgba(0,0,0,.5)}
+ .mbox h2{margin:0 0 10px;font-size:17px;color:#ff9a9a}
+ .mbox .muted{color:#e7b9b9}
  .sw{display:inline-block;width:42px;height:22px;border-radius:11px;background:#3a3a46;border:1px solid #4c4c5a;position:relative;cursor:pointer;vertical-align:middle;transition:background .15s,border-color .15s}
  .sw.on{background:#1f4d2b;border-color:#2d6b3f}
  .sw:after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#9a9aa8;transition:left .15s,background .15s}
@@ -344,6 +349,12 @@ const HTML = `<!DOCTYPE html>
 <thead><tr>
 <th>Область</th><th>Проект</th><th>Запущена</th><th>Авто/Ручной</th><th>Действия</th><th>Аккаунт</th><th>Очки</th>
 </tr></thead><tbody id="tb"></tbody></table>
+<div class="modal" id="alarm"><div class="mbox">
+  <h2>Аларм МиниГена</h2>
+  <div id="alarmText"></div>
+  <div class="muted" style="font-size:12px;margin:10px 0 14px">Процесс активации остановлен автоматически — нужно разобраться, что происходит. Подробности — в журнале.</div>
+  <button onclick="ackAlarm()">Понятно, разбираюсь</button>
+</div></div>
 <div class="box" id="box"></div>
 <div class="jrn" id="jrn"></div>
 <script>
@@ -356,9 +367,22 @@ function st(a){
   if(s==='вышел из аккаунта'||s==='токен не отвечает') return [s,'off'];
   return [s,'none'];
 }
+let ALARM=null;
+function showAlarm(a){
+  if(!a||!a.text) return;
+  if(localStorage.getItem('minigen_alarm_'+a.at)) return;
+  ALARM=a;
+  document.getElementById('alarmText').textContent=a.text;
+  document.getElementById('alarm').classList.add('show');
+}
+function ackAlarm(){
+  if(ALARM) localStorage.setItem('minigen_alarm_'+ALARM.at,'1');
+  document.getElementById('alarm').classList.remove('show');
+}
 async function load(){
   const d=await (await fetch('/api/state')).json();
   MODES={}; for(const a of d.areas) MODES[a.slug]=!!a.autoheal;
+  showAlarm(d.alarm);
   tb.innerHTML='';
   for(const a of d.areas){
     const [label,cls]=st(a);
@@ -448,7 +472,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/state') {
     const list = await liveState(false);
     const acc = await accounts();
-    return json(200, { areas: list, accounts: acc, journal });
+    return json(200, { areas: list, accounts: acc, journal, alarm: (healState().alarm || null) });
   }
 
   // Новый вход — только по одной области и только по команде владельца.
