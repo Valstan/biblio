@@ -68,6 +68,10 @@ STATE_FILE = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" / "autheal-s
 
 INTERVAL = 180          # секунд между проходами
 COOLDOWN = 1800         # секунд между лечениями одной области
+EARLY_REHEAL_GAP = 300  # минимальный пауз перед ПОВТОРНЫМ лечением, если тот
+                        # аккаунт, который мы поставили, уже умер (17.11: Мозг
+                        # сдох за 5 минут после лечения — ждать 30 минут нельзя,
+                        # область всё это время стоит)
 ERROR_WINDOW = 86400    # окно отказа по очкам (сутки): сломанный аккаунт сам не
                         # восстановится до ночного сброса, а главная защита от
                         # повторного лечения — время установки ТЕКУЩЕГО аккаунта
@@ -386,6 +390,11 @@ def pull_account(switch, area: dict):
         for line in buf.getvalue().strip().splitlines():
             log("%s: %s" % (area["title"], line))
         if rc != 0:
+            if rc == 3:
+                # КАРМАН отдал негодный токен (протухший или не принят вендором):
+                # не ставим его, берём следующий аккаунт.
+                log("%s: Карман отдал негодный токен — беру следующий" % area["title"])
+                continue
             return rc, "аккаунт не получен (пул Кармана пуст или отказ)"
         rec = (switch.read_store(area["dir"]).get("records") or {}).get(switch.store_key(area["dir"])) or {}
         exp = int(rec.get("expiresAtMs") or 0)
@@ -608,11 +617,22 @@ def say_continue(area: dict) -> str:
 def heal(area: dict, switch, force: bool = False) -> bool:
     slug = area["slug"]
     last = _state["last_heal"].get(slug, 0)
-    if not force and time.time() - last < COOLDOWN:
-        log("%s: пропуск — кулдаун (лечили недавно)" % area["title"])
-        return False
-
+    gap = time.time() - last
     diag = diagnose(area)
+    if not force and gap < COOLDOWN:
+        # Отказ **новее** нашего последнего лечения ⇒ тот аккаунт, который мы
+        # поставили, уже мёртв, и ждать кулдаун нельзя: область стоит. Именно
+        # это случилось 17.11 с Мозгом: в 11:00 мы вылечили его (id=30), тот
+        # аккаунт сдох за 5 минут, и ещё 25 минут лечащий молчал «кулдаун».
+        fresh = (diag["verdict"] == "ПОТЕРЯН ВХОД") or (diag.get("failure", 0) > last * 1000)
+        if not (fresh and gap >= EARLY_REHEAL_GAP):
+            log("%s: пропуск — кулдаун (лечили %d с назад, осталось %d с; вердикт: %s)" % (
+                area["title"], int(gap), int(COOLDOWN - gap), diag["verdict"]))
+            return False
+        log("%s: лечу РАНЬШЕ СРОКА — аккаунт, который поставили, уже негоден "
+            "(прошло %d с), ждать кулдаун значит держать область мёртвой" % (
+                area["title"], int(gap)))
+
     if diag["verdict"] == "подозрение" and not force:
         verdict, why = probe_exhausted(area["dir"], area.get("folder", ""))
         log("%s: проверка вживую — %s (%s)" % (area["title"], verdict, why))
@@ -634,6 +654,9 @@ def heal(area: dict, switch, force: bool = False) -> bool:
     log("%s: аккаунт получен (%s)" % (area["title"], why))
 
     _state["last_heal"][slug] = time.time()
+    if last and gap < 900:
+        log("%s: прошлый аккаунт прожил всего %d мин — активность тяжёлая, "
+            "пул Кармана горит быстро" % (area["title"], int(gap // 60)))
     # Помним, какое поколение токена поставили и когда: это точный якорь
     # «текущий аккаунт» (profile.json переписывает сам десктоп при входе).
     _state["install"][slug] = {"generation": store_generation(area["dir"]),

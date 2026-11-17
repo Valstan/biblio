@@ -77,6 +77,10 @@ AUDIENCE = "agent-backend"
 PANEL_BASE = "https://agent.minimax.io/minimax-cloud/api/v1/signin"
 SIGNIN_TZ = "Europe%2FMoscow"
 DEFAULT_TTL_MS = 8 * 60 * 60 * 1000
+# Минимальный остаток жизни access-токена, который мы вообще ставим в область.
+# 17.11 КАРМАН отдал аккаунт, у которого access жил 9 минут: десктоп его
+# отверг и стёр запись входа, область осталась незалогиненной. Такой не ставим.
+MIN_TOKEN_LIFE_MIN = 30
 
 SSL_CTX = ssl.create_default_context()
 
@@ -722,6 +726,23 @@ def cmd_pull(args) -> int:
         return 2
     print("  Карман отдал access-токен. Refresh не присылаем и токен обратно НЕ возвращаем:")
     print("  учёт, статистика и ротация — в зоне Кармана (решение владельца 15.11).")
+    # Страховка ДО установки (17.11): Карман отдал access с остатком 9 минут —
+    # десктоп его отверг и стёр запись входа, область осталась незалогиненной.
+    # Такой токен не ставим: сообщаем и выходим с кодом 3 (негодный аккаунт).
+    try:
+        exp = int(expires or 0)
+    except (TypeError, ValueError):
+        exp = 0
+    if exp:
+        life = (exp - time.time() * 1000) / 60000.0
+        if life < MIN_TOKEN_LIFE_MIN:
+            print("  ВНИМАНИЕ: у выданного access осталось %.0f мин — НЕ ставлю его в область." % life)
+            print("  Такой токен десктоп отвергнет и сотрёт вход. Нужен другой аккаунт.")
+            return 3
+    status, _payload = panel(access)
+    if status != 200:
+        print("  ВНИМАНИЕ: вендор не принимает выданный токен (HTTP %s) — НЕ ставлю его." % status)
+        return 3
     if not args.apply:
         print("  (проба — перезапусти с --apply, чтобы поставить в %s)" % area.name)
         return 0
