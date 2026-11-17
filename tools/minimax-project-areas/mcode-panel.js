@@ -340,14 +340,14 @@ const HTML = `<!DOCTYPE html>
 <h1>МиниГен</h1>
 <div class="sub">Области проектов: каждая — отдельная копия приложения со своим проектом, своим входом и своими сессиями. Статус берётся живым запросом к панели MiniMax.</div>
 <div class="row">
-  <div><b>Лечится само</b> <span class="muted">— при отказе по очкам МиниГен берёт аккаунт у Кармана, активирует бонус, перезапускает область и шлёт «Продолжай»</span></div>
+  <div><b>Лечится само</b> <span class="muted">— при отказе по очкам МиниГен берёт аккаунт у Кармана, активирует бонус, меняет вход в области и шлёт «Продолжай»</span></div>
   <button onclick="reloadPanel()">Перезагрузить панель</button>
   <a class="muted" style="font-size:12px" href="http://127.0.0.1:8098" target="_blank">страница управления</a>
 </div>
 <table>
-<colgroup><col style="width:258px"><col style="width:168px"><col style="width:96px"><col style="width:104px"><col style="width:424px"><col style="width:172px"><col style="width:136px"></colgroup>
+<colgroup><col style="width:168px"><col style="width:96px"><col style="width:104px"><col style="width:424px"><col style="width:172px"><col style="width:136px"><col style="width:258px"></colgroup>
 <thead><tr>
-<th>Область</th><th>Проект</th><th>Запущена</th><th>Авто/Ручной</th><th>Действия</th><th>Аккаунт</th><th>Очки</th>
+<th>Проект</th><th>Запущена</th><th>Авто/Ручной</th><th>Действия</th><th>Аккаунт</th><th>Очки</th><th>Область</th>
 </tr></thead><tbody id="tb"></tbody></table>
 <div class="modal" id="alarm"><div class="mbox">
   <h2>Аларм МиниГена</h2>
@@ -384,14 +384,21 @@ async function load(){
   MODES={}; for(const a of d.areas) MODES[a.slug]=!!a.autoheal;
   showAlarm(d.alarm);
   tb.innerHTML='';
-  for(const a of d.areas){
+  // Порядок строк (заказ владельца 17.11): самые активные рабочие области — наверху,
+  // незапущенные — внизу. Внутри группы: с живым входом выше, дальше по расходу
+  // за сегодня; при равенстве порядок исходный (sort стабилен).
+  const rows=d.areas.slice().sort(function(x,y){
+    if(!!x.running!==!!y.running) return x.running?-1:1;
+    if(!!x.live!==!!y.live) return x.live?-1:1;
+    return (y.pulls_today||0)-(x.pulls_today||0);
+  });
+  for(const a of rows){
     const [label,cls]=st(a);
     const tr=document.createElement('tr');
     const burn=(a.pulls_today?'<div class="burn">сегодня '+a.pulls_today+' акк.</div>':'')+
       (a.backoff_until>Date.now()?'<div class="muted" style="font-size:11px">пауза до '+
         new Date(a.backoff_until).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+'</div>':'');
-    tr.innerHTML='<td style="white-space:nowrap"><code>'+a.area+'</code><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div>'+burn+'</td>'+
-      '<td style="white-space:nowrap">'+a.title+'</td>'+
+    tr.innerHTML='<td style="white-space:nowrap">'+a.title+'</td>'+
       '<td>'+(a.running?'<span class="st on">да</span>':'<span class="st none">нет</span>')+'</td>'+
       '<td><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="'+(a.autoheal?'АВТОМАТ — область лечится сама':'РУЧНОЙ — вход меняете вы')+'"></span></td>'+
       '<td class="act">'+
@@ -400,7 +407,8 @@ async function load(){
         '<button data-slug="'+a.slug+'" onclick="revive(this.dataset.slug)">Оживить вход (браузер)</button>'+
       '</td>'+
       '<td class="muted" style="font-size:11.5px">'+(a.email||'—')+'</td>'+
-      '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>';
+      '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>'+
+      '<td style="white-space:nowrap"><code>'+a.area+'</code><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div>'+burn+'</td>';
     tb.appendChild(tr);
   }
   const j=document.getElementById('jrn');
