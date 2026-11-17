@@ -318,9 +318,9 @@ const HTML = `<!DOCTYPE html>
   <a class="muted" style="font-size:12px" href="http://127.0.0.1:8098" target="_blank">страница управления</a>
 </div>
 <table>
-<colgroup><col style="width:140px"><col style="width:160px"><col style="width:108px"><col style="width:88px"><col style="width:200px"><col style="width:226px"><col style="width:420px"><col style="width:166px"><col style="width:130px"></colgroup>
+<colgroup><col style="width:258px"><col style="width:168px"><col style="width:96px"><col style="width:84px"><col style="width:424px"><col style="width:172px"><col style="width:136px"></colgroup>
 <thead><tr>
-<th>Область</th><th>Проект</th><th>Вход</th><th>Запущена</th><th>Папка</th><th>Режим</th><th>Действия</th><th>Аккаунт</th><th>Очки</th>
+<th>Область</th><th>Проект</th><th>Запущена</th><th>Авто/Ручной</th><th>Действия</th><th>Аккаунт</th><th>Очки</th>
 </tr></thead><tbody id="tb"></tbody></table>
 <div class="box" id="box"></div>
 <div class="jrn" id="jrn"></div>
@@ -341,14 +341,10 @@ async function load(){
   for(const a of d.areas){
     const [label,cls]=st(a);
     const tr=document.createElement('tr');
-    tr.innerHTML='<td style="white-space:nowrap"><code>'+a.area+'</code></td>'+
+    tr.innerHTML='<td style="white-space:nowrap"><code>'+a.area+'</code><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div></td>'+
       '<td style="white-space:nowrap">'+a.title+'</td>'+
-      '<td><span class="st '+cls+'">'+label+'</span>'+
-        (a.app_status&&a.app_status!=='authenticated'?'<div class="muted" style="font-size:11px">приложение: '+a.app_status+'</div>':'')+'</td>'+
       '<td>'+(a.running?'<span class="st on">да</span>':'<span class="st none">нет</span>')+'</td>'+
-      '<td><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div></td>'+
-      '<td><div class="row" style="margin:0;white-space:nowrap"><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="Автомат / Вручную — как обслуживается область"></span>'+
-        '<span class="muted" style="font-size:12px">'+(a.autoheal?'Автомат — лечится сам':'Вручную — вход меняешь ты')+'</span></div></td>'+
+      '<td><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="Автомат / Вручную — как обслуживается область"></span></td>'+
       '<td class="act">'+
         '<button class="p" data-slug="'+a.slug+'" onclick="newAcc(this.dataset.slug)">Новый вход (токен)</button>'+
         '<button data-slug="'+a.slug+'" data-op="'+(a.running?'stop':'start')+'" onclick="toggleArea(this.dataset.slug,this.dataset.op)">'+(a.running?'Остановить десктоп':'Запустить десктоп')+'</button>'+
