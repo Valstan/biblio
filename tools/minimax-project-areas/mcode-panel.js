@@ -305,10 +305,11 @@ const HTML = `<!DOCTYPE html>
  .jrn div{padding:2px 0;border-bottom:1px solid #232329}
  .muted{color:#8b8b96}
  .row{display:flex;align-items:center;gap:12px;margin:10px 0}
- .sw{width:44px;height:22px;border-radius:11px;background:#33333d;position:relative;cursor:pointer;border:1px solid #3a3a46}
+ .sw{display:inline-block;width:42px;height:22px;border-radius:11px;background:#3a3a46;border:1px solid #4c4c5a;position:relative;cursor:pointer;vertical-align:middle;transition:background .15s,border-color .15s}
  .sw.on{background:#1f4d2b;border-color:#2d6b3f}
- .sw:after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#9a9aa8;transition:.15s}
+ .sw:after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#9a9aa8;transition:left .15s,background .15s}
  .sw.on:after{left:22px;background:#6ee7a0}
+ .sw:hover{filter:brightness(1.25)}
 </style></head><body>
 <h1>МиниГен</h1>
 <div class="sub">Области проектов: каждая — отдельная копия приложения со своим проектом, своим входом и своими сессиями. Статус берётся живым запросом к панели MiniMax.</div>
@@ -318,7 +319,7 @@ const HTML = `<!DOCTYPE html>
   <a class="muted" style="font-size:12px" href="http://127.0.0.1:8098" target="_blank">страница управления</a>
 </div>
 <table>
-<colgroup><col style="width:258px"><col style="width:168px"><col style="width:96px"><col style="width:84px"><col style="width:424px"><col style="width:172px"><col style="width:136px"></colgroup>
+<colgroup><col style="width:258px"><col style="width:168px"><col style="width:96px"><col style="width:104px"><col style="width:424px"><col style="width:172px"><col style="width:136px"></colgroup>
 <thead><tr>
 <th>Область</th><th>Проект</th><th>Запущена</th><th>Авто/Ручной</th><th>Действия</th><th>Аккаунт</th><th>Очки</th>
 </tr></thead><tbody id="tb"></tbody></table>
@@ -344,7 +345,7 @@ async function load(){
     tr.innerHTML='<td style="white-space:nowrap"><code>'+a.area+'</code><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div></td>'+
       '<td style="white-space:nowrap">'+a.title+'</td>'+
       '<td>'+(a.running?'<span class="st on">да</span>':'<span class="st none">нет</span>')+'</td>'+
-      '<td><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="Автомат / Вручную — как обслуживается область"></span></td>'+
+      '<td><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="'+(a.autoheal?'АВТОМАТ — область лечится сама':'РУЧНОЙ — вход меняете вы')+'"></span></td>'+
       '<td class="act">'+
         '<button class="p" data-slug="'+a.slug+'" onclick="newAcc(this.dataset.slug)">Новый вход (токен)</button>'+
         '<button data-slug="'+a.slug+'" data-op="'+(a.running?'stop':'start')+'" onclick="toggleArea(this.dataset.slug,this.dataset.op)">'+(a.running?'Остановить десктоп':'Запустить десктоп')+'</button>'+
@@ -377,8 +378,15 @@ async function setMode(slug){
   box.classList.add('show');
   box.innerHTML='<b>'+slug+':</b> переключаю режим…';
   const r=await (await fetch('/api/mode?area='+slug+'&mode='+want)).json();
-  if(r.ok) MODES[slug]=!!r.autoheal;
-  box.innerHTML='<b>'+slug+':</b> '+(r.ok?(r.autoheal?'режим — АВТОМАТ (лечится сам).':'режим — ВРУЧНУЮ (вход меняете вы).'):'не вышло: '+(r.error||''))+
+  if(r.ok){
+    MODES[slug]=!!r.autoheal;
+    const on=MODES[slug];
+    document.querySelectorAll('.sw[data-slug="'+slug+'"]').forEach(function(el){
+      el.classList.toggle('on', on);
+      el.title=on?'АВТОМАТ — область лечится сама':'РУЧНОЙ — вход меняете вы';
+    });
+  }
+  box.innerHTML='<b>'+slug+':</b> '+(r.ok?(r.autoheal?'режим — АВТОМАТ (лечится сама).':'режим — ВРУЧНОЙ (вход меняете вы).'):'не вышло: '+(r.error||''))+
     '<br><span class="muted">Лечащий перечитывает режим на каждом проходе (раз в 3 мин).</span>';
   load();
 }
@@ -451,6 +459,15 @@ const server = http.createServer(async (req, res) => {
     const mode = q.get('mode');
     if (!slug) return json(400, { error: 'нужен area' });
     const r = setMode(slug, mode);
+    if (r.ok) {
+      // Кэш состояния живёт 45 с — без сброса переключатель откатывался бы
+      // на старый режим («ничего не меняется»). Обновляем кэш и заставляем
+      // следующий опрос взять свежие данные.
+      if (stateCache.data) {
+        for (const a of stateCache.data) if (a.slug === slug) a.autoheal = !!r.autoheal;
+      }
+      stateCache.ts = 0;
+    }
     return json(r.ok ? 200 : 400, r);
   }
 
