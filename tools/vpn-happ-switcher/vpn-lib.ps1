@@ -93,15 +93,19 @@ public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wP
 }
 
 # Системный прокси Windows (для браузеров и приложений).
-function Set-SystemProxy([bool]$on) {
+# Пустой адрес = выключить. В режиме «VPN выключен» адрес не пустой, а резервный
+# туннель: десктопы MiniMax (Electron) читают системный прокси, и без него они
+# ушли бы в прямую линию, где agent.minimax.io может не отвечать.
+function Set-SystemProxy([string]$server) {
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings'
-    if ($on) {
+    if ($server) {
         Set-ItemProperty $key -Name 'ProxyEnable'  -Value 1 -Type DWord
-        Set-ItemProperty $key -Name 'ProxyServer'  -Value '127.0.0.1:10809' -Type String
+        Set-ItemProperty $key -Name 'ProxyServer'  -Value $server -Type String
+        Write-Log ("системный прокси Windows: включён ({0})" -f $server)
     } else {
         Set-ItemProperty $key -Name 'ProxyEnable' -Value 0 -Type DWord
+        Write-Log 'системный прокси Windows: выключен'
     }
-    Write-Log ("системный прокси Windows: {0}" -f $(if ($on) { 'включён (127.0.0.1:10809)' } else { 'выключен' }))
 }
 
 function Test-RustDeskRoute {
