@@ -37,6 +37,22 @@ const AREAS_ROOT = path.join(HOME, '.minimax-areas');
 const MCODE = path.join(HOME, 'AppData', 'Roaming', 'npm', 'mcode.cmd');
 const JOURNAL_DIR = path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'mcode-web');
 const JOURNAL_FILE = path.join(JOURNAL_DIR, 'journal.log');
+const HEAL_STATE_FILE = path.join(JOURNAL_DIR, 'autheal-state.json');
+
+// Расход пула лечащим: сколько аккаунтов область забрала за сутки и до какого
+// времени она на паузе. Читаем файл состояния лечащего (он и пишет туда).
+function healState() {
+  try { return JSON.parse(fs.readFileSync(HEAL_STATE_FILE, 'utf8')); } catch { return {}; }
+}
+function pullsToday(state, slug) {
+  const pulls = (state && state.pulls && state.pulls[slug]) || [];
+  const dayAgo = Date.now() - 86400000;
+  return pulls.filter((t) => Number(t) * 1000 > dayAgo).length;
+}
+function backoffUntil(state, slug) {
+  const bo = (state && state.backoff && state.backoff[slug]) || {};
+  return Number(bo.until || 0) * 1000;
+}
 
 // Авто-лечение вернулось 17.11 (D-225), но живёт отдельным демоном под
 // супервизором (minimax-autheal.py) — панель только показывает состояние и
@@ -209,13 +225,17 @@ async function liveState(force) {
     try { areas = JSON.parse(r.out || '[]'); } catch { areas = []; }
     if (r.code === -2) log('опрос областей не ответил (таймаут) — показываю прошлые данные');
     const meta = new Map(projectAreas().map((a) => [a.dir, a]));
+    const hstate = healState();
     const list = areas.map((a) => {
       const m = meta.get(path.join(AREAS_ROOT, a.area));
+      const slug = a.slug || a.area.replace(/^p-/, '');
       return Object.assign(a, {
         title: m ? m.title : a.slug,
         folder: m ? m.folder : '',
-        slug: a.slug || a.area.replace(/^p-/, ''),
+        slug: slug,
         autoheal: m ? !!m.autoheal : false,
+        pulls_today: pullsToday(hstate, slug),
+        backoff_until: backoffUntil(hstate, slug),
       });
     }).filter((a) => meta.has(path.join(AREAS_ROOT, a.area)));
     stateCache.ts = Date.now();
@@ -296,6 +316,7 @@ const HTML = `<!DOCTYPE html>
  select{padding:3px 5px;border-radius:6px;border:1px solid #3a3a46;background:#2a2a33;color:#e6e6e6;font-size:12px;max-width:130px}
  code{background:#14141a;padding:2px 6px;border-radius:4px;font-size:12px;word-break:normal;white-space:nowrap}
  .path{max-width:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11.5px}
+ .burn{color:#ff9a9a;font-size:11px;white-space:nowrap}
  .pts{white-space:nowrap;font-size:12px}
  .act{white-space:nowrap}
  .act button{margin:0 6px 0 0}
@@ -342,7 +363,10 @@ async function load(){
   for(const a of d.areas){
     const [label,cls]=st(a);
     const tr=document.createElement('tr');
-    tr.innerHTML='<td style="white-space:nowrap"><code>'+a.area+'</code><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div></td>'+
+    const burn=(a.pulls_today?'<div class="burn">сегодня '+a.pulls_today+' акк.</div>':'')+
+      (a.backoff_until>Date.now()?'<div class="muted" style="font-size:11px">пауза до '+
+        new Date(a.backoff_until).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})+'</div>':'');
+    tr.innerHTML='<td style="white-space:nowrap"><code>'+a.area+'</code><div class="path muted" title="'+(a.folder||'')+'">'+(a.folder||'')+'</div>'+burn+'</td>'+
       '<td style="white-space:nowrap">'+a.title+'</td>'+
       '<td>'+(a.running?'<span class="st on">да</span>':'<span class="st none">нет</span>')+'</td>'+
       '<td><span class="sw'+(a.autoheal?' on':'')+'" data-slug="'+a.slug+'" onclick="setMode(this.dataset.slug)" title="'+(a.autoheal?'АВТОМАТ — область лечится сама':'РУЧНОЙ — вход меняете вы')+'"></span></td>'+
