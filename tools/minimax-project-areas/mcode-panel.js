@@ -473,7 +473,7 @@ async function toggleArea(slug, op){
     const r=await (await fetch('/api/'+op+'?area='+slug)).json();
     box.innerHTML='<b>'+slug+':</b> '+(op==='stop'
       ? ('десктоп остановлен, осталось процессов: '+((r.left===undefined)?'?':r.left))
-      : ('десктоп запущен: '+(r.out||'').trim().split('\n').slice(-1)[0]));
+      : ('десктоп запущен: '+(r.out||'').trim().split(/\\n/).slice(-1)[0]));
   }catch(e){
     box.innerHTML='<b>'+slug+':</b> не получилось: '+e;
   }
