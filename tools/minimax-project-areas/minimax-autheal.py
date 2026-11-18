@@ -702,12 +702,15 @@ def continue_prompt(area_dir: Path) -> str:
     return "\n".join(lines)
 
 
-def _continue_once(area_dir: Path, folder: str, logfile: Path):
+def _continue_once(area_dir: Path, folder: str, logfile):
     """Одна попытка отправить «Продолжай» (фоном).
 
     Возвращает ("ok", описание) — ход пошёл; или ("busy", хвост лога) — сессия
     занята («Session already has an active Turn»); или ("dead", хвост лога) —
     умер по другой причине.
+
+    logfile — **открытый файловый объект** (stdout/stderr для CLI), а не путь:
+    Popen не умеет принимать Path как поток. Читать его надо по пути.
     """
     env = dict(os.environ)
     env["MINIMAX_DATA_DIR"] = str(area_dir)
@@ -722,10 +725,16 @@ def _continue_once(area_dir: Path, folder: str, logfile: Path):
     time.sleep(3)
     if proc.poll() is None:
         return "ok", "отправлено (ход идёт в фоне, pid %s, лог %s)" % (
-            proc.pid, getattr(logfile, "name", logfile))    # Процесс умер сразу — читаем, что он написал.
+            proc.pid, getattr(logfile, "name", logfile))
+    # Процесс умер сразу — читаем, что он написал.
+    # ⚠️ logfile здесь бывает НЕ Path, а открытым файловым объектом (TextIOWrapper):
+    # у него нет read_text, и вызов .read_text() ронял лечение целиком
+    # (18.11 03:04 — «лечение сорвалось: '_io.TextIOWrapper' object has no
+    # attribute 'read_text'»). Поэтому читаем ПО ПУТИ, а не по объекту.
     try:
-        tail = "\n".join(logfile.read_text(encoding="utf-8", errors="replace").splitlines()[-3:])
-    except OSError:
+        log_path = logfile if isinstance(logfile, Path) else Path(str(getattr(logfile, "name", "")))
+        tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-3:])
+    except (OSError, ValueError):
         tail = ""
     if "active turn" in tail.lower():
         return "busy", tail
