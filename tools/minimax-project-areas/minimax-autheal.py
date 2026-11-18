@@ -957,6 +957,171 @@ def _continue_once(area_dir: Path, folder: str, logfile):
     return "dead", tail or ("процесс умер сразу, rc=%s" % proc.returncode)
 
 
+# ── Зависший ход: «Продолжай» ушёл бы в очередь рантайма ─────────────────────
+#
+# 18.11 (жалоба владельца): «панель Миниген снова разучилась отправлять слово
+# „Продолжай“ поверх очереди запросов — два проекта так и не продолжили сессию
+# из-за того, что там в очереди сообщений висел запрос».
+#
+# Что происходит на самом деле: CLI **не отказывается** на занятом ходе (как
+# раньше, «Session already has an active Turn») — он **ставит сообщение в
+# очередь рантайма** (`local_runtime_queue_items`, доставка помечена
+# `queue-delivery:claim_…`). Очередь разбирается, когда текущий ход закончится,
+# поэтому «Продолжай» ждёт зависшего хода и работа не возобновляется.
+#
+# Сорвать ход из CLI нечем: `mcode exec` умеет только поставить сообщение в
+# очередь. Единственный доступный способ — **перезапуск области** (ход умирает,
+# сообщение после перезапуска встаёт первым). Но срывать надо ТОЛЬКО зависший
+# ход: живая работа агента (долгий ход, сборка) — не повод.
+#
+# Признак зависания: ход идёт (`status='accepted'`, `completed_at_ms IS NULL`),
+# а в сессии давно нет ни одного сообщения (`local_runtime_message_rows`).
+# Живой ход сообщения пишет постоянно — это и есть сигнал прогресса.
+# ⚠️ `local_runtime_session_agent_state.updated_at_ms` для проверки НЕ годится:
+# он не меняется от начала хода до конца (проверено замером 18.11).
+
+STUCK_IDLE_SEC = 120      # ход идёт, но сообщений нет дольше этого ⇒ ход висит
+WAIT_IDLE_SEC = 30        # сколько ждём освобождения сессии перед отправкой
+PREEMPT_PAUSE_SEC = 6     # пауза после перезапуска области перед отправкой
+
+
+def session_is_idle(area_dir: Path) -> bool:
+    """Сессия свободна: нет идущего хода, и рантайм считает её не «started».
+
+    ⚠️ Проверять только «есть активный ход» мало: после падения хода рантайм
+    ещё какое-то время держит сессию в «started» (разбор хода), и сообщение,
+    отправленное в это окно, **встаёт в очередь** — а очередь разбирается только
+    на следующей границе хода (наблюдение 18.11: отправили в 16:50, ход начался
+    в 17:02 — 12 минут простоя).
+    """
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return True
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return True
+    try:
+        busy = _rows(con, "select count(*) from local_runtime_turn_ingress "
+                          "where status = 'accepted' and completed_at_ms is null")
+        if busy and int(busy[0][0] or 0) > 0:
+            return False
+        rows = _rows(con, "select status from local_runtime_sessions "
+                          "order by updated_at_ms desc limit 1")
+        return not (rows and str(rows[0][0] or "") == "started")
+    finally:
+        con.close()
+
+
+def wait_for_idle(area: dict, seconds: int) -> bool:
+    """Подождать, пока сессия освободится. True — освободилась (или ждать нечего).
+
+    Ждать дольше нескольких секунд нельзя: лечащий обходит области по очереди,
+    и залипание на одной области подвешивает остальные.
+    """
+    deadline = time.time() + max(0, seconds)
+    while True:
+        if session_is_idle(area["dir"]):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(3)
+
+
+def active_turn(area_dir: Path):
+    """Ход, который сейчас идёт в области: (turn_id, session_id, accepted_at_ms)."""
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return None
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return None
+    try:
+        rows = _rows(con, "select turn_id, session_id, accepted_at_ms from local_runtime_turn_ingress "
+                          "where status = 'accepted' and completed_at_ms is null "
+                          "order by accepted_at_ms desc limit 1")
+        return (rows[0][0], rows[0][1], int(rows[0][2] or 0)) if rows else None
+    finally:
+        con.close()
+
+
+def session_progress_ms(area_dir: Path, session_id: str) -> int:
+    """Когда в сессии последний раз было сообщение — это сигнал прогресса хода."""
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file() or not session_id:
+        return 0
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return 0
+    try:
+        rows = _rows(con, "select max(created_at_ms) from local_runtime_message_rows "
+                          "where session_id = ?", (session_id,))
+        return int(rows[0][0] or 0) if rows else 0
+    finally:
+        con.close()
+
+
+def session_waits_owner(area_dir: Path, session_id: str) -> bool:
+    """Агент ждёт ответа владельца (вопрос) — такой ход срывать нельзя."""
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file() or not session_id:
+        return False
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return False
+    try:
+        rows = _rows(con, "select count(*) from questionnaire_requests "
+                          "where session_id = ? and answered_at is null and dismissed_at is null",
+                     (session_id,))
+        return bool(rows and int(rows[0][0] or 0) > 0)
+    finally:
+        con.close()
+
+
+def stuck_turn(area: dict):
+    """Сессия висит на ходе, который не идёт: (turn_id, простой_секунд) либо None.
+
+    None — либо хода нет, либо ход живой (сообщения идут), либо агент ждёт
+    ответа владельца. Живой ход срывать нельзя: это работа, а не зависание.
+    """
+    at = active_turn(area["dir"])
+    if not at:
+        return None
+    turn_id, sid, accepted = at
+    if session_waits_owner(area["dir"], sid):
+        return None
+    prog = session_progress_ms(area["dir"], sid)
+    idle_ms = int(time.time() * 1000) - int(prog or accepted)
+    if idle_ms < STUCK_IDLE_SEC * 1000:
+        return None
+    return (turn_id, int(idle_ms // 1000))
+
+
+def preempt_stuck(area: dict, why: str) -> bool:
+    """Сорвать зависший ход, чтобы «Продолжай» встал в начало, а не в очередь.
+
+    Перезапуск области — единственный доступный способ сорвать ход (CLI не умеет
+    прерывать). Окно при этом закрывается и открывается заново — поэтому делаем
+    это только когда ход действительно висит, и только в работающей области
+    (правило владельца 18.11: окно в неработающей области не открываем).
+    """
+    slug = area["slug"]
+    if not desktop_running(slug):
+        log("%s: %s, но десктоп не запущен — окно не открываем" % (area["title"], why))
+        return False
+    log("%s: %s — срываю его перезапуском области, чтобы «Продолжай» встал в начало" % (
+        area["title"], why))
+    restart_area(slug)
+    time.sleep(PREEMPT_PAUSE_SEC)
+    ok, _at, why2 = wait_activation(area)
+    if not ok:
+        log("%s: после перезапуска вход не подтверждён — %s" % (area["title"], why2))
+    return ok
+
+
 def say_continue(area: dict) -> str:
     """Отправить «Продолжай» в последнюю сессию области — **в начало, а не в очередь**.
 
@@ -974,6 +1139,27 @@ def say_continue(area: dict) -> str:
     folder = area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
         return "папка проекта недоступна — «Продолжай» не отправляли"
+    # «Продолжай» НЕЛЬЗЯ отправлять в занятую сессию: CLI не отказывается, а
+    # ставит сообщение в очередь рантайма, и очередь разбирается только на
+    # следующей границе хода (наблюдение 18.11: отправили в 16:50 — ход
+    # стартовал лишь в 17:02, 12 минут простоя).
+    #
+    # Три состояния, и каждое — своё действие:
+    # 1) ход ВИВЫЙ (сообщения идут) — не мешаем работающему агенту: сообщение
+    #    встанет в очередь и отработает после хода, это правильно;
+    # 2) ход ЗАВИС (сообщений нет долго) — срываем его перезапуском области,
+    #    чтобы «Продолжай» встал в начало, а не ждал конца висящего хода;
+    # 3) хода нет, но рантайм ещё считает сессию занятой (разбор хода) — ждём
+    #    освобождения; не освободилась — перезапуск чистит заевшее состояние.
+    at = active_turn(area["dir"])
+    stuck = stuck_turn(area) if at else None
+    if stuck:
+        preempt_stuck(area, "ход %s висит (сообщений нет %d с)" % (stuck[0][:12], stuck[1]))
+    elif at:
+        log("%s: сессия занята живым ходом — «Продолжай» встанет в очередь "
+            "и отработает после него" % area["title"])
+    elif not wait_for_idle(area, WAIT_IDLE_SEC):
+        preempt_stuck(area, "сессия не освободилась (ходов нет, а рантайм считает её занятой)")
     logfile = area_dir / "logs" / "continue.log"
     try:
         logfile.parent.mkdir(parents=True, exist_ok=True)
@@ -1072,8 +1258,15 @@ def probe_pending(area: dict) -> bool:
         # Хода нет: то ли он ещё не начался (сессия была занята), то ли рантайм
         # его не принял. Долго ждать нельзя — область стоит.
         age = time.time() - float(pend.get("at") or 0)
-        if age < PROBE_NO_TURN_TIMEOUT:
+        # Ждём полный таймаут, только если ход живой. Если ход висит (нет
+        # сообщений) — «Продолжай» лежит в очереди за ним, и ждать бессмысленно:
+        # срываем ход сейчас.
+        stuck_now = stuck_turn(area)
+        if age < PROBE_NO_TURN_TIMEOUT and not stuck_now:
             return True      # ещё рано — подождём следующего прохода
+        if stuck_now:
+            log("%s: «Продолжай» лежит в очереди за зависшим ходом %s (сообщений нет %d с) — "
+                "жду дальше только бессмысленно" % (area["title"], stuck_now[0][:12], stuck_now[1]))
         _state["probe_turn"].pop(slug, None)
         save_cooldowns()
         log("%s: «Продолжай» без перезапуска не доставился (нового хода нет %d с) — "
