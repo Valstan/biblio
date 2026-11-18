@@ -1,0 +1,27 @@
+name: tools-gate
+
+# Гейт приёмки панели «МиниГен» (D-237, G650).
+# Панель дважды отдавала пустую страницу: отданный скрипт не парсился
+# (escape внутри template literal рвал строковый литерал), а сервер был
+# здоров — отсюда «страница грузится» != «скрипт работает».
+# Проверка ловит это ДО выкатки: рендерит шаблон так же, как Node, и
+# прогоняет node --check по вырезанному скрипту.
+on:
+  pull_request:
+    paths:
+      - 'tools/minimax-project-areas/**'
+  push:
+    branches: [master]
+    paths:
+      - 'tools/minimax-project-areas/**'
+
+jobs:
+  panel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Приёмка панели «МиниГен»
+        run: python3 tools/minimax-project-areas/check_panel.py --source-only
