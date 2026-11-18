@@ -32,9 +32,9 @@ const PORT = parseInt(process.argv[2] || '8099', 10);
 const HOME = process.env.USERPROFILE;
 const BIN = path.join(HOME, 'bin');
 const TOOL = path.join(BIN, 'minimax-switch.py');
+const HEALER = path.join(BIN, 'minimax-autheal.py');
 const PROJECTS_FILE = path.join(BIN, 'mcode-project-areas.json');
 const AREAS_ROOT = path.join(HOME, '.minimax-areas');
-const MCODE = path.join(HOME, 'AppData', 'Roaming', 'npm', 'mcode.cmd');
 const JOURNAL_DIR = path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'mcode-web');
 const JOURNAL_FILE = path.join(JOURNAL_DIR, 'journal.log');
 const HEAL_STATE_FILE = path.join(JOURNAL_DIR, 'autheal-state.json');
@@ -172,6 +172,16 @@ function tool(args) {
   toolChain = next.then(() => {}, () => {});
   return next;
 }
+
+// Лечащий отдельным вызовом: «Новый вход (токен)» должен делать ровно то же,
+// что и автоматическое лечение (заказ владельца 18.11) — поэтому зовём его
+// общий путь `--area`, а не копируем механику в панель.
+function healer(args) {
+  const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+  const next = toolChain.then(() => run('python', [HEALER, ...args], { env, timeout: 180000 }));
+  toolChain = next.then(() => {}, () => {});
+  return next;
+}
 let toolChain = Promise.resolve();
 
 // ────────────────────────────── состояние ──────────────────────────────
@@ -273,28 +283,18 @@ async function accounts() {
 
 function areaDir(slug) { return path.join(AREAS_ROOT, 'p-' + slug); }
 
-async function restartArea(slug) {
-  const stop = await runPS(path.join(BIN, 'mcode-project-stop.ps1'), ['-Project', slug]);
-  await new Promise((r) => setTimeout(r, 1500));
-  const start = await runPS(path.join(BIN, 'mcode-project-start.ps1'), ['-Project', slug]);
-  return { stop: (stop.out || '').trim().split('\n').slice(-1)[0] || '', start: (start.out || '').trim().split('\n').slice(-1)[0] || '' };
-}
-
-// Поставить в область новую пару из Кармана и перезапустить область.
-// Класс очков не задаём: Карман выбирает его сам, по нашей комнате `brain`
-// (тысячные первыми) — параметра `?tier=` в его роуте нет (ответ 15.11).
+// «Новый вход (токен)» — тот же путь, что и автоматическое лечение:
+// новый аккаунт от Кармана, установка БЕЗ перезапуска десктопа, затем
+// «Продолжай» — сначала оборванным субагентам, потом основному чату.
+// Заказ владельца 18.11. Делает лечащий (--area), чтобы не было двух
+// реализаций механики.
 async function newAccount(slug) {
-  const args = ['pull', 'p-' + slug, '--apply'];
-  const r = await tool(args);
-  const ok = !/готовых пар нет|no_tokens_ready|не удалось|ERROR/i.test(r.out);
-  if (!ok) {
-    log('p-' + slug + ': новый аккаунт не получен — ' + (r.out || '').trim().split('\n').slice(-1)[0]);
-    return { ok: false, out: r.out };
-  }
-  log('p-' + slug + ': токен от КАРМАНА посажен (access, без пары)');
-  const rs = await restartArea(slug);
-  log('p-' + slug + ': область перезапущена (' + (rs.start || 'ок') + ')');
-  return { ok: true, out: r.out };
+  const r = await healer(['--once', '--area', slug]);
+  const out = (r.out || '').trim();
+  const ok = r.code === 0 && !/лечение сорвалось|ждём, повторов/i.test(out);
+  if (ok) log('p-' + slug + ': новый вход посажен (без перезапуска), «Продолжай» отправлен');
+  else log('p-' + slug + ': новый вход не получен — ' + (out.split('\n').slice(-1)[0] || 'нет вывода'));
+  return { ok: ok, out: out };
 }
 
 // Тихий ремонт удалён по решению владельца (15.11):
@@ -422,7 +422,6 @@ async function load(){
       '<td class="act">'+
         '<button class="p" data-slug="'+a.slug+'" onclick="newAcc(this.dataset.slug)">Новый вход (токен)</button>'+
         '<button data-slug="'+a.slug+'" data-op="'+(a.running?'stop':'start')+'" onclick="toggleArea(this.dataset.slug,this.dataset.op)">'+(a.running?'Остановить десктоп':'Запустить десктоп')+'</button>'+
-        '<button data-slug="'+a.slug+'" onclick="revive(this.dataset.slug)">Оживить вход (браузер)</button>'+
       '</td>'+
       '<td class="muted" style="font-size:11.5px">'+(a.email||'—')+'</td>'+
       '<td class="pts">'+(a.live?('<b>'+(a.points_today||'-')+'</b> очков<div class="muted">кл. '+a.day_no+' · '+(a.claimed_today?'забрано':'след. '+(a.next_points||'-'))+'</div>'):'<span class="muted">—</span>')+'</td>'+
@@ -434,9 +433,9 @@ async function load(){
 }
 async function newAcc(slug){
   box.classList.add('show');
-  box.innerHTML='<b>'+slug+':</b> беру пару у КАРМАНА и перезапускаю область…';
+  box.innerHTML='<b>'+slug+':</b> беру аккаунт у КАРМАНА, сажаю его без перезапуска десктопа и отправляю «Продолжай» (сначала оборванным субагентам, потом в основной чат)…';
   const r=await (await fetch('/api/repair?area='+slug)).json();
-  box.innerHTML='<b>'+slug+':</b> '+(r.ok?'готово — область перезапущена, сессия на месте.':'не вышло: '+(r.error||''))+
+  box.innerHTML='<b>'+slug+':</b> '+(r.ok?'готово — вход обновлён без перезапуска, «Продолжай» отправлен.':'не вышло: '+(r.error||''))+
     '<br><span class="muted">'+(r.out||'').replace(/\\n/g,'<br>')+'</span>';
   load();
 }
@@ -464,17 +463,21 @@ async function setMode(slug){
     '<br><span class="muted">Лечащий перечитывает режим на каждом проходе (раз в 3 мин).</span>';
   load();
 }
-async function revive(slug){
+// Запуск и остановка десктопа области из панели.
+// ⚠️ 18.11: эта функция в панели ОТСУТСТВОВАЛА — кнопка звала
+// несуществующую toggleArea, и клик молча ничего не делал.
+async function toggleArea(slug, op){
   box.classList.add('show');
-  box.innerHTML='<b>'+slug+':</b> прошу вендору код входа…';
+  box.innerHTML='<b>'+slug+':</b> '+(op==='stop'?'останавливаю десктоп…':'запускаю десктоп…');
   try{
-    const r=await (await fetch('/api/login?area='+slug)).json();
-    box.innerHTML='<b>'+slug+': вход руками</b>'+
-      (r.url?('<br><a href="'+r.url+'" target="_blank">Открыть страницу входа</a><br><b>Код: '+(r.code||'—')+'</b>'):'<br>Ссылка не пришла: '+(r.error||'код не показан'))+
-      '<br><span class="muted">Войди в браузере аккаунтом этой области и подтверди код — рантайм сам сохранит свежий вход.</span>';
+    const r=await (await fetch('/api/'+op+'?area='+slug)).json();
+    box.innerHTML='<b>'+slug+':</b> '+(op==='stop'
+      ? ('десктоп остановлен, осталось процессов: '+((r.left===undefined)?'?':r.left))
+      : ('десктоп запущен: '+(r.out||'').trim().split('\n').slice(-1)[0]));
   }catch(e){
-    box.innerHTML='<b>'+slug+': вход руками</b> — не получилось: '+e;
+    box.innerHTML='<b>'+slug+':</b> не получилось: '+e;
   }
+  load();
 }
 load(); setInterval(load,5000);
 </script></body></html>`;
@@ -555,30 +558,8 @@ const server = http.createServer(async (req, res) => {
     return json(200, { ok: true, areas: list.length });
   }
 
-  if (p === '/api/login') {
-    // ручной вход (device-flow) для аккаунта, которого ещё нет в пуле
-    const slug = q.get('area');
-    if (!slug) return json(400, { error: 'нужен area' });
-    const dir = areaDir(slug);
-    const env = {
-      ...process.env,
-      MCODE_CONFIG_DIR: path.join(dir, 'config'),
-      MINIMAX_DATA_DIR: dir, MAVIS_DATA_DIR: dir,
-      MCODE_LOG_FILE: path.join(dir, 'logs', 'mcode.log'),
-      HTTP_PROXY: '', HTTPS_PROXY: '', ALL_PROXY: '', http_proxy: '', https_proxy: '', all_proxy: '',
-    };
-    const child = spawn('cmd.exe', ['/c', MCODE, 'login', '--region', 'global', '--no-browser'], { env, windowsHide: true });
-    let buf = '';
-    const done = (url, code) => {
-      if (done.done) return; done.done = true;
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ url, code }));
-    };
-    child.stdout.on('data', (d) => { buf += d.toString(); const m = buf.match(/Open:\s*(\S+)/); if (m) done(m[1], (buf.match(/Code:\s*(\S+)/) || [])[1] || null); });
-    child.stderr.on('data', (d) => { buf += d.toString(); const m = buf.match(/Open:\s*(\S+)/); if (m) done(m[1], (buf.match(/Code:\s*(\S+)/) || [])[1] || null); });
-    child.on('close', () => done(null, null));
-    return undefined;
-  }
+  // Эндпоинт /api/login (ручной вход в браузере) удалён 18.11 по решению
+  // владельца: кнопка «Оживить вход (браузер)» убрана из панели вместе с ним.
 
   res.writeHead(404);
   res.end('not found');

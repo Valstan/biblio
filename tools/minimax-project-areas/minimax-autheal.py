@@ -821,6 +821,20 @@ def claim_bonus(switch, area_dir: Path) -> str:
         body.get("claim_result", "?"), status, cell.get("day_no"), cell.get("status"), cell.get("points"))
 
 
+def desktop_running(slug: str) -> bool:
+    """Запущен ли сейчас десктоп области.
+
+    ⚠️ 18.11: откат (перезапуск области) открывал окно десктопа, который
+    владелец закрыл, потому что в этой области он не работает. Перезапуск
+    должен чинить ТОЛЬКО то, что сломано, — поднимать закрытое окно нельзя.
+    """
+    try:
+        switch = load_switch()
+        return ("p-" + slug) in (switch.running_areas() or set())
+    except Exception:  # noqa: BLE001
+        return True
+
+
 def restart_area(slug: str) -> None:
     """Перезапуск области: стоп → старт (собственный каталог, свой AUMID, свой ярлык)."""
     ps = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"]
@@ -890,12 +904,16 @@ def continue_prompt(area_dir: Path) -> str:
     if not kids:
         return "Продолжай"
     lines = ["Продолжай", "",
+             "ПОРЯДОК (важно, заказ владельца 18.11):",
+             "1) СНАЧАЛА разбуди оборванных субагентов — через task_append "
+             "(инструмент рантайма) по task_id из списка ниже; дождись их.",
+             "2) ПОТОМ продолжай основной чат.",
+             "",
              "Оборванные субагенты (последний ход failed/aborted — работа не закончена):"]
     for kid in kids:
         lines.append("- task_id=%s  «%s»" % (kid["task_id"], kid["description"][:80]))
     lines += ["",
-              "Разбуди их через task_append (инструмент рантайма) по task_id; "
-              "тех, чью работу ты уже сделал, не буди. "
+              "Тех, чью работу ты уже сделал сам, не буди. "
               "Полный список — python %s %s" % (ORPHANS, slug)]
     return "\n".join(lines)
 
@@ -968,6 +986,10 @@ def say_continue(area: dict) -> str:
             if status == "ok":
                 return info
             if status == "busy":
+                if not desktop_running(area["slug"]):
+                    log("%s: сессия занята ходом, но десктоп не запущен — «Продолжай» не отправляем "
+                        "(окно не открываем: владелец в этой области не работает)" % area["title"])
+                    return "не отправлено: десктоп не запущен"
                 log("%s: сессия занята ходом — срываю его перезапуском области, "
                     "чтобы «Продолжай» встал в начало (попытка %s)" % (
                         area["title"], attempt))
@@ -1056,6 +1078,12 @@ def probe_pending(area: dict) -> bool:
         save_cooldowns()
         log("%s: «Продолжай» без перезапуска не доставился (нового хода нет %d с) — "
             "ОТКАТ: перезапускаю область и повторяю" % (area["title"], int(age)))
+        if not desktop_running(slug):
+            # Десктоп закрыт (владелец в этой области не работает) — окно не
+            # открываем. Вход уже обновлён, «Продолжай» дойдёт, когда владелец
+            # сам запустит область (18.11: так открылось лишнее окно ВМалмыже).
+            log("%s: десктоп не запущен — откат без перезапуска, окно не открываем" % area["title"])
+            return False
         restart_area(slug)
         ok, _at, why = wait_activation(area)
         if not ok:
@@ -1088,6 +1116,9 @@ def probe_pending(area: dict) -> bool:
         log("%s: десктоп новый вход без перезапуска не взял (ход %s: %s, упал сразу) — "
             "ОТКАТ: перезапускаю область и повторяю «Продолжай»" % (
                 area["title"], turn[0][:8], status))
+        if not desktop_running(slug):
+            log("%s: десктоп не запущен — откат без перезапуска, окно не открываем" % area["title"])
+            return False
         restart_area(slug)
         ok, _at, why = wait_activation(area)
         if not ok:
@@ -1101,6 +1132,74 @@ def probe_pending(area: dict) -> bool:
         log("%s: «Продолжай» после перезапуска — %s" % (area["title"], res))
         return False
     return True              # ход ещё идёт — ждём
+
+
+def renew(switch, area: dict, burst: list = None) -> tuple:
+    """Поставить области новый аккаунт и продолжить её работу.
+
+    **Общий путь** для автоматического лечения и для кнопки «Новый вход
+    (токен)» в панели: заказ владельца 18.11 — «сделай функционал такой же,
+    как и при автоматическом лечении: чтобы без перезагрузки десктопа
+    залогинился по новому токену и отправил сообщение „Продолжай“ сначала в
+    субагенты (если они есть и если они были прерваны), а потом в основной
+    чат».
+
+    Порядок «субагенты → основной чат» задан в самом тексте сообщения
+    (`continue_prompt`).
+
+    Возвращает (ok, описание).
+    """
+    slug = area["slug"]
+    last = _state["last_heal"].get(slug, 0)
+    gap = time.time() - last
+    rc, why = pull_account(switch, area)
+    if rc != 0:
+        log("%s: %s — ждём, повторов не гоним" % (area["title"], why))
+        return False, why
+    log("%s: аккаунт получен (%s)" % (area["title"], why))
+    _state["pulls"].setdefault(slug, []).append(time.time())
+    _state["pulls"][slug] = [t for t in _state["pulls"][slug] if time.time() - t < 86400]
+    # Счётчик «активационной лавины»: 5+ аккаунтов на проект за 3 минуты ⇒
+    # аларм и остановка (проверка выше).
+    now_b = time.time()
+    window = [t for t in (_state.get("burst") or {}).get(slug, []) if now_b - t < BURST_WINDOW]
+    _state.setdefault("burst", {})[slug] = window + [now_b]
+
+    _state["last_heal"][slug] = time.time()
+    # Отказ, ради которого лечили, снят: новый аккаунт поставлен, старый
+    # отказ больше не должен висеть в памяти (иначе область «застрянет» на
+    # вердикте «ОТКАЗ ПО ОЧКАМ»).
+    _state.setdefault("failure", {}).pop(slug, None)
+    if last and gap < 900:
+        log("%s: прошлый аккаунт прожил всего %d мин — активность тяжёлая, "
+            "пул Кармана горит быстро" % (area["title"], int(gap // 60)))
+    # Помним, какое поколение токена поставили и когда: это точный якорь
+    # «текущего аккаунта» (profile.json переписывает сам десктоп при входе).
+    _state["install"][slug] = {"generation": store_generation(area["dir"]),
+                                "at": int(time.time() * 1000)}
+    save_cooldowns()
+
+    # Бонусные очки нового аккаунта — до «Продолжай», чтобы агент начал
+    # работать уже с очками (claim идемпотентен по суткам).
+    res = claim_bonus(switch, area["dir"])
+    log("%s: бонусные очки — %s" % (area["title"], res))
+
+    # Смена аккаунта БЕЗ перезапуска десктопа: токен и состояние уже в
+    # области (поколение выше, чем у приложения — десктоп подхватит его на
+    # следующем запросе). Перезапуск остаётся ЗАПАСНЫМ путём (откат).
+    _state["activated"][slug] = int(time.time() * 1000)
+    save_cooldowns()
+    if area["dir"].name not in (switch.running_areas() or set()):
+        log("%s: десктоп не запущен — вход обновлён, «Продолжай» не отправляли "
+            "(живой сессии нет; когда запустите область, она войдёт новым входом)" % area["title"])
+        return True, "вход обновлён, десктоп не запущен — «Продолжай» не отправляли"
+    before = latest_turn(area["dir"])
+    before_ms = before[2] if before else 0
+    res = say_continue(area)
+    log("%s: «Продолжай» без перезапуска — %s" % (area["title"], res))
+    _state["probe_turn"][slug] = {"before_ms": before_ms, "at": time.time()}
+    save_cooldowns()
+    return True, res
 
 
 def heal(area: dict, switch, force: bool = False) -> bool:
@@ -1190,59 +1289,8 @@ def heal(area: dict, switch, force: bool = False) -> bool:
 
     log("%s: %s (%s) — беру следующий аккаунт у Кармана" % (
         area["title"], diag["verdict"], diag["reason"]))
-    rc, why = pull_account(switch, area)
-    if rc != 0:
-        log("%s: %s — ждём, повторов не гоним" % (area["title"], why))
-        return False
-    log("%s: аккаунт получен (%s)" % (area["title"], why))
-    _state["pulls"].setdefault(slug, []).append(time.time())
-    _state["pulls"][slug] = [t for t in _state["pulls"][slug] if time.time() - t < 86400]
-    # Счётчик «активационной лавины»: 5+ аккаунтов на проект за 3 минуты ⇒
-    # аларм и остановка (см. проверку выше).
-    _state.setdefault("burst", {})[slug] = burst + [time.time()]
-
-    _state["last_heal"][slug] = time.time()
-    # Отказ, ради которого лечили, снят: новый аккаунт поставлен, старый
-    # отказ больше не должен висеть в памяти (иначе область «застрянет» на
-    # вердикте «ОТКАЗ ПО ОЧКАМ»).
-    _state.setdefault("failure", {}).pop(slug, None)
-    if last and gap < 900:
-        log("%s: прошлый аккаунт прожил всего %d мин — активность тяжёлая, "
-            "пул Кармана горит быстро" % (area["title"], int(gap // 60)))
-    # Помним, какое поколение токена поставили и когда: это точный якорь
-    # «текущий аккаунт» (profile.json переписывает сам десктоп при входе).
-    _state["install"][slug] = {"generation": store_generation(area["dir"]),
-                                "at": int(time.time() * 1000)}
-    save_cooldowns()
-
-    # 1) активировать бонусные очки нового аккаунта — до перезапуска,
-    #    чтобы агент начал работать уже с очками (claim идемпотентен по суткам).
-    res = claim_bonus(switch, area["dir"])
-    log("%s: бонусные очки — %s" % (area["title"], res))
-
-    # 2) перезапуск области под новым аккаунтом
-    # 2) Смена аккаунта БЕЗ перезапуска десктопа: токен и состояние уже в
-    #    области (поколение выше, чем у приложения — десктоп подхватит его на
-    #    следующем запросе). Перезапуск оставляем ЗАПАСНЫМ путём: если пробный
-    #    ход упадёт, значит десктоп остался на старом токене.
-    _state["activated"][slug] = int(time.time() * 1000)
-    save_cooldowns()
-    # «Продолжай» — только если десктоп области ЗАПУЩЕН. У незапущенной области
-    # нет живой сессии: сообщение уйдёт в пустоту, а пробный ход потом истечёт
-    # по таймауту и вызовет откат с перезапуском (18.11).
-    if area["dir"].name not in (switch.running_areas() or set()):
-        log("%s: десктоп не запущен — вход обновлён, «Продолжай» не отправляли "
-            "(живой сессии нет; когда запустите область, она войдёт новым входом)" % area["title"])
-        return True
-    before = latest_turn(area["dir"])
-    before_ms = before[2] if before else 0
-    res = say_continue(area)
-    log("%s: «Продолжай» без перезапуска — %s" % (area["title"], res))
-    _state["probe_turn"][slug] = {"before_ms": before_ms, "at": time.time()}
-    save_cooldowns()
-    return True
-
-    return True
+    ok, _why = renew(switch, area, burst)
+    return ok
 
 
 # ────────────────────────────────────────────────────────── режимы
@@ -1288,6 +1336,10 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="лечить принудительно (для проверки вручную)")
     ap.add_argument("--interval", type=int, default=0,
                     help="пауза между проходами, сек (0 = FAST_INTERVAL)")
+    ap.add_argument("--area", default="",
+                    help="вылечить ТОЛЬКО эту область по команде владельца "
+                         "(кнопка «Новый вход (токен)» в панели): тот же путь, "
+                         "что и автоматическое лечение, но без диагностики и кулдауна")
     args = ap.parse_args()
 
     switch = load_switch()
@@ -1303,7 +1355,16 @@ def main() -> int:
     while True:
         # Конфиг перечитываем на каждом проходе: переключатель
         # «Автомат / Вручную» в панели меняет поле `autoheal` на ходу.
-        areas = healable_areas()
+        if args.area:
+            # Ручная команда владельца («Новый вход (токен)» в панели):
+            # лечим ТОЛЬКО эту область и НЕ по расписанию, даже если её
+            # десктоп не запущен (владелец позвал — значит, он в ней работает).
+            areas = [a for a in all_areas() if a["slug"] == args.area]
+            if not areas:
+                log("область %s не найдена в конфиге" % args.area)
+                return 1
+        else:
+            areas = healable_areas()
         now = time.time()
         for area in areas:
             if not area["dir"].is_dir():
@@ -1323,6 +1384,14 @@ def main() -> int:
                     log("%s: диагностика не удалась: %s" % (area["title"], exc))
                 continue
             try:
+                if args.area:
+                    # Ручное лечение: тот же путь, что и автоматическое, но
+                    # без диагностики и кулдауна (владелец позвал сам).
+                    log("%s: ручное лечение по команде владельца" % area["title"])
+                    ok, why = renew(switch, area)
+                    log("%s: %s" % (area["title"], why))
+                    _next_check[area["slug"]] = time.time() + HEAL_QUIET
+                    continue
                 if probe_pending(area):
                     continue          # ждём разбора пробного хода
                 # diagnose() внутри heal() — второй раз не читаем: проверка
