@@ -53,7 +53,7 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 BIN = Path(r"C:\Users\valstan\bin")
@@ -85,9 +85,13 @@ PROBE_COOLDOWN = 600    # секунд между ЖИВЫМИ проверка�
 REJECT_BACKOFF = 900      # (не используется: отклонённый аккаунт ⇒ берём следующий)
 FAST_DEATH_GAP = 900      # (не используется: быстрая смерть аккаунта — это норма)
 FAST_DEATH_BACKOFF = 7200 # (не используется)
-POOL_EMPTY_BACKOFF = 1800 # Карман ответил «свободных аккаунтов нет» — не
-                          # спрашивать 30 минут (у Кармана каждые полчаса
-                          # возвращаются в оборот неизрасходованные аккаунты)
+POOL_EMPTY_BACKOFF = 600 # Карман ответил «свободных аккаунтов нет» — ждём 10 минут.
+                          # ⚠️ Прежнее «каждые полчаса возвращаются» было НЕВЕРНО:
+                          # у Кармана аккаунт, активированный в 03:00–24:00, свободен
+                          # с 03:00 следующих суток, а активированный в 00:00–03:00 — с
+                          # 00:00 следующих суток (DAILY_RESET_HOURS = [0, 3] в его коде).
+                          # Полный пул восстанавливается к 03:00 МСК. Опрос раз в 10 минут
+                          # нужен, чтобы поймать момент, когда владелец добавит аккаунты вручную.
 BURST_WINDOW = 180         # окно подсчёта «активационной лавины», сек
 BURST_LIMIT = 5            # столько аккаунтов на проект за окно ⇒ аларм и стоп
 LIVE_SWITCH = True       # смена аккаунта без перезапуска десктопа (заказ владельца)
@@ -107,7 +111,7 @@ MIN_TOKEN_LIFE_MIN = 30 # минимальный остаток жизни acces
 MAX_PULL_TRIES = 3      # сколько аккаунтов пробуем взять, пока не найдём живой токен
 LOST_LOGIN_STATES = ("logout_pending", "none", "lease-expired", "logged_out", "signed_out")
 
-_state = {"last_heal": {}, "install": {}, "probe": {}, "pulls": {}, "backoff": {}, "activated": {}, "burst": {}, "alarm": {}, "probe_turn": {}}
+_state = {"last_heal": {}, "install": {}, "probe": {}, "pulls": {}, "backoff": {}, "activated": {}, "burst": {}, "alarm": {}, "probe_turn": {}, "pause_notice": {}, "failure": {}}
 _last_verdict = {}      # прошлый вердикт по области — чтобы не писать в журнал
                         # одно и то же «лечить нечего» каждые 15 секунд
 _next_check = {}        # slug → время следующей проверки области
@@ -133,6 +137,9 @@ def load_cooldowns() -> None:
             _state["alarm"] = data.get("alarm") if isinstance(data.get("alarm"), dict) else {}
             _state["probe_turn"] = {str(k): v for k, v in (data.get("probe_turn") or {}).items()
                                    if isinstance(v, dict)}
+            _state["pause_notice"] = {str(k): v for k, v in (data.get("pause_notice") or {}).items()}
+            _state["failure"] = {str(k): v for k, v in (data.get("failure") or {}).items()
+                                 if isinstance(v, dict)}
     except (OSError, ValueError, TypeError):
         _state["last_heal"] = {}
         _state["install"] = {}
@@ -223,13 +230,22 @@ def all_areas() -> list:
 
 
 def healable_areas() -> list:
-    """Области под авто-лечением: autoheal = true и каталог есть.
+    """Области под авто-лечением: **только ЗАПУЩЕННЫЕ**.
+
+    ⚠️ Замечание владельца 18.11: «эти области не запущены и я с ними не работаю
+    пока, поэтому ты на них внимание не должен обращать пока я их не запущу и не
+    начну там программировать». Значит незапущенные области мы **не смотрим
+    вовсе**: ни диагностики, ни лечения, ни строк в журнале — пока владелец их
+    не запустит ([D-217](../docs/DECISIONS.md)).
 
     ⚠️ Конфиг перечитывается **на каждом проходе** — переключатель
     «Автомат / Вручную» в панели меняет поле `autoheal`, и лечащий
     подхватывает это без перезапуска.
     """
-    return [a for a in all_areas() if a["autoheal"] and a["dir"].is_dir()]
+    switch = load_switch()
+    running = switch.running_areas() or set()
+    return [a for a in all_areas()
+            if a["autoheal"] and a["dir"].is_dir() and a["dir"].name in running]
 
 
 def last_install_ts(area_dir: Path) -> int:
@@ -277,10 +293,83 @@ def _rows(con, sql, args=()) -> list:
 
 
 def _area_progress(con) -> int:
-    """Когда область последний раз двигалась (успешный ход)."""
+    """Когда область последний раз РЕАЛЬНО работала (завершённый ход).
+
+    ⚠️ Только `completed`: ход, который merely НАЧАЛСЯ (`accepted`), — не
+    доказательство, что аккаунт жив. Иначе лечащий, послав «Продолжай» после
+    отказа, сам собой гасил бы этот отказ (начатый «Продолжай»-ход становился
+    «прогрессом» — и область с пустым аккаунтом оставалась стоять, а лечащий
+    говорил «жива»; 18.11, Карман: отказ 09:11 → accepted 09:13 → отказ
+    потерян).
+    """
     row = _rows(con, "select max(accepted_at_ms) from local_runtime_turn_ingress "
-                     "where status in ('completed','accepted')")
+                     "where status = 'completed'")
     return int(row[0][0] or 0) if row else 0
+
+
+def _session_progress(con, session_id: str) -> int:
+    """Когда ЭТА сессия последний раз РЕАЛЬНО работала (завершённый ход).
+
+    ⚠️ 18.11: «отказ устарел, потому что область двигалась» надо проверять по
+    **своей** сессии, а не по области. Область — это много сессий: если одна
+    из них упала по очкам, а другая в это время успела сделать ход, отказ
+    первой списывался в «устаревшие» — и область с пустым аккаунтом оставалась
+    стоять, а лечащий говорил «жива».
+    """
+    row = _rows(con, "select max(accepted_at_ms) from local_runtime_turn_ingress "
+                     "where session_id = ? and status = 'completed'",
+                (session_id,))
+    return int(row[0][0] or 0) if row else 0
+
+
+def _area_progress_db(area_dir: Path) -> int:
+    """Когда область последний раз РЕАЛЬНО работала (завершённый ход) — из базы."""
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return 0
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return 0
+    try:
+        return _area_progress(con)
+    finally:
+        con.close()
+
+
+def _session_progress_db(area_dir: Path, session_id: str) -> int:
+    """Когда СЕССИЯ последний раз реально работала (завершённый ход) — из базы."""
+    if not session_id:
+        return 0
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return 0
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return 0
+    try:
+        return _session_progress(con, session_id)
+    finally:
+        con.close()
+
+
+def _remember_failure(slug: str, at: int, why: str, session_id: str = "") -> None:
+    """Запомнить увиденный отказ по очкам.
+
+    ⚠️ Зачем: рантайм стирает `error_code` из строки сессии через пару минут
+    после отказа. Без памяти отказ пропадал из вида, и область с пустым
+    аккаунтом оставалась стоять, а лечащий говорил «жива» (18.11).
+
+    Сессию запоминаем вместе с отказом: отказ в сессии А гасится только
+    работой **той же** сессии А. Ход в соседней сессии области (у другого
+    чата) — не доказательство, что аккаунт жив.
+    """
+    if not at:
+        return
+    _state.setdefault("failure", {})[slug] = {
+        "at": int(at), "why": str(why)[:200], "sid": str(session_id or "")}
+    save_cooldowns()
 
 
 def vendor_balance_failure(area_dir: Path, install: int, since: int):
@@ -313,9 +402,9 @@ def vendor_balance_failure(area_dir: Path, install: int, since: int):
             fail = int(row[0][0] or 0) if row else 0
             if not fail or fail < install or fail < since:
                 continue
-            if progress and progress > fail:
-                continue          # после отказа область возобновилась — отказ устарел
-            cands.append((fail, "вендорский отказ в сессии %s (%s)" % (sid[:12], (msg or "").strip())))
+            if _session_progress(con, sid) > fail:
+                continue          # после отказа двигалась ЭТА ЖЕ сессия — отказ устарел
+            cands.append((fail, "вендорский отказ в сессии %s (%s)" % (sid[:12], (msg or "").strip()), sid))
         # саб-агенты: фоновая задача, УПАВШАЯ с тем же отказом.
         # Смотрим именно поле lastError задачи, а не весь record_json: в выводе
         # задачи может просто упоминаться фраза (например, наш собственный
@@ -336,9 +425,14 @@ def vendor_balance_failure(area_dir: Path, install: int, since: int):
             ts = int(ended or 0)
             if ts < install or ts < since:
                 continue
-            if progress and progress > ts:
+            # Упавшая фоновая задача — тоже «своя» единица: смотрим прогресс её
+            # сессии-владельца, а не всей области (иначе ход в другой сессии
+            # списывал бы отказ в устаревшие). Владельца не знаем — берём область.
+            owner = str(task.get("ownerSessionId") or (task.get("metadata") or {}).get("parentSessionId") or "")
+            moved = _session_progress(con, owner) if owner else progress
+            if moved and moved > ts:
                 continue
-            cands.append((ts, "фоновая задача #%s упала по очкам" % rid))
+            cands.append((ts, "фоновая задача #%s упала по очкам" % rid, owner))
         if cands:
             cands.sort(reverse=True)
             return cands[0]
@@ -510,6 +604,28 @@ def account_anchor(area: dict) -> int:
     return max(inst, act)
 
 
+def next_karman_reset() -> tuple:
+    """Когда у Кармана аккаунты снова станут свободными.
+
+    У Кармана сброс суточного бонуса — **в 00:00 и 03:00 МСК**
+    (`DAILY_RESET_HOURS = [0, 3]` в его коде): аккаунт, активированный в
+    03:00–24:00, свободен с 03:00 следующих суток, а активированный в
+    00:00–03:00 — с 00:00 следующих суток. Значит полный пул восстанавливается
+    к 03:00, а НЕ «каждые полчаса» — прежнее понимание было неверным, из-за
+    него лечащий опрашивал пул ночью зря и области стояли часами.
+
+    Возвращает (ближайший_сброс, полный_пул).
+    """
+    now = datetime.now()
+    cands = []
+    for hour in (0, 3):
+        t = now.replace(hour=hour, minute=0, second=0, microsecond=0)
+        if t <= now:
+            t = t + timedelta(days=1)
+        cands.append(t)
+    return min(cands), max(cands)
+
+
 def pull_account(switch, area: dict):
     """Взять аккаунт у Кармана и посадить его в область.
 
@@ -533,13 +649,18 @@ def pull_account(switch, area: dict):
             log("%s: %s" % (area["title"], line))
         if rc != 0:
             if rc == 2:
-                # Свободных аккаунтов нет: ждём 30 минут (у Кармана каждые
-                # полчаса возвращаются в оборот неизрасходованные аккаунты).
+                # Свободных аккаунтов нет. У Кармана аккаунты возвращаются на
+                # НОЧНОМ сбросе (00:00 / 03:00 МСК), а не «каждые полчаса»:
+                # ждём 10 минут (поймаем, если владелец добавит аккаунты руками)
+                # и говорим владельцу, когда пул восстановится сам.
+                reset_at, full_at = next_karman_reset()
                 _state["backoff"][area["slug"]] = {
                     "until": time.time() + POOL_EMPTY_BACKOFF,
-                    "why": "пул Кармана пуст — ждём 30 мин (возвращаются неизрасходованные)"}
+                    "why": "пул Кармана пуст — сброс в %s (полный пул к %s)" % (
+                        reset_at.strftime("%d.%m %H:%M"), full_at.strftime("%d.%m %H:%M"))}
                 save_cooldowns()
-                return rc, "пул Кармана пуст, пауза %d мин" % (POOL_EMPTY_BACKOFF // 60)
+                return rc, ("пул Кармана пуст — аккаунты вернутся к %s, полный пул к %s" % (
+                    reset_at.strftime("%d.%m %H:%M"), full_at.strftime("%d.%m %H:%M")))
             if rc == 3:
                 # Карман отдал негодный токен — пробуем следующий: возможно, выпал
                 # именно ошибочный, а следующий будет живым.
@@ -605,12 +726,36 @@ def diagnose(area: dict) -> dict:
     install = account_anchor(area)
     out["install"] = install
     since = int((time.time() - ERROR_WINDOW) * 1000)
+
+    # 0) ПОМЕЧЕННЫЙ отказ — переживает чистку runtime. ⚠️ 18.11: рантайм
+    #    стирает `error_code` из строки сессии через пару минут после отказа
+    #    (проверено: отказ Кармана в 09:11:24 к 09:2x из базы исчез). После
+    #    этого область снова выглядела «живой» — и оставалась стоять с пустым
+    #    аккаунтом. Поэтому увиденный отказ запоминаем в состоянии.
+    mem = (_state.get("failure") or {}).get(area["slug"]) or {}
+    mem_at = int(mem.get("at") or 0)
+    if mem_at and mem_at >= install:
+        mem_sid = str(mem.get("sid") or "")
+        moved = (_session_progress_db(area["dir"], mem_sid) if mem_sid
+                 else _area_progress_db(area["dir"]))
+        if moved and moved > mem_at:
+            # после отказа ОТКАЗАВШАЯ СЕССИЯ отработала — отказ устарел, забываем
+            _state.setdefault("failure", {}).pop(area["slug"], None)
+            save_cooldowns()
+        else:
+            out["verdict"] = "ОТКАЗ ПО ОЧКАМ"
+            out["failure"] = mem_at
+            out["reason"] = mem.get("why") or "отказ по очкам (помечен ранее)"
+            out["tier"] = "T1"
+            return out
+
     hit = vendor_balance_failure(area["dir"], install, since)
     if hit:
         out["verdict"] = "ОТКАЗ ПО ОЧКАМ"
         out["failure"] = hit[0]
         out["reason"] = hit[1]
         out["tier"] = "T1"
+        _remember_failure(area["slug"], hit[0], hit[1], hit[2] if len(hit) > 2 else "")
         return out
     maybe = silent_failure(area["dir"], install, since)
     if maybe:
@@ -984,8 +1129,15 @@ def heal(area: dict, switch, force: bool = False) -> bool:
     now = time.time()
     bo = _state["backoff"].get(slug) or {}
     if not force and float(bo.get("until") or 0) > now:
-        log("%s: пауза до %s (%s)" % (
-            area["title"], _fmt(int(float(bo["until"]) * 1000)), bo.get("why", "ожидание")))
+        # Не спамим: «пауза до …» пишем только когда пауза ИЗМЕНИЛАСЬ (конец
+        # сдвинулся или сменилась причина). Иначе журнал забивается одной
+        # строкой каждые 10 секунд (18.11 — 1000+ таких строк за ночь).
+        until = int(float(bo["until"]) * 1000)
+        if _state.get("pause_notice", {}).get(slug) != until:
+            _state.setdefault("pause_notice", {})[slug] = until
+            save_cooldowns()
+            log("%s: пауза до %s (%s)" % (
+                area["title"], _fmt(until), bo.get("why", "ожидание")))
         return False
     burst = [t for t in (_state.get("burst") or {}).get(slug, []) if now - t < BURST_WINDOW]
     if len(burst) >= BURST_LIMIT and not force:
@@ -1050,6 +1202,10 @@ def heal(area: dict, switch, force: bool = False) -> bool:
     _state.setdefault("burst", {})[slug] = burst + [time.time()]
 
     _state["last_heal"][slug] = time.time()
+    # Отказ, ради которого лечили, снят: новый аккаунт поставлен, старый
+    # отказ больше не должен висеть в памяти (иначе область «застрянет» на
+    # вердикте «ОТКАЗ ПО ОЧКАМ»).
+    _state.setdefault("failure", {}).pop(slug, None)
     if last and gap < 900:
         log("%s: прошлый аккаунт прожил всего %d мин — активность тяжёлая, "
             "пул Кармана горит быстро" % (area["title"], int(gap // 60)))
@@ -1093,11 +1249,21 @@ def heal(area: dict, switch, force: bool = False) -> bool:
 
 def show_status() -> int:
     areas = all_areas()
+    switch = load_switch()
+    running = switch.running_areas() or set()
     print("МиниГен — авто-лечение: %s" % datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
     print("%-13s %-9s %-8s %-13s %-13s %s" % (
         "область", "присмотр", "аккаунт", "установлен", "последний отказ", "вердикт"))
     for area in areas:
         watch = "автомат" if area["autoheal"] else "вручную"
+        # Незапущенные области лечащий НЕ смотрит (замечание владельца 18.11):
+        # вердикт у них был бы враньём — показываем, что они вне присмотра.
+        if area["dir"].name not in running:
+            print("%-13s %-9s %-8s %-13s %-13s %s" % (
+                area["title"], watch,
+                "есть" if area["dir"].is_dir() else "—",
+                "—", "—", "не запущена — не смотрим"))
+            continue
         diag = diagnose(area)
         print("%-13s %-9s %-8s %-13s %-13s %s" % (
             area["title"], watch,
