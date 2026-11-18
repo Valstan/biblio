@@ -434,7 +434,7 @@ def karman_available(project: str = "", area: str = "") -> tuple:
 
 
 def karman_note_activation(email: str, account_id=None, activation_index=None,
-                           project: str = "", area: str = "", points=None) -> bool:
+                           project: str = "", area: str = "", points=None) -> tuple:
     """Сообщить Карману, какой аккаунт мы активировали — БЕЗ токенов.
 
     Граница ответственности (решение владельца 15.11): панель только **просит**
@@ -446,10 +446,15 @@ def karman_note_activation(email: str, account_id=None, activation_index=None,
     её номинальные очки), а не наша оценка: остаток очков MiniMax не отдаёт,
     но клетку и её номинал видно в его же `signin/status`. Это и есть второе,
     независимое показание для прогноза Кармана.
+
+    Возвращает **(ok, причина)**. Причина нужна с 18.11: Карман отвечает 404
+    «Активация за сегодня не найдена — мы его не выдавали» на аккаунты,
+    выданные НЕ сегодня. Это не сбой, а «докладывать нечего» — такой отказ
+    не должен повторяться каждую минуту и засорять журнал.
     """
     base, token = karman_base(), karman_token()
     if not base or not token or not email:
-        return False
+        return False, "нет адреса КАРМАНА, room-токена или почты"
     body = {"email": email}
     if account_id is not None:
         body["account_id"] = account_id
@@ -468,9 +473,16 @@ def karman_note_activation(email: str, account_id=None, activation_index=None,
                                  headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=30, context=SSL_CTX) as resp:
-            return 200 <= resp.status < 300
-    except Exception:  # noqa: BLE001
-        return False
+            return (200 <= resp.status < 300), "HTTP %s" % resp.status
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            payload = {}
+        why = payload.get("error") if isinstance(payload, dict) else None
+        return False, "HTTP %s: %s" % (exc.code, why or "")
+    except Exception as exc:  # noqa: BLE001
+        return False, "%s: %s" % (type(exc).__name__, str(exc)[:120])
 
 
 _KARMAN_PROJECT_CACHE = {"ts": 0.0, "map": {}}
@@ -748,8 +760,8 @@ def cmd_pull(args) -> int:
         return 0
     install_pair(area, access, refresh, expires, account.get("email") or "", account.get("id"))
     if args.note:
-        ok = karman_note_activation(account.get("email") or "", account.get("id"), None,
-                                   area_project(area), area.name)
+        ok, _why = karman_note_activation(account.get("email") or "", account.get("id"), None,
+                                          area_project(area), area.name)
         print("  отметка активации у Кармана (без токенов): %s" % ("да" if ok else "нет"))
     return 0
 
@@ -785,8 +797,8 @@ def cmd_repair(args) -> int:
         install_pair(area, access, str(payload.get("refresh_token") or ""), payload.get("expires_at_ms"),
                      account.get("email") or "", account.get("id"))
         if args.note:
-            ok = karman_note_activation(account.get("email") or "", account.get("id"), None,
-                                       area_project(area), area.name)
+            ok, _why = karman_note_activation(account.get("email") or "", account.get("id"), None,
+                                              area_project(area), area.name)
             print("  отметка активации у Кармана (без токенов): %s" % ("да" if ok else "нет"))
         repaired.append(st["area"])
     print("Починено: %s" % (", ".join(repaired) if repaired else "—"))
@@ -815,6 +827,7 @@ def cmd_report(args) -> int:
     """
     running = running_areas()
     sent = []
+    skipped = []
     failed = []
     for st in states_all(running):
         if not st.get("live") or not st.get("claimed_today"):
@@ -828,20 +841,34 @@ def cmd_report(args) -> int:
         done = (read_meta(area) or {}).get("reported_activation") or {}
         if done.get("day_no") == day and done.get("email") == email:
             continue
-        ok = karman_note_activation(email, None, day, area_project(area), area.name, points)
+        ok, why = karman_note_activation(email, None, day, area_project(area), area.name, points)
         if ok:
             meta_update(area, {"reported_activation": {
                 "day_no": day, "email": email, "points": points,
                 "at": time.strftime("%Y-%m-%dT%H:%M:%S")}})
             print("  %s: клетка %s, %s очков → Карману: да" % (area.name, day, points))
             sent.append(area.name)
+        elif "не выдавали" in why or "не найдена" in why:
+            # Карман не выдавал этот аккаунт сегодня — суточный доклад по нему
+            # невозможен (его роутер ищет СЕГОДНЯШНЮЮ выдачу). Это не сбой:
+            # отметку пишем, иначе панель повторяет попытку каждую минуту
+            # и заваливает журнал (18.11).
+            meta_update(area, {"reported_activation": {
+                "day_no": day, "email": email, "points": points,
+                "skipped": "карман не выдавал сегодня",
+                "at": time.strftime("%Y-%m-%dT%H:%M:%S")}})
+            print("  %s: клетка %s, %s очков → Карману: нечего докладывать "
+                  "(аккаунт выдан не сегодня)" % (area.name, day, points))
+            skipped.append(area.name)
         else:
             # Отметку НЕ пишем: иначе неудача считается выполненной и до конца
             # суток не повторится — доклад молча пропадёт (G631).
             failed.append(area.name)
-            print("  %s: клетка %s, %s очков → Карману: НЕТ — повторим позже" % (
-                area.name, day, points))
+            print("  %s: клетка %s, %s очков → Карману: НЕТ — повторим позже (%s)" % (
+                area.name, day, points, why or "без причины"))
     print("Доложено: %s" % (", ".join(sent) if sent else "—"))
+    if skipped:
+        print("Нечего докладывать (Карман не выдавал сегодня): %s" % ", ".join(skipped))
     if failed:
         print("Не доложено (повторим в следующий прогон): %s" % ", ".join(failed))
     return 0

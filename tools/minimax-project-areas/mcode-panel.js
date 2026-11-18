@@ -76,7 +76,12 @@ try {
 function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
 
 function log(line) {
-  const t = new Date().toISOString().replace('T', ' ').slice(0, 19);
+  // Время МЕСТНОЕ, как у лечащего: тот пишет в тот же файл и по местному,
+  // а UTC в одном журнале смотрелся как два разных часа (18.11).
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  const t = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) +
+            ' ' + p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
   const entry = t + ' — ' + line;
   journal.unshift(entry);
   if (journal.length > 60) journal.pop();
@@ -85,6 +90,19 @@ function log(line) {
     fs.appendFileSync(JOURNAL_FILE, entry + '\n');
   } catch {}
   console.log(entry);
+}
+
+// Журнал — с диска и СВЕЖИМ: лечащий пишет в тот же файл, а его строки
+// иначе видны только после перезапуска панели (18.11: панель показывала
+// «вчерашние» строки, пока лечащий вовсю писал новые).
+function readJournal(limit) {
+  const n = limit || 60;
+  try {
+    const raw = fs.readFileSync(JOURNAL_FILE, 'utf8').split('\n').filter(Boolean);
+    return raw.slice(-n).reverse();          // файл хронологический — свежие первыми
+  } catch {
+    return journal.slice(0, n);
+  }
 }
 
 // PowerShell печатает в кодировке консоли (cp1251), а панель читает UTF-8 —
@@ -480,7 +498,7 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/state') {
     const list = await liveState(false);
     const acc = await accounts();
-    return json(200, { areas: list, accounts: acc, journal, alarm: (healState().alarm || null) });
+    return json(200, { areas: list, accounts: acc, journal: readJournal(60), alarm: (healState().alarm || null) });
   }
 
   // Новый вход — только по одной области и только по команде владельца.
