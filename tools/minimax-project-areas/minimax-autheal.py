@@ -379,6 +379,40 @@ def silent_failure(area_dir: Path, install: int, since: int):
     return None
 
 
+def token_expiry_ms(area_dir: Path) -> int:
+    """Когда протухнет access-токен области (0 = неизвестно).
+
+    ⚠️ `auth-state.json` после истечения токена остаётся со `status =
+    authenticated` — его никто не переписывает. Поэтому «живой» статус
+    приложения нельзя считать доказательством живого входа: срок токена —
+    единственный честный признак (18.11).
+    """
+    switch = load_switch()
+    exp = 0
+    try:
+        app = switch.read_app_state(area_dir) or {}
+        exp = int(app.get("expiresAtMs") or 0)
+    except Exception:  # noqa: BLE001
+        exp = 0
+    if not exp:
+        try:
+            rec = (switch.read_store(area_dir).get("records") or {}).get(switch.store_key(area_dir)) or {}
+            exp = int(rec.get("expiresAtMs") or 0)
+        except Exception:  # noqa: BLE001
+            exp = 0
+    return exp
+
+
+def our_account(area_dir: Path) -> bool:
+    """Есть ли у области аккаунт, выданный Карманом (значит, его можно переавторизовать)."""
+    switch = load_switch()
+    try:
+        meta = switch.read_meta(area_dir) or {}
+    except Exception:  # noqa: BLE001
+        meta = {}
+    return bool(meta.get("email") or meta.get("karman_account_id"))
+
+
 def login_lost(area_dir: Path) -> str:
     """T3: вход потерян — область висит незалогиненной.
 
@@ -391,6 +425,12 @@ def login_lost(area_dir: Path) -> str:
     не было (нет e-mail в профиле) — это не поломка, а «нужен вход владельца
     в браузере» ([D-217](../docs/DECISIONS.md)), и тратить на него аккаунт из
     общего пула нельзя.
+
+    **18.11 — протухший токен тоже потерянный вход.** Раньше область с истёкшим
+    access-токеном вечно считалась «жива»: запись в сторе есть, а
+    `auth-state.json` всё ещё говорит `authenticated` (никто его не
+    переписывает). Так не лечились Гоньба, Казанская, Тренер и «Матрица РМЗ 2»
+    — токены протухли ещё 12–17.11.
     """
     switch = load_switch()
     try:
@@ -412,6 +452,10 @@ def login_lost(area_dir: Path) -> str:
     status = str(app.get("status") or "")
     if status and status in LOST_LOGIN_STATES:
         return "приложение считает себя вышедшим (%s)" % status
+    # Токен протух, а запись в сторе и «authenticated» в app-state остались.
+    exp = token_expiry_ms(area_dir)
+    if exp and exp < int(time.time() * 1000):
+        return "токен входа протух (до %s)" % _fmt(exp)
     return ""
 
 
@@ -580,6 +624,15 @@ def diagnose(area: dict) -> dict:
         out["verdict"] = "ПОТЕРЯН ВХОД"
         out["reason"] = lost
         out["tier"] = "T3"
+        return out
+    # Токен протух, но аккаунт у области НЕ наш (в профиле нет e-mail) ⇒
+    # это «нужен вход владельца в браузере», а не поломка: пул не жжём
+    # ([D-217]). Показываем это прямо, а не «жива» (18.11).
+    exp = token_expiry_ms(area["dir"])
+    if exp and exp < int(time.time() * 1000) and not our_account(area["dir"]):
+        out["verdict"] = "нужен вход владельца"
+        out["reason"] = ("токен входа протух (до %s), аккаунт не наш — войдите в браузере "
+                         "(кнопка «Оживить вход (браузер)»)" % _fmt(exp))
         return out
     out["reason"] = "отказов по очкам не найдено"
     return out
@@ -916,7 +969,10 @@ def heal(area: dict, switch, force: bool = False) -> bool:
         prev = _last_verdict.get(slug)
         _last_verdict[slug] = diag["verdict"]
         if force or prev != diag["verdict"]:
-            log("%s: лечить нечего (%s)" % (area["title"], diag["reason"]))
+            if diag["verdict"] == "нужен вход владельца":
+                log("%s: %s" % (area["title"], diag["reason"]))
+            else:
+                log("%s: лечить нечего (%s)" % (area["title"], diag["reason"]))
         return False
     _last_verdict[slug] = diag["verdict"]
 
@@ -1015,6 +1071,13 @@ def heal(area: dict, switch, force: bool = False) -> bool:
     #    ход упадёт, значит десктоп остался на старом токене.
     _state["activated"][slug] = int(time.time() * 1000)
     save_cooldowns()
+    # «Продолжай» — только если десктоп области ЗАПУЩЕН. У незапущенной области
+    # нет живой сессии: сообщение уйдёт в пустоту, а пробный ход потом истечёт
+    # по таймауту и вызовет откат с перезапуском (18.11).
+    if area["dir"].name not in (switch.running_areas() or set()):
+        log("%s: десктоп не запущен — вход обновлён, «Продолжай» не отправляли "
+            "(живой сессии нет; когда запустите область, она войдёт новым входом)" % area["title"])
+        return True
     before = latest_turn(area["dir"])
     before_ms = before[2] if before else 0
     res = say_continue(area)
