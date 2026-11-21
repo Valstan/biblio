@@ -34,7 +34,6 @@ import json
 import os
 import sqlite3
 import subprocess
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -206,13 +205,18 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
-def fmt_ms(ms: int) -> str:
-    if not ms:
-        return "—"
-    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m %H:%M:%S")
+def script_stamp(path: Path) -> float:
+    """Время изменения файла скрипта (0 — файла нет).
 
+    Нужен демонам: правка кода на диске не действует, пока процесс не
+    перезапущен, а супервизор перезапускает демон только по смерти процесса
+    ⇒ демон сам перезапускается, увидев, что его файл изменился (урок 22.11).
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
-# ────────────────────────────────────────────── перезапуск демона после кода
 
 def supervisor_alive(port: int = 8098) -> bool:
     """Жив ли супервизор «МиниГена» (страница управления на 8098)?"""
@@ -230,6 +234,7 @@ def respawn_self() -> None:
     С супервизором демона поднимает он (по смерти процесса); без него —
     поднимаем себя сами, иначе раскатанный код останется мёртвым.
     """
+    import sys
     script = sys.argv[0] if sys.argv else ""
     if not script:
         return
@@ -241,6 +246,12 @@ def respawn_self() -> None:
                          stderr=subprocess.DEVNULL)
     except OSError:
         pass
+
+
+def fmt_ms(ms: int) -> str:
+    if not ms:
+        return "—"
+    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m %H:%M:%S")
 
 
 # ────────────────────────────────────────────────────────── прокси и окружение

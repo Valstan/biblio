@@ -79,29 +79,26 @@ FINAL_MARKERS = ("готово", "закрыто", "завершено", "сде
                  "работа завершена", "закрытие сессии", "финальная сводка",
                  "готово.", "закрыто.")
 # Служебные сессии-пробы лечащего (`mcode exec --cwd … ping`): это не работа
-# владельца, их не показываем, не «оживляем» и НЕ РОТИРУЕМ — иначе будем будить
-# пробы и закрывать служебные сессии.
-#
-# Признак пробы — ДВА: заголовок («ping») и первая реплика пользователя
-# («ping»). Одного заголовка мало: пробу переименовали — и по заголовку она
-# проходит как обычная сессия (и ротация её закрывает). И проверка пробы стоит
-# не в одном месте: и в вердикте, и на ЛЮБОМ действии (ротация, оживление,
-# CLI) — иначе дыра открывается снова.
+# владельца, их не показываем и не «оживляем» — иначе будем будить пробы.
 PROBE_TITLES = ("ping", "пинг", "probe")
 PROBE_TEXTS = ("ping", "пинг", "probe")
-# «Живая» сессия — та, что держит роль: ход идёт, завис, ждёт владельца или
-# требует реакции. Именно она занимает место (см. guard «один Управляющий»).
-ALIVE_VERDICTS = ("работает", "ход завис", "упала по сети", "ждёт владельца",
-                  "контекст заполнен", "есть оборванные субагенты")
-# Роли: «Управляющий» работает в своём worktree Мозга, всё остальное — обычная
-# работа. Guard «одна живая сессия на роль» держим для Управляющего: там один
-# писатель на ветку (ADR-0011); в обычных областях живых сессий в одной папке
-# бывает много — это разные нитки, а не два агента на одной ветке.
-ROLE_MANAGER = "управляющий"
-ROLE_DEFAULT = "обычная"
+# Области, где работает «Управляющий» — сессия, которая управляет сессиями.
+# Правило: **один Управляющий на область** (урок ночи, G679): вторая живая
+# сессия там = два писателя в одном worktree.
+MANAGER_AREAS = ("brain2",)
 RECOVERY_WAIT = 900      # после восстановления сети ждём 15 минут перед «Продолжай»
 REVIVE_COOLDOWN = 900    # не чаще одного «Продолжай» на сессию за 15 минут
-CONTEXT_LIMIT = 95       # процент заполнения контекста, после которого ротация
+CONTEXT_LIMIT = 95       # верхняя граница: процент заполнения контекста, после которого ротация
+CONTEXT_ROTATE = 60      # backstop: НИЖЕ минимальной наблюдённой точки сжатия.
+                          # ⚠️ Точка сжатия не выражается стабильным процентом (замер 22.11
+                          #  по всем областям: 345k–835k токенов ⇒ 68–84 % при окне 1 000 000),
+                          #  поэтому процентный порог между сессиями не переносится, а 70 %
+                          #  был бы ХУЖЕ минимальной точки сжатия и не сработал бы как
+                          #  страховка. Основной триггер — СОБЫТИЕ компактизации
+                          #  (context_compaction_checkpoint_generated), процент — только
+                          #  страховка снизу [G680].
+COMPACT_MARK = "context_compaction_checkpoint_generated"   # событие рантайма о сжатии
+COMPACT_WINDOW_MS = 6 * 3600 * 1000   # окно, в котором сжатие считается свежим
 CLOSE_TIMEOUT = 900      # сколько ждём корректного закрытия сессии, сек
 
 
@@ -187,11 +184,24 @@ def context_fill(con, session_id: str, extra: dict) -> dict:
             "input": inp, "output": out, "cache_read": cache}
 
 
-def broken_subagents(con) -> list:
-    """Оборванные субагенты: работа пропала, её надо поднять."""
+def broken_subagents(con, session_id: str = "", max_age_ms: int = 24 * 3600 * 1000) -> list:
+    """Оборванные субагенты **этой** сессии: работа пропала, её надо поднять.
+
+    ⚠️ 22.11: счёт шёл по всем задачам области — включая старые и чужие ⇒ живая
+    сессия объявлялась «незаконченной» из-за субагента, который оборвался вчера
+    в другой нитке (на Мозга пришло лишнее «Продолжай»). Теперь — только задачи
+    этой сессии и только за последние сутки.
+    """
     out = []
-    for rec in core.rows(con, "select record_json from local_runtime_background_tasks "
-                              "where kind='subagent' and status in ('failed','canceled','aborted')"):
+    sql = ("select record_json, created_at_ms from local_runtime_background_tasks "
+           "where kind='subagent' and status in ('failed','canceled','aborted','lost')")
+    args = []
+    if session_id:
+        sql += " and owner_session_id = ?"
+        args.append(session_id)
+    for rec in core.rows(con, sql, tuple(args)):
+        if max_age_ms and rec[1] and (core.now_ms() - int(rec[1])) > max_age_ms:
+            continue
         try:
             task = json.loads(rec[0] or "{}")
         except ValueError:
@@ -228,105 +238,88 @@ def asks_owner(text: str) -> bool:
                            r"как вам|выберите|нужно подтверждение|подтвердите)", low))
 
 
-# ────────────────────────────────────────────── проба, роль, «место занято»
-
-def is_probe(con, sess: dict) -> bool:
-    """Проба лечащего — служебная сессия, а не работа владельца.
-
-    Два признака: заголовок («ping») и первая реплика пользователя («ping»).
-    Заголовок могли переименовать — тогда опознаём по первой реплике: у пробы
-    она всегда ровно «ping» (`mcode exec --cwd … ping`).
-    """
-    if (sess.get("title") or "").strip().lower() in PROBE_TITLES:
-        return True
-    if con is None:
-        return False
-    r = core.rows(con, "select data_json from local_runtime_message_rows "
-                       "where session_id=? and role='user' order by id asc limit 1",
-                  (sess.get("session_id") or "",))
-    if not r:
-        return False
-    try:
-        data = json.loads(r[0][0] or "{}")
-    except ValueError:
-        return False
-    return (data.get("msg_content") or "").strip().lower() in PROBE_TEXTS
-
-
-def probe_of(area: dict, sess: dict) -> bool:
-    """Проба ли это — без уже открытого соединения с базой."""
-    con = core.connect(core.area_db(area["dir"]))
-    try:
-        return is_probe(con, sess)
-    finally:
-        if con:
-            con.close()
-
-
-def role_of(folder: str) -> str:
-    """Роль сессии по её рабочей папке.
-
-    Управляющий сидит в worktree Мозга: там лежит его бриф
-    (`docs/orchestrator/BRIEF.md`), а `.git` — ФАЙЛ (worktree), а не каталог
-    (обычный клон репозитория).
-    """
-    if not folder:
-        return ROLE_DEFAULT
-    p = Path(folder)
-    try:
-        if (p / ".git").is_file() and (p / "docs" / "orchestrator" / "BRIEF.md").is_file():
-            return ROLE_MANAGER
-    except OSError:
-        pass
-    return ROLE_DEFAULT
-
-
-def occupied_peer(verdicts: list, v: dict) -> dict:
-    """Живая сессия той же роли в том же worktree? ⇒ место занято (G679).
-
-    Guard живёт для роли «Управляющий»: там один писатель на ветку (ADR-0011),
-    а оживление упавшей сессии при живой соседке даёт двух Управляющих в одной
-    области — это и случилось ночью 22.11 (грабли G679).
-    """
-    if v.get("role") != ROLE_MANAGER:
-        return {}
-    for peer in verdicts:
-        if peer.get("session_id") == v.get("session_id"):
-            continue
-        if peer.get("role") != ROLE_MANAGER:
-            continue
-        if (peer.get("workspace") or "") != (v.get("workspace") or ""):
-            continue
-        if peer.get("archived"):
-            continue
-        if peer.get("probe"):
-            continue          # проба не «держит» роль: она лежит в том же worktree
-        if peer.get("verdict") not in ALIVE_VERDICTS:
-            continue
-        return peer
-    return {}
-
-
 # ────────────────────────────────────────────────────────── вердикт
 
-def classify(area: dict, sess: dict, con) -> dict:
+def compacted_sessions(area_dir: Path, window_ms: int = COMPACT_WINDOW_MS) -> dict:
+    """Сессии, которые рантайм недавно СЖАЛ (компактизация контекста).
+
+    Источник — журнал рантайма области (`v2/observability/logs/runtime-*.log`):
+    `context_compaction_checkpoint_generated` и `beforeLlmCall replaced context
+    messages`.
+
+    Почему это важно: после сжатия метрика заполнения падает до ~10 %, и сторож
+    по «последнему ходу» никогда не увидит переполнения ⇒ сессия остаётся
+    затушенной (а в замере 22.11 сводки не осталось вовсе: `summary_length: 0`).
+    Сжатие надо ловить **событием**, а не процентом.
+    """
+    out = {}
+    log_dir = area_dir / "v2" / "observability" / "logs"
+    if not log_dir.is_dir():
+        return out
+    try:
+        files = sorted(log_dir.glob("runtime-*.log"))[-3:]
+    except OSError:
+        return out
+    for f in files:
+        try:
+            raw = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            if COMPACT_MARK not in line:
+                continue
+            m = re.search(r'"session_id":\s*"([^"]+)"', line)
+            ts = re.search(r"\[(\d\d):(\d\d):(\d\d)", line)
+            if not m:
+                continue
+            at = 0
+            if ts:
+                try:
+                    import datetime as _dt
+                    hh, mm, ss = (int(x) for x in ts.groups())
+                    now = _dt.datetime.now()
+                    at = int(now.replace(hour=hh, minute=mm, second=ss,
+                                         microsecond=0).timestamp() * 1000)
+                except Exception:  # noqa: BLE001
+                    at = 0
+            sid = m.group(1)
+            if at and (core.now_ms() - at) > window_ms:
+                continue
+            out[sid] = max(out.get(sid, 0), at)
+    return out
+
+
+def context_peak(con, session_id: str, window_ms: int = 24 * 3600 * 1000) -> dict:
+    """Пик заполнения контекста сессии (максимум по ходам за сутки).
+
+    ⚠️ Нужен именно **пик**, а не последний ход: после компактизации рантайма
+    последний ход показывает ~10 %, и заполнение кажется нормальным — а сессия
+    уже была большой (замер 22.11: было 68 %, стало 10 %).
+    """
+    since = core.now_ms() - window_ms
+    r = core.rows(con, "select max(input_tokens + output_tokens + cache_read_tokens) "
+                       "from local_runtime_token_usage where session_id=? and ts>=?",
+                  (session_id, since))
+    return {"peak_tokens": int(r[0][0] or 0) if r else 0}
+
+
+def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
     """Вердикт по сессии: что с ней и надо ли что-то делать."""
     sid = sess["session_id"]
+    compacted = compacted or {}
     turn = last_turn(con, sid)
     outcome = terminal_outcome(con, sid)
     last_msg = last_message(con, sid)
     final_msg = last_message(con, sid, final_only=True)
     fill = context_fill(con, sid, sess.get("extra") or {})
-    kids = broken_subagents(con)
+    kids = broken_subagents(con, sid)
 
-    folder = sess.get("workspace_dir") or area.get("folder") or ""
     v = {
         "session_id": sid, "title": sess["title"][:70], "status": sess["status"],
         "archived": sess["archived"], "kind": sess["kind"], "verdict": "непонятно",
         "reason": "", "fill": fill.get("fill"), "turn_status": turn.get("status"),
         "updated_at_ms": sess["updated_at_ms"], "broken_kids": len(kids),
         "last_text": (last_msg.get("text") or "")[:400],
-        "role": role_of(folder), "workspace": folder, "probe": False,
     }
     if sess["archived"]:
         v["verdict"] = "готова"
@@ -337,7 +330,6 @@ def classify(area: dict, sess: dict, con) -> dict:
     if is_probe(con, sess):
         v["verdict"] = "проба"
         v["reason"] = "служебная сессия-проба лечащего"
-        v["probe"] = True
         return v
 
     # 1) Отказ провайдера по очкам — лечит лечащий, мы не лезем.
@@ -367,9 +359,18 @@ def classify(area: dict, sess: dict, con) -> dict:
 
     # 4) Ход завершён — смотрим, закончена ли работа.
     if turn.get("status") == "completed" or outcome == "completed":
-        if fill.get("fill", 0) >= CONTEXT_LIMIT:
+        if compacted.get(sid):
+            v["verdict"] = "скомпактилась"
+            v["reason"] = ("рантайм сжал контекст (%s) — сессия дальше «тупеет», "
+                           "нужно корректно закрыть и открыть новую" % COMPACT_MARK)
+            return v
+        peak = context_peak(con, sid)
+        peak_fill = (100.0 * peak.get("peak_tokens", 0) / win) if win else 0.0
+        if peak_fill >= CONTEXT_ROTATE or fill.get("fill", 0) >= CONTEXT_LIMIT:
             v["verdict"] = "контекст заполнен"
-            v["reason"] = "занято %s%% контекста" % fill.get("fill")
+            v["reason"] = "пик %s%% контекста (сейчас %s%%)" % (
+                round(peak_fill, 1), fill.get("fill"))
+            v["peak_fill"] = round(peak_fill, 1)
             return v
         if kids:
             v["verdict"] = "есть оборванные субагенты"
@@ -391,7 +392,69 @@ def classify(area: dict, sess: dict, con) -> dict:
     return v
 
 
+def is_probe(con, sess: dict) -> bool:
+    """Проба лечащего — служебная сессия, а не работа владельца.
+
+    Два признака: заголовок («ping») и первая реплика пользователя («ping»).
+    Одного заголовка мало: пробу переименовали — и по заголовку она проходит
+    как обычная сессия (и ротация её закрывает). У пробы первая реплика всегда
+    ровно «ping» (`mcode exec --cwd … ping`).
+    """
+    if (sess.get("title") or "").strip().lower() in PROBE_TITLES:
+        return True
+    if con is None:
+        return False
+    r = core.rows(con, "select data_json from local_runtime_message_rows "
+                       "where session_id=? and role='user' order by id asc limit 1",
+                  (sess.get("session_id") or "",))
+    if not r:
+        return False
+    try:
+        data = json.loads(r[0][0] or "{}")
+    except ValueError:
+        return False
+    return (data.get("msg_content") or "").strip().lower() in PROBE_TEXTS
+
+
+def probe_of(area: dict, sess: dict) -> bool:
+    """Проба ли это — без уже открытого соединения с базой."""
+    con = core.connect(core.area_db(area["dir"]))
+    try:
+        return is_probe(con, sess)
+    finally:
+        if con:
+            con.close()
+
+
 # ────────────────────────────────────────────────────────── действия
+
+def live_manager_session(area: dict) -> str:
+    """Живая сессия Управляющего в области (id или пусто).
+
+    «Живая» = идёт ход либо рантайм считает сессию занятой. Одна такая сессия на
+    область — и всё, что запускает вторую (оживление, ручное открытие), должно
+    остановиться: два писателя в одном worktree (G679).
+    """
+    if area.get("slug") not in MANAGER_AREAS:
+        return ""
+    con = core.connect(core.area_db(area["dir"]))
+    if not con:
+        return ""
+    try:
+        for s in sessions_of(area["dir"]):
+            if s["archived"] or s["kind"] != "conversation":
+                continue
+            if is_probe(con, s):
+                continue
+            turn = last_turn(con, s["session_id"])
+            if turn.get("status") == "accepted" and not turn.get("completed_at_ms"):
+                return s["session_id"]
+            if s["status"] == "started":
+                return s["session_id"]
+    finally:
+        con.close()
+    return ""
+
 
 def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
                      force: bool = False) -> dict:
@@ -433,18 +496,20 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
     return {"ok": bool(proc and proc.returncode == 0), "why": out[-400:]}
 
 
-def new_session(area: dict, prompt: str) -> dict:
-    """Открыть НОВУЮ сессию в области с начальной командой."""
+def new_session(area: dict, prompt: str, force: bool = False) -> dict:
+    """Открыть НОВУЮ сессию в области с начальной командой.
+
+    В области Управляющего — только если там нет живой сессии (один
+    Управляющий на область, G679); `force` обходит запрет.
+    """
+    if not force:
+        busy = live_manager_session(area)
+        if busy:
+            return {"ok": False, "why": "в области уже живая сессия Управляющего %s — "
+                                        "вторая не открывается (один Управляющий на область)" % busy[:12]}
     folder = area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
         return {"ok": False, "why": "папка проекта недоступна: %s" % folder}
-    # Guard: в области — одна живая сессия той же роли (G679). Второго
-    # Управляющего не открываем: два писателя на одной ветке (ADR-0011).
-    peer = occupied_peer(survey(area, core.read_state(core.SESSION_STATE)),
-                         {"session_id": "", "role": role_of(folder), "workspace": folder})
-    if peer:
-        return {"ok": False, "why": "место занято: живая сессия той же роли %s"
-                % peer["session_id"][:12]}
     logs = core.LOCAL / "sessionwatch-sends.log"
     logs.parent.mkdir(parents=True, exist_ok=True)
     with open(logs, "a", encoding="utf-8") as logfile:
@@ -623,20 +688,6 @@ REVIVE_PROMPT = (
 )
 
 
-# ────────────────────────────────────────────────────── отпечаток своего кода
-
-def self_stamp() -> tuple:
-    """Отпечаток кода демона: файл изменился — процесс надо перезапустить."""
-    out = []
-    for p in (Path(__file__).resolve(), Path(core.__file__).resolve()):
-        try:
-            st = p.stat()
-            out.append((str(p), int(st.st_mtime), st.st_size))
-        except OSError:
-            out.append((str(p), 0, 0))
-    return tuple(out)
-
-
 # ────────────────────────────────────────────────────────── проход демона
 
 def survey(area: dict, state: dict) -> list:
@@ -645,13 +696,14 @@ def survey(area: dict, state: dict) -> list:
     if not con:
         return []
     out = []
+    compacted = compacted_sessions(area["dir"])
     try:
         for sess in sessions_of(area["dir"]):
             if sess["kind"] != "conversation":
                 continue
             if sess["updated_at_ms"] and core.now_ms() - sess["updated_at_ms"] < 5 * 60 * 1000:
                 pass  # свежая сессия — всё равно показываем, но не трогаем
-            out.append(classify(area, sess, con))
+            out.append(classify(area, sess, con, compacted))
     finally:
         con.close()
     return out
@@ -664,20 +716,19 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
         slug = area["slug"]
         last = int((state.get("revived") or {}).get(v["session_id"]) or 0)
         cool = int(time.time()) - last < REVIVE_COOLDOWN
-        if v["verdict"] in ("готова", "работает", "кончились очки", "ждёт владельца",
-                            "проба", "непонятно"):
+        if v["verdict"] in ("готова", "работает", "кончились очки", "ждёт владельца"):
             continue
-        if v["verdict"] in ("контекст заполнен", "упала по сети", "брошена",
-                            "есть оборванные субагенты"):
-            # Guard «одна живая сессия на роль» (G679): пока в области жива
-            # сессия той же роли в том же worktree — место занято, эту не трогаем.
-            peer = occupied_peer(verdicts, v)
-            if peer:
-                actions.append({"session": v["session_id"], "action": "место занято — не трогаем",
-                                "peer": peer["session_id"]})
-                core.log("СЕССИИ: %s — %s не трогаем: место занято (живая сессия %s той же роли)" % (
-                    slug, v["session_id"][:12], peer["session_id"][:12]))
+        if v["verdict"] == "скомпактилась":
+            if dry_run:
+                actions.append({"session": v["session_id"], "action": "ротация после компактизации (сухой прогон)"})
                 continue
+            sess = {"session_id": v["session_id"], "title": v["title"],
+                    "workspace_dir": area.get("folder", "")}
+            rep = rotate_session(area, sess)
+            actions.append({"session": v["session_id"], "action": "ротация после компактизации", "report": rep})
+            core.log("СЕССИИ: %s — сессия %s сжата рантаймом, ротирую: %s" % (
+                slug, v["session_id"][:12], rep.get("why")))
+            continue
         if v["verdict"] == "контекст заполнен":
             if dry_run:
                 actions.append({"session": v["session_id"], "action": "ротация (сухой прогон)"})
@@ -713,6 +764,9 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                 slug, v["session_id"][:12], res.get("why")))
             continue
         if v["verdict"] in ("брошена", "есть оборванные субагенты"):
+            if area["slug"] in MANAGER_AREAS and live_manager_session(area) not in ("", v["session_id"]):
+                actions.append({"session": v["session_id"], "action": "место занято (один Управляющий на область)"})
+                continue
             # «Ход завис» сюда НЕ входит: сорвать зависший ход и положить
             # «Продолжай» в начало умеет лечащий (перезапуск области) — если
             # послать «Продолжай» сюда, оно встанет в очередь за висящим ходом
@@ -831,10 +885,6 @@ def cli_send(args) -> int:
     if not sess:
         print("сессии нет")
         return 1
-    if not getattr(args, "force", False) and probe_of(area, sess):
-        print(json.dumps({"ok": False, "why": "это проба лечащего — сообщение не отправлено"},
-                         ensure_ascii=False))
-        return 1
     res = send_to_session(area, sess, text, background=False)
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("ok") else 1
@@ -879,8 +929,7 @@ def cli_rotate(args) -> int:
         print("сессии нет")
         return 1
     if not getattr(args, "force", False) and probe_of(area, sess):
-        print(json.dumps({"ok": False, "why": "это проба лечащего — ротация запрещена"},
-                         ensure_ascii=False))
+        print("это служебная сессия-проба — ротировать её нельзя (--force — если очень надо)")
         return 1
     rep = rotate_session(area, sess)
     print(json.dumps(rep, ensure_ascii=False, indent=2)[:3000])
@@ -941,17 +990,16 @@ def main() -> int:
         return 0
 
     core.log("СЕССИИ: сторож запущен")
-    stamp = self_stamp()
+    stamp = core.script_stamp(Path(__file__))
     while True:
-        if self_stamp() != stamp:
-            # Раскатали новый код: живой процесс держит старую версию в памяти,
-            # и фикс в файле не действует, пока демон жив (находка 22.11).
-            core.log("СЕССИИ: код сторожа изменился — перезапускаюсь")
-            if core.supervisor_alive():
-                return 0                      # супервизор поднимет свежий процесс
-            core.respawn_self()
-            return 0
         try:
+            if core.script_stamp(Path(__file__)) != stamp:
+                core.log("СЕССИИ: файл сторожа изменился — перезапускаюсь "
+                         "(правка на диске не действует в живом процессе)")
+                if core.supervisor_alive():
+                    return 0              # супервизор поднимет свежий процесс
+                core.respawn_self()
+                return 0
             cycle(core.read_state(core.SESSION_STATE), dry_run=False)
         except Exception as exc:  # noqa: BLE001
             core.log("СЕССИИ: сбой прохода: %s" % exc)
