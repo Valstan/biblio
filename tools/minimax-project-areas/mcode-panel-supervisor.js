@@ -27,6 +27,7 @@ const PANEL_SCRIPT = path.join(BIN, 'mcode-panel.js');
 const HEALER_SCRIPT = path.join(BIN, 'minimax-autheal.py');
 const NETWATCH_SCRIPT = path.join(BIN, 'minimax-netwatch.py');
 const SESSIONWATCH_SCRIPT = path.join(BIN, 'minimax-sessionwatch.py');
+const CORE_SCRIPT = path.join(BIN, 'minigen_core.py');
 const PANEL_PORT = 8099;
 const CTRL_PORT = 8098;
 const LOCAL = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local');
@@ -208,10 +209,36 @@ function startWatchers() {
         watchers = watchers.filter((w) => w.child !== child);
         if (desiredState() === 'running') setTimeout(startWatchers, 5000);
       });
-      watchers.push({ name: spec.name, child });
+      watchers.push({ name: spec.name, child, script: spec.script, stamp: codeStamp(spec.script) });
     } catch (e) {
       log(spec.name + ' не поднялся: ' + e.message);
     }
+  }
+}
+
+// Отпечаток кода сторожа: раскатали новую версию — сторож надо перезапустить.
+// Иначе демон до конца жизни работает на старом коде: правка в файле не
+// действует, пока процесс жив (находка 22.11 — фикс не вступил в силу).
+function codeStamp(script) {
+  const parts = [];
+  for (const f of [script, CORE_SCRIPT]) {
+    try {
+      const st = fs.statSync(f);
+      parts.push(f + ':' + st.mtimeMs + ':' + st.size);
+    } catch (e) {
+      parts.push(f + ':-');
+    }
+  }
+  return parts.join('|');
+}
+
+function restartWatchersOnCodeChange() {
+  for (const w of watchers.slice()) {
+    const stamp = codeStamp(w.script);
+    if (!stamp || stamp === w.stamp) continue;
+    log(w.name + ': код изменился — перезапускаю сторожа');
+    w.stamp = stamp;
+    try { w.child.kill(); } catch {}
   }
 }
 
@@ -326,6 +353,9 @@ const server = http.createServer((req, res) => {
 
 ensureDir();
 log('супервизор стартует, pid ' + process.pid);
+
+// Сторож перезапускается не только по смерти процесса, но и по раскатке кода.
+setInterval(restartWatchersOnCodeChange, 30000);
 
 // Экземплярность — по самому порту, а не по pid в файле: pid в Windows
 // переиспользуется, и старый lock-файл мог «выдать» чужой процесс (G633).
