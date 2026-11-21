@@ -1,4 +1,4 @@
-// Супервизор МиниГен — тихий, без окон.
+﻿// Супервизор МиниГен — тихий, без окон.
 //
 // Зачем (15.11.2026, просьба владельца):
 //   * окно терминала от автозапуска пугало: закрыть его = убить и сторожа, и
@@ -25,6 +25,8 @@ const HOME = process.env.USERPROFILE;
 const BIN = path.join(HOME, 'bin');
 const PANEL_SCRIPT = path.join(BIN, 'mcode-panel.js');
 const HEALER_SCRIPT = path.join(BIN, 'minimax-autheal.py');
+const NETWATCH_SCRIPT = path.join(BIN, 'minimax-netwatch.py');
+const SESSIONWATCH_SCRIPT = path.join(BIN, 'minimax-sessionwatch.py');
 const PANEL_PORT = 8099;
 const CTRL_PORT = 8098;
 const LOCAL = process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local');
@@ -43,6 +45,24 @@ function log(line) {
 }
 
 function ensureDir() { try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch {} }
+
+// Прокси-переменные для дочерних процессов.
+// ⚠️ Супервизор унаследовал переменные от момента своего старта; если сетевой
+// сторож починил мёртвый прокси (порт 10809 → 10808), новые процессы
+// должны получить ИСПРАВЛЕННЫЕ значения, иначе `mcode` снова упадёт с
+// «Connection error». Значения берём из файла, который пишет сторож.
+const PROXY_ENV_FILE = path.join(LOG_DIR, 'proxy-env.json');
+
+function childEnv() {
+  const env = { ...process.env };
+  try {
+    const px = JSON.parse(fs.readFileSync(PROXY_ENV_FILE, 'utf8'));
+    for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY']) {
+      if (px[k]) env[k] = px[k];
+    }
+  } catch {}
+  return env;
+}
 
 // ────────────────────────────── состояние ──────────────────────────────
 
@@ -83,11 +103,12 @@ function startPanel() {
     cwd: BIN,
     windowsHide: true,          // окна не создаём
     stdio: 'ignore',
-    env: { ...process.env },
+    env: childEnv(),
   });
   const pid = panel.pid;
   log('панель запущена, pid ' + pid);
   startHealer();
+  startWatchers();
   panel.on('exit', (code, signal) => {
     log('панель завершилась (code=' + code + ', signal=' + signal + ')');
     panel = null;
@@ -108,6 +129,7 @@ function stopPanel() {
     panel = null;
   }
   stopHealer();
+  stopWatchers();
   log('панель остановлена по команде владельца');
   return { ok: true };
 }
@@ -130,7 +152,7 @@ function startHealer() {
       cwd: BIN,
       windowsHide: true,
       stdio: 'ignore',
-      env: { ...process.env },
+      env: childEnv(),
     });
     log('авто-лечение запущено, pid ' + healer.pid);
     healer.on('exit', (code, signal) => {
@@ -149,6 +171,67 @@ function stopHealer() {
     healer = null;
     log('авто-лечение остановлено');
   }
+}
+
+// ── Сторожа сети и сессий (21.11.2026, заказ владельца) ────────────────────
+// Живут рядом с панелью: поднимаются вместе с ней, перезапускаются при падении.
+//
+// Отдельные процессы, а не часть лечащего: лечащий лечит АККАУНТЫ (отказ по
+// очкам), сетевой сторож — СЕТЬ (интернет, VPN, доступ к модели), сторож
+// сессий — СЕССИИ (работа стоит / контекст забит). Разные кулдауны, разные
+// правила, разные журналы — смешивать их в одном цикле нельзя.
+let watchers = [];
+
+function watcherAlive(w) { return !!(w && w.child && w.child.exitCode === null && !w.child.killed); }
+
+function startWatchers() {
+  const specs = [
+    { name: 'сетевой сторож', script: NETWATCH_SCRIPT },
+    { name: 'сторож сессий', script: SESSIONWATCH_SCRIPT },
+  ];
+  for (const spec of specs) {
+    if (watchers.some((w) => w.name === spec.name && watcherAlive(w))) continue;
+    if (!fs.existsSync(spec.script)) {
+      log(spec.name + ': файла нет — ' + spec.script);
+      continue;
+    }
+    try {
+      const child = spawn('python', [spec.script], {
+        cwd: BIN,
+        windowsHide: true,
+        stdio: 'ignore',
+        env: childEnv(),
+      });
+      log(spec.name + ' запущен, pid ' + child.pid);
+      child.on('exit', (code, signal) => {
+        log(spec.name + ' завершился (code=' + code + ', signal=' + signal + ')');
+        watchers = watchers.filter((w) => w.child !== child);
+        if (desiredState() === 'running') setTimeout(startWatchers, 5000);
+      });
+      watchers.push({ name: spec.name, child });
+    } catch (e) {
+      log(spec.name + ' не поднялся: ' + e.message);
+    }
+  }
+}
+
+function stopWatchers() {
+  for (const w of watchers) { try { w.child.kill(); } catch {} }
+  watchers = [];
+  log('сторожа сети и сессий остановлены');
+}
+
+// Перезапуск ПАНЕЛИ и ЛЕЧАЩЕГО без остановки сторожей.
+// Нужен сетевому сторожу: когда он меняет прокси, старый процесс новых
+// переменных окружения не наследует — контур надо переподнять. Самого
+// сетевого сторожа останавливать нельзя: он на середине восстановления.
+function restartContour() {
+  if (panel) { try { panel.kill(); } catch {} panel = null; }
+  stopHealer();
+  setState('running');
+  log('перезапуск контура (панель + лечащий) по команде сторожа');
+  setTimeout(startPanel, 1200);
+  return { ok: true };
 }
 
 function restartPanel() {
@@ -198,7 +281,8 @@ async function act(what){
 async function refresh(){
   try{
     const r=await (await fetch('/status')).json();
-    document.getElementById('st').innerHTML='состояние: <b>'+r.state+'</b> · панель '+(r.running?'<span class="ok">работает</span> (pid '+r.pid+')':'остановлена')+' · супервизор: pid '+r.supervisor;
+    document.getElementById('st').innerHTML='состояние: <b>'+r.state+'</b> · панель '+(r.running?'<span class="ok">работает</span> (pid '+r.pid+')':'остановлена')+' · супервизор: pid '+r.supervisor+
+      '<br>сторожа: '+((r.watchers&&r.watchers.length)?r.watchers.map(w=>w.name+' (pid '+w.pid+')').join(', '):'нет');
   }catch(e){ document.getElementById('st').textContent='супервизор не отвечает'; }
 }
 refresh(); setInterval(refresh,5000);
@@ -214,7 +298,13 @@ const server = http.createServer((req, res) => {
     });
     res.end(JSON.stringify(obj));
   };
-  const status = () => ({ running: panelAlive(), state: desiredState(), pid: panel ? panel.pid : null, supervisor: process.pid });
+  const status = () => ({
+    running: panelAlive(),
+    state: desiredState(),
+    pid: panel ? panel.pid : null,
+    supervisor: process.pid,
+    watchers: watchers.filter(watcherAlive).map((w) => ({ name: w.name, pid: w.child.pid })),
+  });
 
   if (p === '/' || p === '/index.html') {
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -224,6 +314,10 @@ const server = http.createServer((req, res) => {
   if (p === '/start') { const r = startPanel(); return json(200, Object.assign(r, status())); }
   if (p === '/stop') { const r = stopPanel(); return json(200, Object.assign(r, status())); }
   if (p === '/restart') { const r = restartPanel(); return json(200, Object.assign(r, status())); }
+  // Перезапуск контура (панель + лечащий) без остановки сторожей — зовёт
+  // сетевой сторож после смены прокси (старый процесс не наследует новые
+  // переменные окружения).
+  if (p === '/restart-contour') { const r = restartContour(); return json(200, Object.assign(r, status())); }
   res.writeHead(404);
   res.end('not found');
 });
