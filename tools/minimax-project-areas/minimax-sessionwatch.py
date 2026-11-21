@@ -1,4 +1,4 @@
-"""МиниГен — сторож сессий: понимает, что с сессиями происходит, и оживляет те,
+﻿"""МиниГен — сторож сессий: понимает, что с сессиями происходит, и оживляет те,
 которые встали. Плюс — ротация сессии, когда её контекст забит.
 
 Задача (заказ владельца 21.11.2026), дословно:
@@ -66,12 +66,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import minigen_core as core  # noqa: E402
 
 BALANCE_CODE = 50110
+# Код провайдера «соединение с моделью оборвалось» (21.11: `50113`,
+# error_message «Connection error.»). Это сеть, а не аккаунт.
+NET_CODE = 50113
 # Признаки сетевого сбоя в тексте ошибки рантайма.
 NET_MARKERS = ("fetch failed", "econnrefused", "econnreset", "etimedout",
                 "enotfound", "ehostunreach", "enetunreach", "socket hang up",
-                "network error", "network request failed", "connection closed",
-                "not available in your country", "unauthorized", "forbidden",
-                "request timed out", "dns")
+                "network error", "network request failed", "connection error",
+                "connection closed", "not available in your country",
+                "unauthorized", "forbidden", "request timed out", "dns")
 FINAL_MARKERS = ("готово", "закрыто", "завершено", "сделано", "итог", "сводка",
                  "работа завершена", "закрытие сессии", "финальная сводка",
                  "готово.", "закрыто.")
@@ -257,7 +260,7 @@ def classify(area: dict, sess: dict, con) -> dict:
     # 3) Упавший ход: сеть или нет?
     if turn.get("status") == "failed" or sess["status"] == "error" or outcome == "failed":
         blob = ("%s %s" % (sess["error_message"] or "", turn.get("input_json") or "")).lower()
-        net = any(m in blob for m in NET_MARKERS)
+        net = any(m in blob for m in NET_MARKERS) or sess["error_code"] == NET_CODE
         v["verdict"] = "упала по сети" if net else "ошибка"
         v["reason"] = "ход упал: %s" % ((sess["error_message"] or "без текста")[:120])
         return v
@@ -527,8 +530,6 @@ def survey(area: dict, state: dict) -> list:
 def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
     """Действия по вердиктам: оживление и ротация."""
     actions = []
-    net_state = core.read_state(core.NET_STATE)
-    recovered_at = int(net_state.get("recovered_at") or 0)
     for v in verdicts:
         slug = area["slug"]
         last = int((state.get("revived") or {}).get(v["session_id"]) or 0)
@@ -546,29 +547,41 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
             core.log("СЕССИИ: %s — ротация: %s" % (slug, rep.get("why")))
             continue
         if v["verdict"] == "упала по сети":
-            # Ждём, пока сторож сети вернёт связь.
-            if not recovered_at or core.now_ms() - recovered_at > RECOVERY_WAIT:
+            # Поднимаем, когда сеть **сейчас** в порядке (по данным сетевого
+            # сторожа) и сессия упала не сейчас (иначе ход ещё качается).
+            net = core.read_state(core.NET_STATE).get("last_run") or {}
+            if not net.get("stable"):
                 actions.append({"session": v["session_id"], "action": "ждём сеть"})
+                continue
+            failed_at = int(v.get("updated_at_ms") or 0)
+            if failed_at and core.now_ms() - failed_at < 120000:
+                actions.append({"session": v["session_id"], "action": "ход ещё мог упасть — ждём"})
                 continue
             if cool:
                 continue
             if dry_run:
                 actions.append({"session": v["session_id"], "action": "«Продолжай» после сети (сухой прогон)"})
                 continue
-            res = send_to_session(area, {"workspace_dir": area.get("folder", "")},
+            res = send_to_session(area, {"session_id": v["session_id"],
+                                  "workspace_dir": area.get("folder", "")},
                                   REVIVE_PROMPT, background=True)
             state.setdefault("revived", {})[v["session_id"]] = int(time.time())
             actions.append({"session": v["session_id"], "action": "«Продолжай» после сети", "result": res})
             core.log("СЕССИИ: %s — сессия %s упала по сети, связь вернулась: %s" % (
                 slug, v["session_id"][:12], res.get("why")))
             continue
-        if v["verdict"] in ("брошена", "ход завис", "есть оборванные субагенты"):
+        if v["verdict"] in ("брошена", "есть оборванные субагенты"):
+            # «Ход завис» сюда НЕ входит: сорвать зависший ход и положить
+            # «Продолжай» в начало умеет лечащий (перезапуск области) — если
+            # послать «Продолжай» сюда, оно встанет в очередь за висящим ходом
+            # и не разбудит нитку (та самая беда, что чинили 18.11).
             if cool:
                 continue
             if dry_run:
                 actions.append({"session": v["session_id"], "action": "«Продолжай» (сухой прогон)"})
                 continue
-            res = send_to_session(area, {"workspace_dir": area.get("folder", "")},
+            res = send_to_session(area, {"session_id": v["session_id"],
+                                  "workspace_dir": area.get("folder", "")},
                                   REVIVE_PROMPT, background=True)
             state.setdefault("revived", {})[v["session_id"]] = int(time.time())
             actions.append({"session": v["session_id"], "action": "«Продолжай»", "result": res})
