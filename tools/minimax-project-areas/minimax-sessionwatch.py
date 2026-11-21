@@ -299,6 +299,8 @@ def occupied_peer(verdicts: list, v: dict) -> dict:
             continue
         if peer.get("archived"):
             continue
+        if peer.get("probe"):
+            continue          # проба не «держит» роль: она лежит в том же worktree
         if peer.get("verdict") not in ALIVE_VERDICTS:
             continue
         return peer
@@ -324,7 +326,7 @@ def classify(area: dict, sess: dict, con) -> dict:
         "reason": "", "fill": fill.get("fill"), "turn_status": turn.get("status"),
         "updated_at_ms": sess["updated_at_ms"], "broken_kids": len(kids),
         "last_text": (last_msg.get("text") or "")[:400],
-        "role": role_of(folder), "workspace": folder,
+        "role": role_of(folder), "workspace": folder, "probe": False,
     }
     if sess["archived"]:
         v["verdict"] = "готова"
@@ -335,6 +337,7 @@ def classify(area: dict, sess: dict, con) -> dict:
     if is_probe(con, sess):
         v["verdict"] = "проба"
         v["reason"] = "служебная сессия-проба лечащего"
+        v["probe"] = True
         return v
 
     # 1) Отказ провайдера по очкам — лечит лечащий, мы не лезем.
