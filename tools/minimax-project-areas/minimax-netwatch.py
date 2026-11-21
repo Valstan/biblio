@@ -63,6 +63,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -255,6 +256,83 @@ def happ_scheme(action: str) -> bool:
         return False
 
 
+def machine_hwid() -> str:
+    """Windows MachineGuid — им Happ подписывает запрос (заголовок X-HWID).
+
+    Провайдер подписки NextGenVPN отдаёт список серверов **только** с этим
+    заголовком: без него — 404 (проверено 22.11: с `X-HWID: <MachineGuid>`
+    приходит 200 и 8898 байт, без него — 404 и 0 байт).
+    """
+    if winreg is None:
+        return ""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Cryptography") as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+            return str(value)
+    except OSError:
+        return ""
+
+
+def fetch_happ_servers() -> list:
+    r"""Список серверов Happ: тянем его подписку и разбираем.
+
+    Кэш — `%LOCALAPPDATA%\mcode-web\happ-servers.json` (12 ч).
+    """
+    cache = core.LOCAL / "happ-servers.json"
+    cached = core.read_state(cache)
+    if cached.get("servers"):
+        if core.now_ms() - int(cached.get("at") or 0) < 12 * 3600 * 1000:
+            return cached["servers"]
+    url = subscription_url()
+    hwid = machine_hwid()
+    if not url or not hwid:
+        return (cached.get("servers") or [])
+    try:
+        req = urllib.request.Request(url, headers={"X-HWID": hwid,
+                                                   "User-Agent": "Happ/1.6.16"})
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001
+        core.log("СЕТЬ: подписку Happ не прочитать (%s) — беру кэш" % exc)
+        return (cached.get("servers") or [])
+    servers = []
+    for line in raw.replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(vless|vmess|trojan|ss)://[^@]*@([^/?#]+)\?[^#]*#?(.*)$", line)
+        if not m:
+            continue
+        scheme, hp, frag = m.groups()
+        host, _, port = hp.rpartition(":")
+        name = urllib.parse.unquote(frag) if frag else ""
+        servers.append({"name": name, "host": host.strip("[]"), "port": port,
+                        "scheme": scheme})
+    if servers:
+        core.write_state(cache, {"at": core.now_ms(), "servers": servers})
+        core.log("СЕТЬ: подписка Happ прочитана — серверов: %d" % len(servers))
+    return servers or (cached.get("servers") or [])
+
+
+def reg_delete(names) -> None:
+    """Убрать значения из реестра Happ."""
+    if winreg is None:
+        return
+    for name in names:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, HAPP_PREF_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            pass
+
+
 def port_listening(port: int) -> bool:
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command",
@@ -269,13 +347,10 @@ def port_listening(port: int) -> bool:
 def happ_candidates() -> list:
     """Список серверов Happ для переключения.
 
-    Источник — локальный файл `happ-servers.json` (его заполняет владелец
-    или сам сторож, когда подписка отвечает). Формат:
-        {"servers": [{"name": "...", "guid": "...", "host": "...", "port": "..."}]}
-    Файла нет ⇒ переключать сервер нечем, и сторож честно пишет об этом.
+    Формат элемента: {"name": ..., "host": ..., "port": ...} — ровно то, что
+    Happ пишет в реестр (`lastServerName/Host/Port`).
     """
-    data = core.read_state(HAPP_SERVERS_FILE)
-    return [s for s in (data.get("servers") or []) if s.get("host")]
+    return [s for s in (fetch_happ_servers() or []) if s.get("host")]
 
 
 def subscription_url() -> str:
@@ -289,7 +364,12 @@ def subscription_url() -> str:
 
 
 def pick_candidate(current_host: str) -> dict:
-    """Кандидат на смену: первый из файла, кто не текущий и не в «плохом» списке."""
+    r"""Кандидат на смену: первый из подписки Happ, кто не текущий и не в «плохом» списке.
+
+    Источник — подписка самого Happ (`X-HWID`), кэш в
+    `%LOCALAPPDATA%\mcode-web\happ-servers.json`; раньше список лежал в
+    зашифрованной `subs.db` и был недоступен.
+    """
     bad = set(core.read_state(core.NET_STATE).get("bad_servers") or [])
     for srv in happ_candidates():
         if srv.get("host") == current_host:
@@ -319,12 +399,14 @@ def switch_happ_server() -> dict:
            ("lastServer", "lastServerName", "lastServerGuid", "lastServerHost", "lastServerPort")}
     new = {
         "lastServerName": srv.get("name") or cur.get("lastServerName"),
-        "lastServerGuid": srv.get("guid") or cur.get("lastServerGuid"),
         "lastServerHost": srv.get("host"),
         "lastServerPort": srv.get("port") or cur.get("lastServerPort"),
     }
     if not reg_write(new):
         return {"ok": False, "why": "реестр Happ не пишется"}
+    # `lastServerGuid`/`lastServer` — внутренние идентификаторы Happ; чужие
+    # значения только мешают. Убираем ⇒ Happ ищет сервер по имени и хосту.
+    reg_delete(("lastServerGuid", "lastServer"))
     happ_scheme("disconnect")
     time.sleep(3)
     happ_scheme("connect")
@@ -500,7 +582,15 @@ def proxy_state() -> dict:
         if proc.get(key) and reg.get(key) and proc[key] != reg[key]:
             out["stale_process"] = True
             out["dead"].append("process:%s" % key)
-    out["broken"] = bool(out["dead"]) or not (reg.get("HTTP_PROXY") or proc.get("HTTP_PROXY"))
+    # ⚠️ Важно (22.11): «сломаны переменные» и «сеть сломана» — РАЗНЫЕ вещи.
+    # Сеть сломана, только если мёртв прокси В РЕЕСТРЕ (его читают новые
+    # процессы). Расхождение «реестр ↔ процесс» — устаревшие переменные у уже
+    # работающих процессов: их надо освежить, но сеть при этом ЖИВА, и лечащему
+    # нельзя говорить «сеть не в порядке» (иначе он откладывает живые проверки
+    # и видит ложное «подозрение» — так было в 00:18:55).
+    reg_dead = [k for k, v in out["registry_ports"].items() if v["url"] and not v["listening"]]
+    out["registry_dead"] = reg_dead
+    out["broken"] = bool(reg_dead) or not reg.get("HTTP_PROXY")
     return out
 
 
@@ -534,8 +624,12 @@ def repair_proxy(cfg: dict) -> dict:
     state = proxy_state()
     if not state["broken"]:
         return {"ok": True, "why": "прокси-переменные в порядке", "changed": False}
-    core.log("СЕТЬ: прокси-переменные сломаны (%s) — чиню" %
-             ", ".join(state["dead"] or ["не заданы"]))
+    if state.get("stale_process") and not state.get("broken"):
+        core.log("СЕТЬ: процессы держат устаревшие прокси-переменные (%s) — освежаю "
+                 "(сеть при этом жива)" % ", ".join(state["dead"][:3]))
+    else:
+        core.log("СЕТЬ: прокси-переменные сломаны (%s) — чиню" %
+                 ", ".join(state["dead"] or ["не заданы"]))
 
     # 1) Реестр живой, процесс отстал — забираем правильные значения.
     reg = state["registry"]
@@ -683,6 +777,21 @@ def cycle(cfg: dict, state: dict, dry_run: bool = False) -> dict:
         core.write_state(core.NET_STATE, state)
         return report
 
+    # 0a) Только расхождение «реестр ↔ процесс»: сеть жива, но процессы держат
+    #     устаревшие переменные ⇒ освежаем их и идём дальше.
+    if proxy.get("stale_process"):
+        if dry_run:
+            report["action"] = "освежение прокси-переменных у процессов (сухой прогон)"
+        else:
+            rep = repair_proxy(cfg)
+            report["proxy_repair"] = rep
+            report["action"] = "освежены прокси-переменные у процессов"
+            if rep.get("ok"):
+                report["probes"] = probes = [probe_path(p, cfg) for p in paths]
+                alive = [p for p in probes if p.get("alive")]
+                report["stable"] = bool(alive)
+            core.log("СЕТЬ: прокси-переменные у процессов освежены (%s)" % rep.get("why"))
+
     # Плановый заход к вендору — не каждый проход (лишний трафик).
     state["cycles"] = int(state.get("cycles") or 0) + 1
     if int(state.get("cycles") or 0) % VENDOR_EVERY == 1:
@@ -789,8 +898,16 @@ def main() -> int:
 
     # демон
     core.log("СЕТЬ: сторож запущен")
+    stamp = core.script_stamp(Path(__file__))
     while True:
         try:
+            if core.script_stamp(Path(__file__)) != stamp:
+                core.log("СЕТЬ: файл сторожа изменился — перезапускаюсь "
+                         "(правка на диске не действует в живом процессе)")
+                if core.supervisor_alive():
+                    return 0              # супервизор поднимет свежий процесс
+                core.respawn_self()
+                return 0
             cycle(cfg, core.read_state(core.NET_STATE), dry_run=False)
         except Exception as exc:  # noqa: BLE001
             core.log("СЕТЬ: сбой прохода: %s" % exc)
