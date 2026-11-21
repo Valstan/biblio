@@ -365,6 +365,9 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
                            "нужно корректно закрыть и открыть новую" % COMPACT_MARK)
             return v
         peak = context_peak(con, sid)
+        # Окно контекста — из context_fill() (там оно и считается);
+        # раньше здесь был NameError: демон падал на каждом проходе.
+        win = int(fill.get("window") or 0)
         peak_fill = (100.0 * peak.get("peak_tokens", 0) / win) if win else 0.0
         if peak_fill >= CONTEXT_ROTATE or fill.get("fill", 0) >= CONTEXT_LIMIT:
             v["verdict"] = "контекст заполнен"
