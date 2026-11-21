@@ -667,7 +667,10 @@ def pull_account(switch, area: dict):
                 log("%s: Карман отдал негодный токен — пробую следующий (попытка %s из %s)" % (
                     area["title"], attempt, MAX_PULL_TRIES))
                 continue
-            return rc, "аккаунт не получен (пул Кармана пуст или отказ)"
+            # rc == 1 — это отказ или сеть, а НЕ «пул пуст» (пул пуст — это rc == 2
+            # с честным текстом выше). Причина отказа напечатана строкой выше:
+            # 21.11 сеть была убита прокси, а в журнале читалось «пул пуст».
+            return rc, "Карман ответил отказом — причина в строке выше"
         rec = (switch.read_store(area["dir"]).get("records") or {}).get(switch.store_key(area["dir"])) or {}
         exp = int(rec.get("expiresAtMs") or 0)
         life = (exp - time.time() * 1000) / 60000.0
@@ -806,7 +809,9 @@ def claim_bonus(switch, area_dir: Path) -> str:
         data=b"",
     )
     try:
-        with urllib.request.urlopen(req, timeout=20, context=switch.SSL_CTX) as resp:
+        # Напрямую, мимо локального прокси (см. пояснение в minimax-switch.py:
+        # 21.11 мёртвый HTTP-порт прокси ронял и этот запрос тоже).
+        with switch._open_direct_then_proxy(req, timeout=20) as resp:
             raw = resp.read().decode("utf-8")
         try:
             body = json.loads(raw) if raw.strip() else {}
@@ -839,10 +844,10 @@ def restart_area(slug: str) -> None:
     """Перезапуск области: стоп → старт (собственный каталог, свой AUMID, свой ярлык)."""
     ps = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"]
     subprocess.run(ps + [str(BIN / "mcode-project-stop.ps1"), "-Project", slug],
-                   capture_output=True, text=True, timeout=120)
+                   capture_output=True, text=True, errors="replace", timeout=120)
     time.sleep(3)
     subprocess.run(ps + [str(BIN / "mcode-project-start.ps1"), "-Project", slug],
-                   capture_output=True, text=True, timeout=180)
+                   capture_output=True, text=True, errors="replace", timeout=180)
 
 
 def broken_subagents(area_dir: Path) -> list:
@@ -1331,11 +1336,16 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
     """Поставить области новый аккаунт и продолжить её работу.
 
     **Общий путь** для автоматического лечения и для кнопки «Новый вход
-    (токен)» в панели: заказ владельца 18.11 — «сделай функционал такой же,
-    как и при автоматическом лечении: чтобы без перезагрузки десктопа
-    залогинился по новому токену и отправил сообщение „Продолжай“ сначала в
-    субагенты (если они есть и если они были прерваны), а потом в основной
-    чат».
+    (токен)» в панели.
+
+    Смена аккаунта = смена логина ⇒ десктоп ПЕРЕЗАГРУЖАЕТСЯ (заказ владельца
+    19.11: «сделай всетаки перезагрузку десктопного минимакса при смене логина
+    аккаунта, как было до этого»). Раньше (18.11) было наоборот — «без перезагрузки
+    десктопа»: рантайм новый токен принимал, а интерфейс оставался в старой
+    сессии — чат залипал, последних действий не видно.
+
+    Дальше сообщение «Продолжай» уходит сначала в субагенты (если они есть и если
+    они были прерваны), а потом в основной чат.
 
     Порядок «субагенты → основной чат» задан в самом тексте сообщения
     (`continue_prompt`).
@@ -1377,9 +1387,14 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
     res = claim_bonus(switch, area["dir"])
     log("%s: бонусные очки — %s" % (area["title"], res))
 
-    # Смена аккаунта БЕЗ перезапуска десктопа: токен и состояние уже в
-    # области (поколение выше, чем у приложения — десктоп подхватит его на
-    # следующем запросе). Перезапуск остаётся ЗАПАСНЫМ путём (откат).
+    # Смена аккаунта = СМЕНА ЛОГИНА. Перезагрузки десктопа НЕТ.
+    #
+    # Заказ владельца 19.11 (ночь): «убери перезагрузку приложения минимакса при смене
+    # аккаунта — это не помогает для разморозки залипшего чата, я нашёл другой способ его
+    # разморозки, вручную». Значит — как 18.11: новый access и состояние кладутся в
+    # токен-стор области (поколение выше, чем у приложения), и рантайм подхватывает их на
+    # следующем запросе. Интерфейс может остаться в старой сессии — залипший чат
+    # размораживает владелец, руками; лишний рестарт области тут не помогает.
     _state["activated"][slug] = int(time.time() * 1000)
     save_cooldowns()
     if area["dir"].name not in (switch.running_areas() or set()):
@@ -1389,10 +1404,40 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
     before = latest_turn(area["dir"])
     before_ms = before[2] if before else 0
     res = say_continue(area)
-    log("%s: «Продолжай» без перезапуска — %s" % (area["title"], res))
+    log("%s: «Продолжай» без перезагрузки — %s" % (area["title"], res))
     _state["probe_turn"][slug] = {"before_ms": before_ms, "at": time.time()}
     save_cooldowns()
     return True, res
+
+
+def network_unhealthy() -> str:
+    """Сеть сейчас сломана? Тогда «подозрение» лечить нельзя.
+
+    Замер 21.11.2026: прокси-переменные указывали на мёртвый порт `10809`
+    (живой — `10808`), и **все** живые проверки падали с «Connection error».
+    Лечащий видел это как «возможно, кончились очки» и лез бы лечить аккаунт,
+    хотя аккаунт был цел. Теперь перед живой проверкой спрашиваем сетевого
+    сторожа: если сеть/прокси сломаны — проверку не делаем и ждём.
+
+    Возвращает описание поломки (пусто — сеть в порядке).
+    """
+    try:
+        state = json.loads((Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" /
+                            "netwatch-state.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return ""
+    last = state.get("last_run") or {}
+    if last.get("stable") and not (last.get("proxy") or {}).get("broken"):
+        return ""
+    proxy = last.get("proxy") or {}
+    dead = proxy.get("dead") or []
+    if dead:
+        return "прокси-переменные сломаны: %s" % ", ".join(dead[:3])
+    if last.get("action") and last.get("action") not in ("всё живо", "нет"):
+        return "сеть: %s" % last.get("action")
+    if not last:
+        return ""
+    return "сеть: устойчивый доступ не подтверждён"
 
 
 def heal(area: dict, switch, force: bool = False) -> bool:
@@ -1460,6 +1505,14 @@ def heal(area: dict, switch, force: bool = False) -> bool:
                 area["title"], int(gap)))
 
     if diag["verdict"] == "подозрение" and not force:
+        # ⚠️ Сеть сломана ⇒ «подозрение» может быть не про аккаунт, а про
+        # прокси (21.11: все живые проверки падали с «Connection error» из-за
+        # мёртвого порта 10809). Спрашиваем сетевого сторожа и ждём.
+        net_problem = network_unhealthy()
+        if net_problem:
+            log("%s: подозрение, но сеть не в порядке (%s) — живую проверку не делаю, "
+                "лечение откладываю" % (area["title"], net_problem))
+            return False
         # Живая проверка стоит реального хода — при паузе 15 с её нельзя
         # делать каждый проход, иначе сама проверка станет источником нагрузки.
         last_probe = _state["probe"].get(slug, 0)

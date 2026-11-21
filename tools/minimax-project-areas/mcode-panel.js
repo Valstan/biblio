@@ -33,11 +33,17 @@ const HOME = process.env.USERPROFILE;
 const BIN = path.join(HOME, 'bin');
 const TOOL = path.join(BIN, 'minimax-switch.py');
 const HEALER = path.join(BIN, 'minimax-autheal.py');
+const NETWATCH = path.join(BIN, 'minimax-netwatch.py');
+const SESSIONWATCH = path.join(BIN, 'minimax-sessionwatch.py');
 const PROJECTS_FILE = path.join(BIN, 'mcode-project-areas.json');
 const AREAS_ROOT = path.join(HOME, '.minimax-areas');
 const JOURNAL_DIR = path.join(process.env.LOCALAPPDATA || path.join(HOME, 'AppData', 'Local'), 'mcode-web');
 const JOURNAL_FILE = path.join(JOURNAL_DIR, 'journal.log');
 const HEAL_STATE_FILE = path.join(JOURNAL_DIR, 'autheal-state.json');
+// Состояния сторожей (21.11.2026): сеть и сессии. Пишут их демоны,
+// панель только читает — источник правды один.
+const NET_STATE_FILE = path.join(JOURNAL_DIR, 'netwatch-state.json');
+const SESSION_STATE_FILE = path.join(JOURNAL_DIR, 'sessionwatch-state.json');
 
 // Расход пула лечащим: сколько аккаунтов область забрала за сутки и до какого
 // времени она на паузе. Читаем файл состояния лечащего (он и пишет туда).
@@ -354,6 +360,7 @@ const HTML = `<!DOCTYPE html>
  .sw:after{content:'';position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#9a9aa8;transition:left .15s,background .15s}
  .sw.on:after{left:22px;background:#6ee7a0}
  .sw:hover{filter:brightness(1.25)}
+ .netbox{max-width:1200px;margin-top:16px;padding:14px;background:#1c1c22;border:1px solid #2a2a33;border-radius:8px;font-size:13px}
 </style></head><body>
 <h1>МиниГен</h1>
 <div class="sub">Области проектов: каждая — отдельная копия приложения со своим проектом, своим входом и своими сессиями. Статус берётся живым запросом к панели MiniMax.</div>
@@ -367,6 +374,15 @@ const HTML = `<!DOCTYPE html>
 <thead><tr>
 <th>Проект</th><th>Запущена</th><th>Авто/Ручной</th><th>Действия</th><th>Аккаунт</th><th>Очки</th><th>Область</th>
 </tr></thead><tbody id="tb"></tbody></table>
+<div class="netbox" id="netbox">
+  <div class="row">
+    <b>Сеть и сессии</b>
+    <button class="p" onclick="checkNet()">Проверить сеть</button>
+    <button onclick="checkSessions()">Проверить сессии</button>
+    <span class="muted" id="netstamp"></span>
+  </div>
+  <div id="netbody" class="muted">загрузка…</div>
+</div>
 <div class="modal" id="alarm"><div class="mbox">
   <h2>Аларм МиниГена</h2>
   <div id="alarmText"></div>
@@ -430,6 +446,52 @@ async function load(){
   }
   const j=document.getElementById('jrn');
   j.innerHTML='<b>Журнал</b><br>'+(d.journal&&d.journal.length?d.journal.slice(0,14).map(x=>'<div>'+x+'</div>').join(''):'<div class="muted">пусто</div>');
+  renderNet(d);
+}
+function renderNet(d){
+  const net=d.net||{}, sess=d.sessions||{};
+  const nl=net.last_run||{}, sl=sess.last_run||{};
+  let h='<b>Сеть:</b> ';
+  if(!nl.at){
+    h+='<span class="muted">сетевой сторож ещё не отработал</span>';
+  }else{
+    for(const p of (nl.probes||[])){
+      h+='<span class="st '+(p.alive?'on':'off')+'">'+(p.name||'?')+'</span> '+
+         ((p.country?('страна '+p.country+' · '):'')+(p.ip||''))+
+         ' <span class="muted">'+(p.note||'')+'</span><br>';
+    }
+    h+='<span class="muted">действие: '+(nl.action||'-')+' · устойчивый доступ: '+(nl.stable?'да':'нет')+'</span>';
+  }
+  const areas=sl.areas||[];
+  let s='<br><b>Сессии:</b> ';
+  let any=false;
+  for(const a of areas){
+    const vs=(a.verdicts||[]).filter(function(v){return v.verdict!=='готова'&&v.verdict!=='проба';});
+    if(!vs.length) continue;
+    any=true;
+    s+='<br><span class="muted">'+a.slug+':</span> '+vs.map(function(v){
+      return v.session_id.slice(0,12)+' — '+v.verdict+(v.fill?(' ('+v.fill+'%)'):'');
+    }).join('; ');
+  }
+  if(!any) s+='<span class="muted">незакрытых дел нет</span>';
+  document.getElementById('netbody').innerHTML=h+s;
+  document.getElementById('netstamp').textContent='проход сети: '+(nl.at?new Date(nl.at).toLocaleTimeString('ru-RU'):'—')+' · сессий: '+(sl.at?new Date(sl.at).toLocaleTimeString('ru-RU'):'—');
+}
+async function checkNet(){
+  box.classList.add('show');
+  box.innerHTML='<b>Сеть:</b> проверяю пути и вендора…';
+  const r=await (await fetch('/api/net-check')).json();
+  box.innerHTML='<b>Сеть:</b> '+(r.ok?'проверка прошла.':'не вышло: '+(r.error||''))+
+    '<br><span class="muted">'+(r.out||'').replace(/\\n/g,'<br>').slice(-1200)+'</span>';
+  load();
+}
+async function checkSessions(){
+  box.classList.add('show');
+  box.innerHTML='<b>Сессии:</b> смотрю, что с ними (сухой прогон — ничего не трогаю)…';
+  const r=await (await fetch('/api/sessions-check')).json();
+  box.innerHTML='<b>Сессии:</b> '+(r.ok?'разбор сделан.':'не вышло: '+(r.error||''))+
+    '<br><span class="muted">'+(r.out||'').replace(/\\n/g,'<br>').slice(-1200)+'</span>';
+  load();
 }
 async function newAcc(slug){
   box.classList.add('show');
@@ -501,7 +563,26 @@ const server = http.createServer(async (req, res) => {
   if (p === '/api/state') {
     const list = await liveState(false);
     const acc = await accounts();
-    return json(200, { areas: list, accounts: acc, journal: readJournal(60), alarm: (healState().alarm || null) });
+    return json(200, { areas: list, accounts: acc, journal: readJournal(60), alarm: (healState().alarm || null),
+      net: readJson(NET_STATE_FILE), sessions: readJson(SESSION_STATE_FILE) });
+  }
+
+  // Ручная проверка сети и сессий — зовём те же демоны, что и под супервизором
+  // (одна реализация, никаких копий механики в панели).
+  if (p === '/api/net-check') {
+    const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+    const r = await run('python', [NETWATCH, '--once'], { env, timeout: 300000 });
+    const last = (r.out || '').trim().split('\n').slice(-1)[0] || '';
+    log('ручная проверка сети: ' + last);
+    return json(200, { ok: r.code === 0, out: r.out });
+  }
+
+  if (p === '/api/sessions-check') {
+    const env = { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' };
+    const r = await run('python', [SESSIONWATCH, '--once', '--dry-run'], { env, timeout: 300000 });
+    const last = (r.out || '').trim().split('\n').slice(-1)[0] || '';
+    log('ручная проверка сессий (сухой прогон): ' + last);
+    return json(200, { ok: r.code === 0, out: r.out });
   }
 
   // Новый вход — только по одной области и только по команде владельца.
