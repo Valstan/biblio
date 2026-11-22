@@ -375,13 +375,20 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
                 round(peak_fill, 1), fill.get("fill"))
             v["peak_fill"] = round(peak_fill, 1)
             return v
+        # ⚠️ ПОРЯДОК ПРАВИЛ (22.11, находка Управляющего): «итоговая сводка»
+        # проверяется ПЕРВОЙ. D-249 ⑤ (владелец: «работу реально законченную
+        # продолжать не надо принудительно») сильнее D-230 (будить сессии с
+        # оборванными субагентами): сессия со сводкой НЕ оживает, а её сироты —
+        # забота Управляющего (task_append), а не «Продолжай» в закрытую сессию.
+        if final_msg and looks_finished(final_msg.get("text")):
+            v["verdict"] = "готова"
+            v["reason"] = ("последний ход завершён, напечатана итоговая сводка"
+                           + (" · есть %d оборванных субагентов — их поднимает "
+                              "Управляющий (task_append)" % len(kids) if kids else ""))
+            return v
         if kids:
             v["verdict"] = "есть оборванные субагенты"
             v["reason"] = "%d оборванных субагентов — работа не закончена" % len(kids)
-            return v
-        if final_msg and looks_finished(final_msg.get("text")):
-            v["verdict"] = "готова"
-            v["reason"] = "последний ход завершён, напечатана итоговая сводка"
             return v
         if asks_owner(last_msg.get("text")):
             v["verdict"] = "ждёт владельца"
@@ -505,6 +512,11 @@ def new_session(area: dict, prompt: str, force: bool = False) -> dict:
     В области Управляющего — только если там нет живой сессии (один
     Управляющий на область, G679); `force` обходит запрет.
     """
+    # Прокси-переменные — из реестра (22.11, находка Управляющего): сетевой
+    # сторож мог починить мёртвый прокси, а вызывающий процесс держит старые
+    # значения ⇒ новый ход упал бы с «Connection error». В send_to_session()
+    # это уже есть, здесь — нет.
+    core.refresh_env()
     if not force:
         busy = live_manager_session(area)
         if busy:
