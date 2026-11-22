@@ -159,7 +159,7 @@ def last_message(con, session_id: str, final_only: bool = False) -> dict:
     except ValueError:
         return {}
     return {"id": r[0][0], "at": r[0][2] or 0, "msg_type": data.get("msg_type"),
-            "text": data.get("msg_content") or ""}
+            "text": data.get("msg_content") or "", "turn_id": data.get("turnId") or ""}
 
 
 def context_fill(con, session_id: str, extra: dict) -> dict:
@@ -310,7 +310,14 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
     turn = last_turn(con, sid)
     outcome = terminal_outcome(con, sid)
     last_msg = last_message(con, sid)
-    final_msg = last_message(con, sid, final_only=True)
+    # Финальный ответ хода — по метке САМОГО рантайма: assistant с msg_type=1 —
+    # это финальный ответ хода, и он привязан к turnId. Ответ из ПРОШЛОГО хода
+    # сводкой этого хода не считаем (22.11: ложное «Продолжай» в живую сессию —
+    # отчёт без слов «готово/закрыто» считался брошенной ниткой).
+    legacy_final = last_message(con, sid, final_only=True)
+    turn_id = turn.get("turn_id") or ""
+    final_msg = legacy_final if (not legacy_final.get("turn_id")
+                                  or legacy_final.get("turn_id") == turn_id) else {}
     fill = context_fill(con, sid, sess.get("extra") or {})
     kids = broken_subagents(con, sid)
 
@@ -386,16 +393,25 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
                            + (" · есть %d оборванных субагентов — их поднимает "
                               "Управляющий (task_append)" % len(kids) if kids else ""))
             return v
-        if kids:
-            v["verdict"] = "есть оборванные субагенты"
-            v["reason"] = "%d оборванных субагентов — работа не закончена" % len(kids)
-            return v
         if asks_owner(last_msg.get("text")):
             v["verdict"] = "ждёт владельца"
             v["reason"] = "последнее сообщение — вопрос владельцу"
             return v
+        # 22.11 (находка Управляющего): ход завершён, рантайм пометил его
+        # финальным ответом (msg_type=1), сирот нет ⇒ работа закончена. Раньше
+        # тут был только путь «сводка по ключевым словам» ⇒ обычный отчёт без
+        # слов «готово/закрыто» считался брошенной ниткой, и сторож слал
+        # «Продолжай» в живую сессию (ложное пробуждение 13:51).
+        if final_msg and not kids:
+            v["verdict"] = "готова"
+            v["reason"] = "ход завершён, у него есть финальный ответ — работа закончена"
+            return v
+        if kids:
+            v["verdict"] = "есть оборванные субагенты"
+            v["reason"] = "%d оборванных субагентов — работа не закончена" % len(kids)
+            return v
         v["verdict"] = "брошена"
-        v["reason"] = "ход завершён, но итоговой сводки нет"
+        v["reason"] = "ход завершён, но финального ответа нет (агент оборвался)"
         return v
 
     v["reason"] = "нет ходов"
