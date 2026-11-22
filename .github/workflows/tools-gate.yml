@@ -25,3 +25,5 @@ jobs:
           node-version: '20'
       - name: Приёмка панели «МиниГен»
         run: python3 tools/minimax-project-areas/check_panel.py --source-only
+      - name: Приёмка переключения серверов Happ
+        run: python3 tools/minimax-project-areas/test_minimax_netwatch_switch.py
