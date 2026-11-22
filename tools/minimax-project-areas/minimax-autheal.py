@@ -1269,6 +1269,16 @@ def probe_pending(area: dict) -> bool:
         stuck_now = stuck_turn(area)
         if age < PROBE_NO_TURN_TIMEOUT and not stuck_now:
             return True      # ещё рано — подождём следующего прохода
+        live = active_turn(area["dir"])
+        if live and not stuck_now:
+            # Живой ход: «Продолжай» стоит в очереди за ним и отработает после
+            # него. «Нового хода нет» — не значит «сессия мертва»: перезапуск
+            # десктопа тут срывал бы живую работу (23.11, 01:09 — так был
+            # перезапущен рабочий десктоп «Матрицы РМЗ»).
+            log("%s: «Продолжай» стоит в очереди за живым ходом %s — жду, "
+                "десктоп не трогаю"
+                % (area["title"], (live[1] if len(live) > 1 else "?")[:12]))
+            return True
         if stuck_now:
             log("%s: «Продолжай» лежит в очереди за зависшим ходом %s (сообщений нет %d с) — "
                 "жду дальше только бессмысленно" % (area["title"], stuck_now[0][:12], stuck_now[1]))
