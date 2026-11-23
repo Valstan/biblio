@@ -16,6 +16,7 @@ declare global {
       call(cmd: string, args?: Record<string, unknown>): Promise<unknown>
       openExternal(path: string): Promise<boolean>
       saveText(name: string, content: string): Promise<{ ok: boolean; path: string; error?: string }>
+      smoke: { csv: string }
       onEvent(handler: (event: { kind: string; message: string; alive: boolean }) => void): () => void
     }
   }

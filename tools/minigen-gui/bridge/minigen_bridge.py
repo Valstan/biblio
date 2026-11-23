@@ -363,9 +363,26 @@ class Bridge:
         ok, err = state.write_projects(cfg)
         if not ok:
             return {"error": "конфиг не записан: %s" % err}
-        self.core.log("Панель «МиниГен»: создана область %s (%s)" % (slug, title))
+        # Ярлык на рабочем столе — той же командой, что и для остальных
+        # областей (своя реализация = вторая правда).
+        shortcut_note = ""
+        maker = self.core.BIN / "make-mcode-project-shortcuts.ps1"
+        if maker.is_file():
+            res = _run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-WindowStyle", "Hidden", "-File", str(maker)], timeout=180)
+            shortcut_note = ("ярлыки пересозданы" if res["ok"]
+                             else "ярлыки не пересозданы: %s" % (res["err"] or "")[:120])
+        else:
+            shortcut_note = "нет скрипта ярлыков: %s" % maker
+        folder_note = ""
+        if folder and not Path(folder).is_dir():
+            folder_note = ("рабочая папка не найдена: %s — создай её (или git worktree) "
+                           "до запуска области" % folder)
+        self.core.log("Панель «МиниГен»: создана область %s (%s) — %s" % (
+            slug, title, shortcut_note or "без ярлыков"))
         return {"ok": True, "slug": slug, "dir": str(area_dir),
-                "auth_from": copied, "folder": folder}
+                "auth_from": copied, "folder": folder,
+                "shortcut": shortcut_note, "folder_note": folder_note}
 
     # ────────────────────────────────────────────────────────────── сессии
     def _area(self, slug: str) -> dict[str, Any]:

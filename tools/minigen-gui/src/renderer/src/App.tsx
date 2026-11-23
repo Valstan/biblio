@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Settings, Snapshot } from '@shared/types'
 import { api } from './api'
+import { buildStatsCsv } from './format'
 import AreasTab from './tabs/AreasTab'
 import StatsTab from './tabs/StatsTab'
 import NetworkTab from './tabs/NetworkTab'
@@ -52,6 +53,23 @@ export default function App() {
     }, Math.max(1000, interval))
     return () => window.clearInterval(timer)
   }, [interval, refresh])
+
+  // Дымовая проверка экспорта CSV: окно собирает CSV из живых данных тем же
+  // кодом, что и кнопка «Экспорт CSV», и отдаёт его главному процессу.
+  useEffect(() => {
+    if (!window.minigen.smoke?.csv) return
+    const timer = window.setInterval(() => {
+      if (!snapshot) return
+      window.clearInterval(timer)
+      try {
+        ;(window as unknown as { __minigenSmokeCsv?: string }).__minigenSmokeCsv =
+          buildStatsCsv(snapshot.stats)
+      } catch {
+        /* пусто — главный процесс сообщит об этом */
+      }
+    }, 500)
+    return () => window.clearInterval(timer)
+  }, [snapshot])
 
   const run = useCallback(
     async (action: () => Promise<unknown>) => {

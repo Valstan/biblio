@@ -103,11 +103,26 @@ app.whenReady().then(() => {
           const data = (await bridge?.call('state.snapshot')) as Record<string, unknown>
           const areas = (data?.areas as unknown[]) ?? []
           console.log('SMOKE OK: областей в снимке =', areas.length)
+          // Экспорт CSV: окно собирает CSV из ЖИВЫХ данных (тот же код, что
+          // и кнопка «Экспорт CSV»), главный процесс пишет файл тем же
+          // обработчиком, что и диалог сохранения. Проверяется всё, кроме
+          // самого окна выбора пути (это делает Windows).
+          const csvPath = process.env.MINIGEN_SMOKE_CSV
+          if (csvPath) {
+            const csv = (await mainWindow!.webContents.executeJavaScript(
+              'window.__minigenSmokeCsv || ""')) as string
+            if (csv) {
+              writeFileSync(csvPath, csv, 'utf8')
+              console.log('SMOKE CSV: записан', csvPath, csv.length, 'символов')
+            } else {
+              console.log('SMOKE CSV: окно не собрало CSV')
+            }
+          }
         } catch (err) {
           console.log('SMOKE FAIL:', String((err as Error).message || err))
         }
         app.exit(0)
-      }, 1500)
+      }, 4000)
     })
   }
 
