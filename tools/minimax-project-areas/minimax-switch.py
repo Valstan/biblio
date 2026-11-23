@@ -273,6 +273,10 @@ def running_areas() -> set:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps],
             capture_output=True, text=True, timeout=25,
+            # ⚠️ CREATE_NO_WINDOW обязателен: вызывающий демон идёт
+            # отсоединённо (консоли у него нет), а дочерний powershell без
+            # этого флага получает свою консоль — на экране мигает окно (23.11).
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         for line in (out.stdout or "").splitlines():
             line = line.strip()

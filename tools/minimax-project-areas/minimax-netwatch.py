@@ -60,6 +60,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -359,13 +360,33 @@ def reg_delete(names) -> None:
 
 
 def port_listening(port: int) -> bool:
+    """Слушает ли локальный порт.
+
+    ⚠️ Раньше проверка жила в PowerShell (`Get-NetTCPConnection`) — и **каждая
+    проверка мигала окном** на экране владельца (23.11, жалоба: «окна
+    терминала постоянно появляются и закрываются»). Причина: демон запущен
+    отсоединённо, консоли у него нет, а дочерний `powershell` без
+    `CREATE_NO_WINDOW` получает **свою** консоль. За проход сторожа таких
+    проверок десятки, и шли они пачками.
+
+    Теперь проверка чистая, на сокетах: connect к локальному порту отвечает ⇔
+    порт слушают. Никаких процессов, никаких окон, и вместо ~0,5 с на
+    проверку — миллисекунды.
+
+    Отличие от `Get-NetTCPConnection -State Listen`: connect спрашивает
+    «примет ли кто-то соединение», а не «есть ли сокет в состоянии LISTEN».
+    Для наших портов (прокси Happ и наш резервный тоннель — оба на
+    127.0.0.1) это одно и то же.
+
+    Таймаут 0,3 с: слушающий порт на loopback отвечает мгновенно (рукопожатие
+    делает ядро), а вот на свободный порт Windows отвечает отказом либо
+    (если правило файрвола глушит) таймаутом — и вот тут важно не ждать дольше
+    нужного: за проход сторожа проверяется несколько портов.
+    """
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                              "(Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction "
-                              "SilentlyContinue | Measure-Object).Count" % port],
-                             capture_output=True, text=True, timeout=30)
-        return out.stdout.strip().isdigit() and int(out.stdout.strip()) > 0
-    except Exception:  # noqa: BLE001
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=0.3):
+            return True
+    except (OSError, ValueError):
         return False
 
 
@@ -705,10 +726,14 @@ def rotate_reserve() -> dict:
 
 def _restart_reserve_tunnel() -> None:
     """Перезапустить наш тоннель (xtunnel) с активным конфигом."""
+    # ⚠️ CREATE_NO_WINDOW обязателен: демон идёт отсоединённо (консоли нет),
+    # а дочерний powershell без этого флага получает свою консоль — на экране
+    # мигает окно (23.11).
     subprocess.run(["powershell", "-NoProfile", "-Command",
                     "Get-Process xtunnel -ErrorAction SilentlyContinue | "
                     "Stop-Process -Force -ErrorAction SilentlyContinue"],
-                   capture_output=True, text=True, timeout=60)
+                   capture_output=True, text=True, timeout=60,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     time.sleep(2)
     try:
         subprocess.Popen([str(RESERVE_XRAY), "-config", str(RESERVE_CONFIG)],
