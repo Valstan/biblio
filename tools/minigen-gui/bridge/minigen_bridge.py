@@ -642,10 +642,16 @@ def daemon_mode() -> int:
     bridge = Bridge()
     bridge.start_daemon_supervision()
     try:
+        import minigen_api
+        minigen_api.serve()
         bridge.core.log("ДЕМОНЫ: программа «МиниГен» в фоновом режиме — "
-                        "демоны подняты и следятся")
-    except Exception:  # noqa: BLE001
-        pass
+                        "демоны подняты и следятся (API на %s)"
+                        % minigen_api.base_url())
+    except Exception as exc:  # noqa: BLE001
+        try:
+            bridge.core.log("ДЕМОНЫ: локальный API не поднялся: %s" % exc)
+        except Exception:  # noqa: BLE001
+            pass
     while True:
         time.sleep(3600)
 

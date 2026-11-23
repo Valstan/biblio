@@ -65,11 +65,11 @@ FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
 
 
 
-def master_file(name: str) -> bytes:
-    r = subprocess.run(["git", "-C", str(REPO), "show", "origin/master:" + REL + "/" + name],
+def master_file(name: str, ref: str = "origin/master") -> bytes:
+    r = subprocess.run(["git", "-C", str(REPO), "show", ref + ":" + REL + "/" + name],
                        capture_output=True)
     if r.returncode != 0 or not r.stdout.strip():
-        raise SystemExit("не прочитал из master: " + name)
+        raise SystemExit("не прочитал из " + ref + ": " + name)
     return r.stdout
 
 
@@ -93,10 +93,18 @@ def daemons_alive() -> list[str]:
 
 
 def main() -> int:
-    print("=== раскатка «МиниГена» из репозитория (biblio master) на боевое место ===")
+    # Источник кода: по умолчанию master. `--ref` — раскатать из другой
+    # ветки (нужно, когда правка срочная, а слияние PR ещё не прошло):
+    # код всё равно едет из репозитория, и PR остаётся открытым.
+    ref = "origin/master"
+    if "--ref" in sys.argv:
+        index = sys.argv.index("--ref")
+        if index + 1 < len(sys.argv):
+            ref = sys.argv[index + 1]
+    print("=== раскатка «МиниГена» из репозитория (biblio %s) на боевое место ===" % ref)
     print("--- файлы ---")
     for name in FILES:
-        data = master_file(name)
+        data = master_file(name, ref)
         (BIN / name).write_bytes(data)
         print("   записан %-26s %d байт" % (name, len(data)))
 

@@ -29,3 +29,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_minimax_netwatch_switch.py
       - name: Приёмка записи конфига областей
         run: python3 tools/minimax-project-areas/test_config_write_race.py
+      - name: Приёмка перезапуска контура
+        run: python3 tools/minimax-project-areas/test_minigen_contour_restart.py

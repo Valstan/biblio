@@ -58,12 +58,28 @@ try {
     $shell = New-Object -ComObject WScript.Shell
     $link = $shell.CreateShortcut($shortcut)
     $link.TargetPath = $launcher
+    # ⚠️ Arguments чистим ЯВНО: CreateShortcut загружает существующий ярлык,
+    # и старые поля остаются. Так в ярлыке «МиниГен» остался адрес старой
+    # панели (http://127.0.0.1:8099/) — мёртвый после архивирования панели.
+    $link.Arguments = ""
     $link.WorkingDirectory = $PSScriptRoot
     $link.Description = "МиниГен — единая программа с графическим интерфейсом"
     $link.Save()
     Write-Host "Ярлык на рабочем столе: $shortcut" -ForegroundColor Green
 } catch {
     Write-Host "Ярлык создать не удалось: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# Ярлык старой панели (страница управления :8098) — в архив: страница
+# больше не существует, а ярлык вёл бы в никуда.
+$oldPanelShortcut = Join-Path ([Environment]::GetFolderPath("Desktop")) "МиниГен — панель (управление).lnk"
+if (Test-Path $oldPanelShortcut) {
+    try {
+        Move-Item $oldPanelShortcut (Join-Path "C:\Users\valstan\bin\_archive" "МиниГен — панель (управление).lnk") -Force
+        Write-Host "Ярлык старой панели убран в архив" -ForegroundColor Yellow
+    } catch {
+        Write-Host "Ярлык старой панели не убран: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
 }
 
 # ── автозапуск: демоны должны жить без окна ────────────────────────────────
