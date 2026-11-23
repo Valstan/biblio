@@ -154,6 +154,37 @@ class DaemonDirTest(unittest.TestCase):
         self.assertTrue((base / "minigen_core.py").is_file())
 
 
+class ProgramVersionTest(unittest.TestCase):
+    """Программа должна знать свою версию (урок 23.11: «программа без версии»)."""
+
+    def test_version_from_installed_copy(self) -> None:
+        import tempfile
+        from pathlib import Path
+        import json
+
+        old = state.HERE
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "version.json").write_text(
+                json.dumps({"commit": "abc1234", "installed_at": 1700000000,
+                            "source": "D:/repo"}), encoding="utf-8")
+            bridge_dir = root / "app" / "bridge"
+            bridge_dir.mkdir(parents=True)
+            state.HERE = bridge_dir
+            try:
+                version = state.program_version()
+            finally:
+                state.HERE = old
+        self.assertTrue(version["installed"])
+        self.assertEqual(version["commit"], "abc1234")
+        self.assertEqual(version["source"], "D:/repo")
+
+    def test_version_without_install_file(self) -> None:
+        version = state.program_version()
+        self.assertIn("commit", version)
+        self.assertIn("running_from", version)
+
+
 class SettingsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

@@ -4,6 +4,7 @@ import type {
   DaemonStatus,
   JournalLine,
   NetworkState,
+  ProgramVersion,
   Settings,
   Snapshot,
   Stats
@@ -53,6 +54,7 @@ export const api = {
   chatConfirm: (approved: boolean) => call<ChatReply>('chat.confirm', { approved }),
   chatReset: () => call<{ ok: boolean }>('chat.reset'),
   daemonsStatus: () => call<DaemonStatus>('daemons.status'),
+  programVersion: () => call<ProgramVersion>('program.version'),
   daemonsStart: (name?: string) => call<unknown>('daemons.start', name ? { name } : {}),
   daemonsStop: (name?: string) => call<unknown>('daemons.stop', name ? { name } : {}),
   daemonsRestart: (name?: string) => call<unknown>('daemons.restart', name ? { name } : {}),

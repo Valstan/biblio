@@ -349,6 +349,43 @@ def network_state(mods: dict[str, Any], probe: bool = False) -> dict[str, Any]:
     return out
 
 
+def program_version() -> dict[str, Any]:
+    """Какая версия программы запущена.
+
+    Урок 23.11: «программа, живущая в рабочем дереве репозитория, не имеет
+    версии» — она меняется вместе с веткой. Установленная копия версию
+    имеет: при установке рядом с программой пишется `version.json`
+    (коммит исходников + время установки). Если файла нет (запуск из
+    репозитория, разработка) — показываем коммит рабочего дерева.
+    """
+    out: dict[str, Any] = {"commit": "", "installed_at": 0, "source": "",
+                           "installed": False, "running_from": str(HERE.parent)}
+    bridge_dir = HERE
+    for parent in bridge_dir.parents:
+        version_file = parent / "version.json"
+        if version_file.is_file():
+            try:
+                data = json.loads(version_file.read_text(encoding="utf-8"))
+                out.update({k: v for k, v in data.items() if k in out})
+                out["installed"] = True
+                out["running_from"] = str(parent)
+                return out
+            except (OSError, ValueError):
+                break
+    # запуск из репозитория (разработка): показываем коммит дерева
+    try:
+        res = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=15,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        commit = (res.stdout or "").strip()
+        if commit:
+            out["commit"] = commit
+            out["source"] = "рабочее дерево (разработка)"
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def daemons_status(mods: dict[str, Any]) -> dict[str, Any]:
     """Кто из демонов жив.
 
