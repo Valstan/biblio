@@ -136,8 +136,16 @@ def probe_path(path_cfg: dict, cfg: dict) -> dict:
             pass
     expect = (path_cfg.get("expect_country") or "").upper()
     if out["country"] and expect and out["country"].upper() != expect:
-        out["note"] = ("страна выхода %s вместо ожидаемой %s — нода упала, трафик ушёл "
-                       "напрямую" % (out["country"], expect))
+        # ⚠️ Несовпадение страны САМО ПО СЕБЕ — не поломка (23.11). Вендор
+        # Happ отдаёт разные серверы (NL/DE/AT/PL/CA…), и «ожидаемая страна»
+        # в конфиге устаревает. Прежний вывод «нода упала, трафик ушёл напрямую»
+        # приводил к каскаду восстановления (смена сервера → перезапуск ядра
+        # Happ → прокси на 30 с умирал) ⇒ в десктопах «The model service is
+        # unstable. Please try again.». Проверять надо не страну, а ЖИВ ЛИ ПУТЬ.
+        out["note"] = ("страна выхода %s вместо ожидаемой %s — вендор по этому пути "
+                       "отвечает (%s), значит нода жива, это просто другой сервер"
+                       % (out["country"], expect, out["code"]))
+        out["country_mismatch"] = True
     else:
         out["note"] = "путь живой"
     return out
@@ -904,15 +912,25 @@ def cycle(cfg: dict, state: dict, dry_run: bool = False) -> dict:
                 else:
                     core.log("СЕТЬ: устойчивого доступа нет — %s" % json.dumps(stable, ensure_ascii=False)[:300])
     else:
-        # Путь есть, но geo может быть «упал на прямой выход» — это ловим
-        # по стране выхода против ожидаемой.
+        # Путь есть. Страна выхода — НЕ повод для каскада: вендор по пути
+        # отвечает ⇒ нода жива. Каскад запускаем только когда путь реально
+        # не работает (вендор отдаёт 5xx или нет ответа).
         bad = [p for p in alive if p.get("note") and "вместо ожидаемой" in p["note"]]
-        if bad and not dry_run:
-            report["action"] = "путь жив, но выход не тот — пробуем смену"
-            core.log("СЕТЬ: %s" % bad[0]["note"])
-            # Нода упала и трафик ушёл напрямую ⇒ этот сервер негоден (22.11).
+        broken = [p for p in bad if int(p.get("code") or 0) >= 500]
+        if bad and not broken:
+            # Строка действия остаётся ровно «всё живо» — на неё смотрит
+            # лечащий (`network_unhealthy`): любое другое значение он читает как
+            # «сеть плохая» и ОТКЛАДЫВАЕТ лечение (так потеря входа РМЗ 2 и
+            # не чинилась). Подробности — в отдельном поле.
+            report["action"] = "всё живо"
+            report["stable"] = True
+            report["geo_note"] = bad[0].get("note")
+            core.log("СЕТЬ: %s — каскад НЕ запускаю: путь живой, вендор отвечает" % bad[0].get("note"))
+        elif broken and not dry_run:
+            report["action"] = "путь жив, но вендор отдаёт 5xx — пробуем смену"
+            core.log("СЕТЬ: %s" % broken[0]["note"])
             mark_bad_server(str(reg_read().get("lastServerHost") or ""), state,
-                            "выход не тот: %s" % (bad[0].get("country") or "-"))
+                            "вендор 5xx: %s" % (broken[0].get("code") or "-"))
             state["last_recover"] = int(time.time())
             report["recovery"] = recover(cfg, state, dry_run=False)
             stable = verify_stable(cfg)

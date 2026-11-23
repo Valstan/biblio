@@ -760,18 +760,27 @@ def diagnose(area: dict) -> dict:
         out["tier"] = "T1"
         _remember_failure(area["slug"], hit[0], hit[1], hit[2] if len(hit) > 2 else "")
         return out
+    # ⚠️ ПОРЯДОК ПРОВЕРОК (23.11, разбор «Матрицы РМЗ 2»): «потеря входа»
+    # проверяется **ПЕРЕД** «подозрением». «Подозрение» — это про вендора/сеть, и
+    # при плохой сети лечащий лечение ОТКЛАДЫВАЕТ; потеря входа — это ФАКТ (в
+    # сторе области нет записи входа), и от сети она не зависит.
+    #
+    # Старый порядок давал «полузависшее»: сеть плохая ⇒ «подозрение» ⇒ лечение
+    # отложено ⇒ десктоп тем временем выпал из логина (auth.json с пустыми
+    # records, экран «Create an account or log in to continue») ⇒ «ПОТЕРЯН ВХОД»
+    # уже не проверялась ⇒ область оставалась мёртвой, и никто её не залогинил.
+    lost = login_lost(area["dir"])
+    if lost:
+        out["verdict"] = "ПОТЕРЯН ВХОД"
+        out["reason"] = lost
+        out["tier"] = "T3"
+        return out
     maybe = silent_failure(area["dir"], install, since)
     if maybe:
         out["verdict"] = "подозрение"
         out["failure"] = maybe[0]
         out["reason"] = maybe[1]
         out["tier"] = "T2"
-        return out
-    lost = login_lost(area["dir"])
-    if lost:
-        out["verdict"] = "ПОТЕРЯН ВХОД"
-        out["reason"] = lost
-        out["tier"] = "T3"
         return out
     # Токен протух, но аккаунт у области НЕ наш (в профиле нет e-mail) ⇒
     # это «нужен вход владельца в браузере», а не поломка: пул не жжём
@@ -840,14 +849,74 @@ def desktop_running(slug: str) -> bool:
         return True
 
 
+def area_process_ids(slug: str) -> list:
+    """PID'ы процессов десктопа области (главный + дети) — по её каталогу данных."""
+    ps = ["powershell", "-NoProfile", "-Command",
+          "(Get-CimInstance Win32_Process -Filter \"Name='MiniMax Code.exe'\" | "
+          "Where-Object { $_.CommandLine -like '*minimax-areas\\p-%s\\*' }).ProcessId" % slug]
+    try:
+        out = subprocess.run(ps, capture_output=True, text=True, errors="replace", timeout=40,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:  # noqa: BLE001
+        return []
+    ids = []
+    for line in (out.stdout or "").split():
+        if line.strip().isdigit():
+            ids.append(int(line.strip()))
+    return ids
+
+
+def wait_area_stopped(slug: str, timeout: int = 30) -> bool:
+    """Ушёл ли десктоп области на самом деле (а не только по отчёту скрипта)."""
+    deadline = time.time() + timeout
+    while True:
+        if not area_process_ids(slug):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(2)
+
+
+def kill_area_processes(slug: str) -> int:
+    """Добить дерево процессов десктопа области (главный + дети)."""
+    ids = area_process_ids(slug)
+    for pid in ids:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, text=True, errors="replace", timeout=90,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return len(ids)
+
+
 def restart_area(slug: str) -> None:
-    """Перезапуск области: стоп → старт (собственный каталог, свой AUMID, свой ярлык)."""
+    """Перезапуск области: стоп → проверка → старт → проверка.
+
+    ⚠️ 23.11, разбор «полузависшего» окна: stop-скрипт **не всегда убивает главный
+    процесс** десктопа. Тогда «перезапуск» был фикцией: старый экземпляр оставался
+    жив (и висел на экране «Create an account or log in to continue»), а новый
+    умирал от single-instance lock — владелец видел окно, которое не вернулось в
+    строй. Теперь после каждой команды ПРОВЕРЯЕМ результат:
+      - после «стоп» — что процесс действительно ушёл (иначе добиваем дерево);
+      - после «старт» — что окно поднялось (иначе «Продолжай» уйдёт в никуда).
+    """
     ps = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"]
     subprocess.run(ps + [str(BIN / "mcode-project-stop.ps1"), "-Project", slug],
                    capture_output=True, text=True, errors="replace", timeout=120)
+    if not wait_area_stopped(slug, 30):
+        n = kill_area_processes(slug)
+        log("СЕССИИ: десктоп %s не остановился stop-скриптом — добиваю дерево (%d процессов)" % (
+            slug, n))
+        if not wait_area_stopped(slug, 20):
+            log("СЕССИИ: десктоп %s всё ещё жив — перезапуск не удался, старт не делаю" % slug)
+            return
     time.sleep(3)
     subprocess.run(ps + [str(BIN / "mcode-project-start.ps1"), "-Project", slug],
                    capture_output=True, text=True, errors="replace", timeout=180)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if area_process_ids(slug):
+            return
+        time.sleep(2)
+    log("СЕССИИ: десктоп %s не поднялся после старта" % slug)
 
 
 def broken_subagents(area_dir: Path) -> list:
@@ -985,7 +1054,14 @@ def _continue_once(area_dir: Path, folder: str, logfile):
 # ⚠️ `local_runtime_session_agent_state.updated_at_ms` для проверки НЕ годится:
 # он не меняется от начала хода до конца (проверено замером 18.11).
 
-STUCK_IDLE_SEC = 120      # ход идёт, но сообщений нет дольше этого ⇒ ход висит
+# ⚠️ Порог тишины (23.11, правка после ложного перезапуска десктопа Управляющего).
+# 120 с было СЛИШКОМ мало: агент может молчать и при живой работе — длинная
+# команда (сборка, тесты, ожидание), чтение большого файла, ожидание ответа
+# инструмента. В 09:34 лечащий решил, что ход «завис», и перезапустил область,
+# хотя беседа работала. Теперь тишина в 10 минут — кандидат на «завис», и даже
+# тогда область не перезапускается (см. preempt_stuck): срыв хода перезапуском
+# убивает ВСЕ сессии области, включая живую беседу владельца.
+STUCK_IDLE_SEC = 600      # ход идёт, но сообщений нет дольше этого ⇒ кандидат на «завис»
 WAIT_IDLE_SEC = 30        # сколько ждём освобождения сессии перед отправкой
 PREEMPT_PAUSE_SEC = 6     # пауза после перезапуска области перед отправкой
 
@@ -1086,11 +1162,47 @@ def session_waits_owner(area_dir: Path, session_id: str) -> bool:
         con.close()
 
 
+def turn_is_delivery(area_dir: Path, turn_id: str) -> bool:
+    """Ход **доставки** сообщения в очередь занятой сессии — это не «зависание».
+
+    Почему это важно (23.11, разбор ложного перезапуска десктопа Управляющего):
+    когда «Продолжай» отправляют в ЗАНЯТУЮ сессию, рантайм создаёт отдельный
+    ход доставки (`turn_task_delivery`). Он висит ровно столько, сколько занята
+    сессия, и **по определению молчит** — сообщений он не пишет. Лечащий брал
+    его за «зависший ход» (тишина > 120 с), считал, что «Продолжай» не
+    доставился, и перезапускал область — убивая живую беседу.
+
+    Теперь ход доставки зависанием **не считается никогда**.
+    """
+    if not turn_id:
+        return False
+    low = str(turn_id).lower()
+    if "delivery" in low or "deliver" in low:
+        return True
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return False
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return False
+    try:
+        rows = _rows(con, "select source, claim_source from local_runtime_turn_ingress "
+                          "where turn_id = ?", (turn_id,))
+        if not rows:
+            return False
+        src = " ".join(str(x or "").lower() for x in rows[0])
+        return "delivery" in src
+    finally:
+        con.close()
+
+
 def stuck_turn(area: dict):
     """Сессия висит на ходе, который не идёт: (turn_id, простой_секунд) либо None.
 
     None — либо хода нет, либо ход живой (сообщения идут), либо агент ждёт
-    ответа владельца. Живой ход срывать нельзя: это работа, а не зависание.
+    ответа владельца, либо это ход **доставки** в очередь (он молчит по
+    определению — зависанием не считается).
     """
     at = active_turn(area["dir"])
     if not at:
@@ -1098,11 +1210,31 @@ def stuck_turn(area: dict):
     turn_id, sid, accepted = at
     if session_waits_owner(area["dir"], sid):
         return None
+    if turn_is_delivery(area["dir"], turn_id):
+        return None
     prog = session_progress_ms(area["dir"], sid)
     idle_ms = int(time.time() * 1000) - int(prog or accepted)
     if idle_ms < STUCK_IDLE_SEC * 1000:
         return None
     return (turn_id, int(idle_ms // 1000))
+
+
+def active_turn_failed(area_dir: Path) -> bool:
+    """Активный ход УПАЛ (failed/aborted), а не просто молчит."""
+    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
+    if not db.is_file():
+        return False
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
+    except sqlite3.Error:
+        return False
+    try:
+        rows = _rows(con, "select status from local_runtime_turn_ingress "
+                          "where status in ('failed','aborted') and completed_at_ms is null "
+                          "order by accepted_at_ms desc limit 1")
+        return bool(rows)
+    finally:
+        con.close()
 
 
 def preempt_stuck(area: dict, why: str) -> bool:
@@ -1112,8 +1244,18 @@ def preempt_stuck(area: dict, why: str) -> bool:
     прерывать). Окно при этом закрывается и открывается заново — поэтому делаем
     это только когда ход действительно висит, и только в работающей области
     (правило владельца 18.11: окно в неработающей области не открываем).
+
+    ⚠️ 23.11, правка после ложного перезапуска: **перезапуск области — крайняя
+    мера**, он убивает ВСЕ сессии области, включая живую беседу владельца.
+    Поэтому применяем его только когда ход **УПАЛ** (failed/aborted), а не когда
+    он просто молчит: молчание — норма для длинной работы (сборка, тесты,
+    ожидание инструмента). Молчащий ход мы оставляем в покое.
     """
     slug = area["slug"]
+    if not active_turn_failed(area["dir"]):
+        log("%s: %s — ход не упал, просто молчит; десктоп НЕ трогаю (перезапуск "
+            "убил бы живые сессии области)" % (area["title"], why))
+        return False
     if not desktop_running(slug):
         log("%s: %s, но десктоп не запущен — окно не открываем" % (area["title"], why))
         return False
@@ -1185,7 +1327,20 @@ def say_continue(area: dict) -> str:
                     "чтобы «Продолжай» встал в начало (попытка %s)" % (
                         area["title"], attempt))
                 restart_area(area["slug"])
-                time.sleep(6)
+                # ⚠️ 23.11: после перезапуска команда «Продолжай» уходила через
+                # 6 секунд — а десктоп после старта грузится и входит десятки
+                # секунд. Команда приходила в ещё не готовый рантайм, терялась,
+                # и лечащий уходил в ещё один перезапуск (каскад «ОТКАТ» в 00:30,
+                # 00:35, 01:12, 01:26 — команды накладывались друг на друга).
+                # Теперь: ЖДЁМ готовности (приложение поднялось + вошло + вендор
+                # подтвердил токен) и только потом шлём следующую команду.
+                ok, _at, why = wait_activation(area)
+                if not ok:
+                    log("%s: после перезапуска приложение не подтвердило вход (%s) — "
+                        "«Продолжай» пока не отправляю" % (area["title"], why))
+                    return "не отправлено: десктоп не готов (%s)" % why
+                log("%s: десктоп поднялся и вошёл — повторяю «Продолжай»" % area["title"])
+                time.sleep(PREEMPT_PAUSE_SEC)
                 continue
             return "не отправлено: %s" % info
         # Сессия занята и после перезапуска — последний путь: новая сессия.
@@ -1269,9 +1424,30 @@ def probe_pending(area: dict) -> bool:
         stuck_now = stuck_turn(area)
         if age < PROBE_NO_TURN_TIMEOUT and not stuck_now:
             return True      # ещё рано — подождём следующего прохода
+        live = active_turn(area["dir"])
+        if live and not stuck_now:
+            # Живой ход: «Продолжай» стоит в очереди за ним и отработает после
+            # него. «Нового хода нет» — не значит «сессия мертва»: перезапуск
+            # десктопа тут срывал бы живую работу (23.11, 01:09 — так был
+            # перезапущен рабочий десктоп «Матрицы РМЗ»).
+            log("%s: «Продолжай» стоит в очереди за живым ходом %s — жду, "
+                "десктоп не трогаю"
+                % (area["title"], (live[1] if len(live) > 1 else "?")[:12]))
+            return True
         if stuck_now:
             log("%s: «Продолжай» лежит в очереди за зависшим ходом %s (сообщений нет %d с) — "
                 "жду дальше только бессмысленно" % (area["title"], stuck_now[0][:12], stuck_now[1]))
+            # ⚠️ 23.11: ЗДЕСЬ БЫЛ НЕТ `return` ⇒ выполнение падало в «ОТКАТ:
+            # перезапускаю область», и десктоп перезапускался на живом ходе.
+            # В 09:34 так был перезапущен десктоп Управляющего «ни с чего ни с
+            # сего», пока владелец смотрел на свою рабочую беседу.
+            #
+            # Теперь: молчащий (или висящий в очереди) ход — НЕ повод трогать
+            # десктоп. Откат с перезапуском остаётся только для настоящего
+            # случая «доставка не удалась» — когда активного хода нет вовсе.
+            _state["probe_turn"].pop(slug, None)
+            save_cooldowns()
+            return True
         _state["probe_turn"].pop(slug, None)
         save_cooldowns()
         log("%s: «Продолжай» без перезапуска не доставился (нового хода нет %d с) — "
@@ -1338,11 +1514,17 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
     **Общий путь** для автоматического лечения и для кнопки «Новый вход
     (токен)» в панели.
 
-    Смена аккаунта = смена логина ⇒ десктоп ПЕРЕЗАГРУЖАЕТСЯ (заказ владельца
-    19.11: «сделай всетаки перезагрузку десктопного минимакса при смене логина
-    аккаунта, как было до этого»). Раньше (18.11) было наоборот — «без перезагрузки
-    десктопа»: рантайм новый токен принимал, а интерфейс оставался в старой
-    сессии — чат залипал, последних действий не видно.
+    Смена аккаунта = смена логина. Перезагрузка десктопа при этом **НЕ**
+    делается (заказ владельца 19.11, ночь: «убери перезагрузку приложения
+    минимакса при смене аккаунта — это не помогает для разморозки залипшего
+    чата»): новый access и состояние кладутся в токен-стор области (поколение
+    выше, чем у приложения), и рантайм подхватывает их на следующем запросе.
+
+    ⚠️ ИСКЛЮЧЕНИЕ (23.11): если десктоп **без входа** (стор пуст, экран «Create
+    an account or log in to continue») — новый токен ему некуда положить. Тогда
+    перезапуск НУЖЕН, и за ним обязательно идёт проверка входа
+    (`wait_activation`): «Продолжай» уходит только в подтверждённо готовый
+    десктоп. Это и есть лечение «из логина вышли, а обратно не зашли».
 
     Дальше сообщение «Продолжай» уходит сначала в субагенты (если они есть и если
     они были прерваны), а потом в основной чат.
@@ -1355,6 +1537,11 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
     slug = area["slug"]
     last = _state["last_heal"].get(slug, 0)
     gap = time.time() - last
+    # ⚠️ Состояние входа запоминаем ДО установки нового токена (23.11): после
+    # установки стор непуст и app-state записан «authenticated» ⇒ проверка
+    # «десктоп без входа» уже ничего не видит, а десктоп при этом может
+    # продолжать показывать экран «Create an account or log in to continue».
+    was_logged_out = bool(login_lost(area["dir"]))
     rc, why = pull_account(switch, area)
     if rc != 0:
         log("%s: %s — ждём, повторов не гоним" % (area["title"], why))
@@ -1395,6 +1582,29 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
     # токен-стор области (поколение выше, чем у приложения), и рантайм подхватывает их на
     # следующем запросе. Интерфейс может остаться в старой сессии — залипший чат
     # размораживает владелец, руками; лишний рестарт области тут не помогает.
+    #
+    # ⚠️ ИСКЛЮЧЕНИЕ (23.11): если десктоп **без входа** (стор пуст, экран «Create an
+    # account or log in to continue») — новый токен ему некуда положить, и «Продолжай»
+    # уйдёт в пустоту. Вот тут перезапуск НУЖЕН: десктоп должен войти новым
+    # аккаунтом. И это ровно тот случай, который владелец видел как «из логина вышли,
+    # а обратно не зашли» (область «Матрица РМЗ 2», 23.11 09:40).
+    lost = login_lost(area["dir"])
+    if was_logged_out or lost:
+        why_lost = lost or "десктоп был без входа"
+        log("%s: десктоп без входа (%s) — перезапускаю, чтобы он вошёл новым аккаунтом" % (
+            area["title"], why_lost))
+        if desktop_running(slug):
+            restart_area(slug)
+            ok, _at, why = wait_activation(area)
+            if not ok:
+                log("%s: после перезапуска вход НЕ подтверждён — %s (область останется "
+                    "на экране входа; нужен вход владельца или новый аккаунт)" % (
+                        area["title"], why))
+                return False, "вход не подтверждён: %s" % why
+            log("%s: вход подтверждён после перезапуска" % area["title"])
+        else:
+            log("%s: десктоп не запущен — окно не открываем; когда владелец запустит "
+                "область, она войдёт новым входом" % area["title"])
     _state["activated"][slug] = int(time.time() * 1000)
     save_cooldowns()
     if area["dir"].name not in (switch.running_areas() or set()):
