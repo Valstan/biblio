@@ -59,6 +59,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -79,6 +80,20 @@ except ImportError:      # pragma: no cover — на Windows всегда ест
 HAPP_PREF_KEY = r"Software\Happ\OrganizationDefaults\Preferences"
 HAPP_SERVERS_FILE = core.BIN / "happ-servers.json"       # кандидаты серверов (локальный файл)
 SUBS_LOG = Path(os.environ.get("LOCALAPPDATA", "")) / "Happ" / "logs" / "subscription_log.txt"
+
+# ── НАШ СОБСТВЕННЫЙ ТОННЕЛЬ (резерв MiniMax) ─────────────────────────────
+# Живёт в папке владельца `C:\Users\valstan\vpn`: своё ядро `xtunnel.exe`
+# (переименовано, чтобы Happ его не убивал — плейбук
+# `vpn-server-happ-opencode-tunnel.md` §7), входы 11080/11081.
+# ⚠️ 23.11: порты в тоннеле были перееханы на 13090/13091, а и МиниГен, и
+# скрипты владельца ждали 11080/11081 ⇒ «резерв» не поднимался НИКОГДА, и при
+# смерти Happ все области MiniMax оставались без сети.
+RESERVE_DIR = Path(r"C:\Users\valstan\vpn")
+RESERVE_XRAY = RESERVE_DIR / "xray26327" / "xtunnel.exe"
+RESERVE_CONFIG = RESERVE_DIR / "config.json"
+RESERVE_UPSTREAMS = RESERVE_DIR / "upstreams"   # набор реальных апстримов (*.json)
+RESERVE_SOCKS_PORT = 11080
+RESERVE_HTTP_PORT = 11081
 
 RECOVER_COOLDOWN = 600      # секунд между попытками восстановления
 # Негодный сервер Happ возвращается в список через 6 ч (нода могла подняться).
@@ -472,7 +487,7 @@ def switch_happ_server() -> dict:
     return {"ok": True, "from": cur_host, "to": new["lastServerHost"], "old": old, "new": new}
 
 
-def switch_happ_server_verified(cfg: dict, state: dict, tries: int = 3) -> dict:
+def switch_happ_server_verified(cfg: dict, state: dict, tries: int = 10) -> dict:
     """Смена сервера Happ С ПРОВЕРКОЙ: негодные серверы уходят в «плохой» список.
 
     22.11 (находка владельца): сервер всегда выбирался первым из подписки, а
@@ -480,9 +495,15 @@ def switch_happ_server_verified(cfg: dict, state: dict, tries: int = 3) -> dict:
     сеть зависала, и дальше серверы не менялись. Теперь каждый кандидат
     проверяется: не ожил — помечается негодным и пропускается, пока не
     найдётся живой.
+
+    ⚠️ 23.11 (жалоба владельца: «он один раз поменяет сервер и затухает,
+    дальше не меняет»): попыток было **3** при 23 серверах в подписке, из
+    которых половина дохлая ⇒ каскад often исчерпывал попытки, не найдя
+    живого. Теперь попыток 10. И главное: **перед пробой ждём готовности
+    порта** — раньше проверка шла через фиксированные 11 с, и сервер, который
+    поднимался чуть дольше, честно помечался «плохим» (ложное обвинение).
     """
     paths = {p.get("name"): p for p in (cfg.get("paths") or [])}
-    want = (paths.get("happ") or {}).get("expect_country")
     tried = []
     for _ in range(max(1, tries)):
         res = switch_happ_server()
@@ -491,10 +512,19 @@ def switch_happ_server_verified(cfg: dict, state: dict, tries: int = 3) -> dict:
             return res
         host = res.get("to") or ""
         tried.append(host)
+        # Порт может подниматься дольше 11 с — ждём его, иначе живой сервер
+        # будет помечен «плохим» без причины.
+        _wait_port(proxy_port((paths.get("happ") or {}).get("proxy") or ""), 45)
         probe = probe_path(paths.get("happ") or {}, cfg)
-        if probe.get("alive") and (not want or probe.get("country") == want):
+        # ⚠️ 23.11: страна выхода **не** приговор (вендер Happ отдаёт серверы
+        # разных стран: NL/DE/AT/PL/US/CA). Раньше после смены требовалась
+        # именно ожидаемая страна ⇒ живой сервер из другой страны честно
+        # помечался «плохим», список плохих рос, и переключаться было некуда
+        # (жалоба владельца: «смена сервера не сработал, а он следующий не
+        # пытается»). Теперь критерий один: **вендор отвечает по этому пути**.
+        if probe.get("alive"):
             core.log("СЕТЬ: сервер Happ переключён на %s (выход %s)"
-                     % (host, probe.get("country")))
+                     % (host, probe.get("country") or "?"))
             return {"ok": True, "from": res.get("from"), "to": host, "tried": tried}
         mark_bad_server(host, state, "после смены путь не ожил: %s"
                         % (probe.get("note") or probe.get("country") or "нет ответа"))
@@ -572,8 +602,13 @@ def restart_contour() -> bool:
 def switch_path(to: str, cfg: dict) -> dict:
     """Переключить рабочий путь: `happ` (10808) или `reserve` (11081).
 
-    Правило выбора: для MiniMax нужен **иностранец** (российский egress
-    даёт гео-отказ модели). Поэтому резерв (RU) — запасной, а не первый.
+    Правило выбора: для MiniMax нужен **иностранец** (российский egress →
+    гео-отказ модели). Поэтому резерв (наш тоннель, RU) — запасной, а не
+    первый.
+
+    ⚠️ 23.11: переключаться на путь, который не отвечает, нельзя — тогда
+    MiniMax теряет связь совсем (все области стоят). Поэтому ПЕРЕД переключением
+    проверяем, что целевой путь живой, и поднимаем резерв, если он мёртв.
     """
     paths = {p.get("name"): p for p in cfg.get("paths") or []}
     target = paths.get(to)
@@ -581,43 +616,102 @@ def switch_path(to: str, cfg: dict) -> dict:
         return {"ok": False, "why": "нет такого пути в конфиге"}
     proxy = target.get("proxy") or ""
     socks = proxy.replace("http://", "socks5://")
+    if to == "reserve" and not port_listening(RESERVE_HTTP_PORT):
+        res = ensure_reserve()
+        if not res.get("ok"):
+            return {"ok": False, "why": "резерв не поднялся: %s" % res.get("why")}
+    code, _ = http_get(cfg_probe_url(), proxy, timeout=20)
+    if not code:
+        return {"ok": False, "why": "путь %s не отвечает — не переключаюсь" % to}
     set_proxy_env(proxy, socks)
     restart_contour()
+    core.log("СЕТЬ: путь переключён на %s (%s) — вендор отвечает" % (to, proxy))
     return {"ok": True, "path": to, "proxy": proxy}
 
 
 def rotate_reserve() -> dict:
-    """Сменить апстрим резервного туннеля между своими REALITY-серверами.
+    """Сменить апстрим НАШЕГО тоннеля (резерв MiniMax, порты 11080/11081).
 
-    Конфиги лежат в `C:\\Users\\valstan\\vpn\\config*.json`; активный —
-    `config.json`. Переключение = подмена файла + перезапуск `xtunnel.exe`.
+    Набор апстримов — `C:\\Users\\valstan\\vpn\\upstreams\\*.json` (реальные
+    конфиги). ⚠️ Раньше здесь перебирались `config*.json` из папки тоннеля —
+    а это **бэкапы** (`config.json.bak-…`), то есть мусор: подставлялся
+    «апстрим», которого нет, и резерв никогда не оживал.
+
+    Плюс главное: наш тоннель должен быть **поднят всегда** (см.
+    `ensure_reserve`), чтобы переключение на него было мгновенным — «время
+    до воли» не должно зависеть от того, успели ли мы поднять резерв.
     """
-    vpn = Path(r"C:\Users\valstan\vpn")
-    active = vpn / "config.json"
-    if not active.is_file():
-        return {"ok": False, "why": "нет %s" % active}
-    alts = sorted([p for p in vpn.glob("config*.json")
-                   if p.name not in ("config.json", "config.link.json")])
-    if not alts:
-        return {"ok": False, "why": "нет запасных конфигов апстрима"}
-    for alt in alts:
+    upstreams = sorted(RESERVE_UPSTREAMS.glob("*.json")) if RESERVE_UPSTREAMS.is_dir() else []
+    if not upstreams:
+        return {"ok": False, "why": "нет набора апстримов (%s)" % RESERVE_UPSTREAMS}
+    if not RESERVE_XRAY.is_file():
+        return {"ok": False, "why": "нет своего xray (%s)" % RESERVE_XRAY}
+    for alt in upstreams:
         try:
-            backup = vpn / ("config.json.bak-%s" % datetime.now().strftime("%Y%m%d-%H%M%S"))
-            active.replace(backup)
-            alt.replace(active)
+            shutil.copy2(alt, RESERVE_CONFIG)
         except OSError as exc:
             return {"ok": False, "why": "подменить конфиг не вышло: %s" % exc}
-        subprocess.run(["powershell", "-NoProfile", "-Command",
-                        "Get-Process xtunnel -ErrorAction SilentlyContinue | "
-                        "Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep 2; "
-                        "Start-Process -FilePath '%s' -ArgumentList '-config','%s' -WindowStyle Hidden"
-                        % (vpn / "xray26327" / "xtunnel.exe", active)],
-                       capture_output=True, text=True, timeout=60)
-        time.sleep(6)
-        code, _ = http_get(cfg_probe_url(), "http://127.0.0.1:11081", timeout=20)
+        _restart_reserve_tunnel()
+        if not _wait_port(RESERVE_HTTP_PORT, 30):
+            core.log("СЕТЬ: апстрим %s — тоннель не поднялся" % alt.name)
+            continue
+        code, _ = http_get(cfg_probe_url(), "http://127.0.0.1:%d" % RESERVE_HTTP_PORT, timeout=20)
         if code:
+            core.log("СЕТЬ: наш тоннель переведён на апстрим %s — вендор отвечает" % alt.name)
             return {"ok": True, "upstream": alt.name}
-    return {"ok": False, "why": "ни один запасной апстрим не ожил"}
+        core.log("СЕТЬ: апстрим %s не ожил — пробую следующий" % alt.name)
+    return {"ok": False, "why": "ни один апстрим нашего тоннеля не ожил"}
+
+
+def _restart_reserve_tunnel() -> None:
+    """Перезапустить наш тоннель (xtunnel) с активным конфигом."""
+    subprocess.run(["powershell", "-NoProfile", "-Command",
+                    "Get-Process xtunnel -ErrorAction SilentlyContinue | "
+                    "Stop-Process -Force -ErrorAction SilentlyContinue"],
+                   capture_output=True, text=True, timeout=60)
+    time.sleep(2)
+    try:
+        subprocess.Popen([str(RESERVE_XRAY), "-config", str(RESERVE_CONFIG)],
+                         cwd=str(RESERVE_DIR), stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except OSError as exc:
+        core.log("СЕТЬ: свой тоннель не запустился: %s" % exc)
+
+
+def _wait_port(port: int, timeout: int = 30) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if port_listening(port):
+            return True
+        time.sleep(2)
+    return port_listening(port)
+
+
+def ensure_reserve() -> dict:
+    """Держать наш собственный тоннель (резерв MiniMax) поднятым.
+
+    Зачем (23.11, заказ владельца: «сделать один прокси для MiniMax и не
+    включать вообще ВПН… или прокси для MiniMax оставался рабочим»): когда
+    Happ-путь умирает, MiniMax должен уйти на НАШ тоннель мгновенно, а не
+    ждать, пока что-то поднимется. Значит, резерв поднят **заранее** и
+    ждёт своего часа.
+
+    ⚠️ Честно о роли резерва: наш тоннель выходит в **РФ**, а MiniMax для
+    агента нужен иностранный egress (гео-отказ модели — плейбук
+    `vpn-server-happ-opencode-tunnel.md` §9). То есть резерв — это «связь
+    жива», а не «модель ответит»; основной путь остаётся Happ.
+    """
+    if port_listening(RESERVE_HTTP_PORT):
+        return {"ok": True, "why": "резерв уже слушает %d" % RESERVE_HTTP_PORT}
+    if not RESERVE_XRAY.is_file() or not RESERVE_CONFIG.is_file():
+        return {"ok": False, "why": "нет своего тоннеля (%s)" % RESERVE_XRAY}
+    core.log("СЕТЬ: резерв (%d) не слушает — поднимаю свой тоннель" % RESERVE_HTTP_PORT)
+    _restart_reserve_tunnel()
+    if _wait_port(RESERVE_HTTP_PORT, 30):
+        core.log("СЕТЬ: свой тоннель поднят, резерв %d готов" % RESERVE_HTTP_PORT)
+        return {"ok": True, "why": "тоннель поднят"}
+    return {"ok": False, "why": "свой тоннель не поднялся"}
 
 
 def cfg_probe_url() -> str:
@@ -849,6 +943,17 @@ def cycle(cfg: dict, state: dict, dry_run: bool = False) -> dict:
     alive = [p for p in probes if p.get("alive")]
     report = {"at": core.now_ms(), "probes": probes, "action": "нет", "stable": False,
               "proxy": proxy}
+
+    # 0-бис) Резерв (НАШ тоннель) держим поднятым ЗАРАНЕЕ (23.11, заказ
+    # владельца: «сделай один прокси для MiniMax… чтобы прокси для MiniMax
+    # оставался рабочим»). Когда Happ-путь умирает, переключение на резерв
+    # должно быть мгновенным, а не «сначала поднять, потом переключить».
+    if not dry_run and not port_listening(RESERVE_HTTP_PORT):
+        rep = ensure_reserve()
+        report["reserve"] = rep
+        if not rep.get("ok"):
+            core.log("СЕТЬ: резерв не поднялся (%s) — при смерти Happ переключаться будет некуда"
+                     % rep.get("why"))
 
     # 0) Мёртвый прокси — самая частая поломка: починить ДО остального.
     if proxy.get("broken"):
