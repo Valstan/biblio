@@ -16,6 +16,7 @@
 | [audio-to-text](tools/audio-to-text/) | Русская речь → текст локально на CPU (GigaAM v2 + Silero), оффлайн |
 | [video-downloader](tools/video-downloader/) | Скачать все видео со страницы (yt-dlp + ffmpeg из pip) |
 | [net-monitor](tools/net-monitor/) | Трей Windows: жив ли интернет (IP и DNS раздельно), статус VPN, смена DNS |
+| [minigen-gui](tools/minigen-gui/) | «МиниГен» одной программой: окно с областями, статистикой, сетью и чатом с нейросетью (Electron + React, ядро на Python) |
 
 ## Музей: старые наработки
 

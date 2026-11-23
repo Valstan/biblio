@@ -21,6 +21,7 @@
     {"slug": "kultura", "title": "Культура (портал)", "folder": "D:\\valstan\\REPO\\KulturaMalmyzh", "karman": "KulturaMalmyzh", "autoheal": true},
     {"slug": "portfolio", "title": "Портфолио", "folder": "D:\\valstan\\REPO\\ValentinPortfolio", "karman": "ValentinPortfolio", "autoheal": true},
     {"slug": "pozvoni", "title": "ПОЗВОНИ", "folder": "D:\\valstan\\REPO\\Pozvoni", "karman": "Pozvoni", "autoheal": true},
-    {"slug": "biblio", "title": "biblio (дом утилит)", "folder": "D:\\valstan\\REPO\\biblio", "karman": "biblio", "autoheal": false}
+    {"slug": "biblio", "title": "biblio (дом утилит)", "folder": "D:\\valstan\\REPO\\biblio", "karman": "biblio", "autoheal": false},
+    {"slug": "minigen", "title": "МиниГен (разработка)", "folder": "D:\\valstan\\REPO\\biblio-minigen", "karman": "biblio", "autoheal": true}
   ]
 }

@@ -1,0 +1,41 @@
+name: minigen-gui-gate
+
+# Гейт программы «МиниГен» (окно + Python-мост).
+#
+# Проверяет то, что можно проверить без боевых демонов: типы, тесты окна,
+# сборку и тесты моста. Живое состояние областей не проверяется — это делает
+# владелец на своей машине (см. docs/RUNBOOK.md).
+on:
+  pull_request:
+    paths:
+      - 'tools/minigen-gui/**'
+      - '.github/workflows/minigen-gui-gate.yml'
+  push:
+    branches: [master]
+    paths:
+      - 'tools/minigen-gui/**'
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/minigen-gui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Зависимости
+        run: npm ci --no-audit --fund=false
+      - name: Типы
+        run: npm run typecheck
+      - name: Тесты окна
+        run: npm test
+      - name: Сборка
+        run: npm run build
+      - name: Тесты моста
+        run: python -m unittest discover -s bridge/tests -t . -v
