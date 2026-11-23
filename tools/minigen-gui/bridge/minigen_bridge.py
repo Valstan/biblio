@@ -41,6 +41,7 @@ sys.path.insert(0, str(HERE))
 import minigen_state as state          # noqa: E402
 import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
+import minigen_daemons as daemons      # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
@@ -76,7 +77,25 @@ class Bridge:
         self._points: dict[str, dict[str, Any]] = {}
         self._points_at: dict[str, int] = {}
         self._points_lock = threading.Lock()
+        self._daemon_stop = threading.Event()
+        self._daemon_thread: threading.Thread | None = None
         self.handlers = self._build_handlers()
+        self.start_daemon_supervision()
+
+    def start_daemon_supervision(self) -> None:
+        """Следить за демонами: поднимать упавшего.
+
+        Старая панель архивирована (23.11) — сторожей держит программа. Пока
+        программа жива, упавший демон поднимается в течение минуты; если
+        программа закрыта, демон поднимает себя сам (`respawn_self`).
+        """
+        if not state.read_settings().get("manageDaemons", True):
+            return
+        if self._daemon_thread is not None:
+            return
+        self._daemon_thread = threading.Thread(
+            target=daemons.supervise_loop, args=(self._daemon_stop,), daemon=True)
+        self._daemon_thread.start()
 
     # ───────────────────────────────────────────────────────── реестр команд
     def _build_handlers(self) -> dict[str, Any]:
@@ -117,6 +136,11 @@ class Bridge:
             "code.commit": self.cmd_code_commit,
             "code.pr": self.cmd_code_pr,
             "code.discard": self.cmd_code_discard,
+            # демоны «МиниГена» (старая панель архивирована — держит программа)
+            "daemons.status": self.cmd_daemons_status,
+            "daemons.start": self.cmd_daemons_start,
+            "daemons.stop": self.cmd_daemons_stop,
+            "daemons.restart": self.cmd_daemons_restart,
         }
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -536,6 +560,37 @@ class Bridge:
     def cmd_code_discard(self, args: dict[str, Any]) -> dict[str, Any]:
         return code.discard_worktree()
 
+    # ──────────────────────────────────────────────────────────── демоны
+    def cmd_daemons_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        return state.jsonable(daemons.status())
+
+    def cmd_daemons_start(self, args: dict[str, Any]) -> dict[str, Any]:
+        name = str(args.get("name") or "")
+        if name:
+            spec = daemons.by_name(name)
+            if not spec:
+                return {"error": "нет такого демона: %s" % name}
+            return state.jsonable(daemons.start(spec))
+        return state.jsonable(daemons.start_all())
+
+    def cmd_daemons_stop(self, args: dict[str, Any]) -> dict[str, Any]:
+        name = str(args.get("name") or "")
+        if name:
+            spec = daemons.by_name(name)
+            if not spec:
+                return {"error": "нет такого демона: %s" % name}
+            return state.jsonable(daemons.stop(spec))
+        return state.jsonable(daemons.stop_all())
+
+    def cmd_daemons_restart(self, args: dict[str, Any]) -> dict[str, Any]:
+        name = str(args.get("name") or "")
+        if name:
+            spec = daemons.by_name(name)
+            if not spec:
+                return {"error": "нет такого демона: %s" % name}
+            return state.jsonable(daemons.restart(spec))
+        return state.jsonable(daemons.restart_all())
+
     # ────────────────────────────────────────────────────────────── прочее
     def cmd_open_folder(self, args: dict[str, Any]) -> dict[str, Any]:
         path = str(args.get("path") or "")
@@ -551,7 +606,14 @@ class Bridge:
 
 
 def main() -> int:
-    """Слушать stdin, отвечать в stdout."""
+    """Слушать stdin, отвечать в stdout.
+
+    Режим `--daemon`: окна нет и запросов нет — программа только держит
+    демонов (автозапуск при входе в Windows). Запускать через `pythonw.exe`,
+    чтобы не было окна консоли.
+    """
+    if "--daemon" in sys.argv:
+        return daemon_mode()
     bridge = Bridge()
     out = sys.stdout
     for line in sys.stdin:
@@ -573,6 +635,19 @@ def main() -> int:
                              ensure_ascii=False, default=str) + "\n")
         out.flush()
     return 0
+
+
+def daemon_mode() -> int:
+    """Демон-режим: поднять демонов и следить, пока не остановят."""
+    bridge = Bridge()
+    bridge.start_daemon_supervision()
+    try:
+        bridge.core.log("ДЕМОНЫ: программа «МиниГен» в фоновом режиме — "
+                        "демоны подняты и следятся")
+    except Exception:  # noqa: BLE001
+        pass
+    while True:
+        time.sleep(3600)
 
 
 if __name__ == "__main__":

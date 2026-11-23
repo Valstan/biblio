@@ -43,8 +43,17 @@ import threading
 import time
 from pathlib import Path
 
+# Печать значков (🟢/🔴) в консоли Windows ломается на кодовой странице
+# консоли (charmap) — скрипт падал с UnicodeEncodeError.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass
+
 HERE = Path(__file__).resolve().parent
-PANEL_JS = HERE / "mcode-panel.js"
+# Панель архивирована (23.11, Ф6) — её код лежит в archive/, и проверка
+# берёт writeJsonAtomic именно оттуда (архивный код тоже должен быть живым).
+PANEL_JS = HERE / "archive" / "mcode-panel.js"
 
 ROUNDS = 300
 TRIES = 30

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { Settings, Snapshot } from '@shared/types'
+import type { DaemonStatus, Settings, Snapshot } from '@shared/types'
 import { api } from '../api'
 
 interface Props {
@@ -11,10 +11,18 @@ interface Props {
 export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   const [form, setForm] = useState<Settings | null>(settings)
   const [note, setNote] = useState('')
+  const [daemons, setDaemons] = useState<DaemonStatus | null>(null)
 
   useEffect(() => {
     if (settings && !form) setForm(settings)
   }, [settings, form])
+
+  useEffect(() => {
+    const load = () => api.daemonsStatus().then(setDaemons).catch(() => undefined)
+    void load()
+    const timer = window.setInterval(() => void load(), 5000)
+    return () => window.clearInterval(timer)
+  }, [])
 
   if (!form) return <section><p className="muted">Загружаю настройки…</p></section>
 
@@ -22,6 +30,15 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
     const saved = await api.saveSettings(form)
     onSaved(saved)
     setNote('сохранено')
+  }
+
+  const daemonAction = async (action: 'start' | 'stop' | 'restart', name?: string) => {
+    setNote(`${action}: ${name ?? 'все'}…`)
+    if (action === 'start') await api.daemonsStart(name)
+    if (action === 'stop') await api.daemonsStop(name)
+    if (action === 'restart') await api.daemonsRestart(name)
+    setDaemons(await api.daemonsStatus())
+    setNote(`${action}: готово`)
   }
 
   return (
@@ -33,6 +50,58 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
         </button>
       </div>
       {note && <div className="banner">{note}</div>}
+
+      <div className="card">
+        <h3>Демоны «МиниГена»</h3>
+        <p className="muted small">
+          Сторожа аккаунтов, сети и сессий. Старая веб-панель (:8099) и страница
+          управления (:8098) архивированы — демонов держит эта программа.
+        </p>
+        <table className="grid compact">
+          <thead>
+            <tr>
+              <th>Демон</th>
+              <th>За что отвечает</th>
+              <th>Состояние</th>
+              <th>Действия</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(daemons?.daemons ?? []).map((daemon) => (
+              <tr key={daemon.name}>
+                <td>{daemon.name}</td>
+                <td className="muted">{daemon.role}</td>
+                <td>
+                  <span className={`dot ${daemon.alive ? 'ok' : 'bad'}`} />
+                  {daemon.alive ? `жив (pid ${daemon.pids.join(', ')})` : 'не работает'}
+                </td>
+                <td className="actions">
+                  <button
+                    className="ghost"
+                    onClick={() => void daemonAction('restart', daemon.name)}
+                  >
+                    Перезапустить
+                  </button>
+                  {daemon.alive ? (
+                    <button className="ghost" onClick={() => void daemonAction('stop', daemon.name)}>
+                      Остановить
+                    </button>
+                  ) : (
+                    <button className="ghost" onClick={() => void daemonAction('start', daemon.name)}>
+                      Запустить
+                    </button>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div className="row" style={{ marginTop: 8 }}>
+          <button className="ghost" onClick={() => void daemonAction('restart')}>
+            Перезапустить всех
+          </button>
+        </div>
+      </div>
 
       <div className="card">
         <div className="grid2">
@@ -82,7 +151,7 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
             checked={form.manageDaemons}
             onChange={(e) => setForm({ ...form, manageDaemons: e.target.checked })}
           />
-          Программа управляет демонами (нужно, если супервизора панели нет)
+          Программа следит за демонами и поднимает упавшего
         </label>
       </div>
 

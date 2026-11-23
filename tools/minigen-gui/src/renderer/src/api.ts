@@ -1,6 +1,7 @@
 import type {
   Area,
   ChatReply,
+  DaemonStatus,
   JournalLine,
   NetworkState,
   Settings,
@@ -51,5 +52,9 @@ export const api = {
   chatSend: (text: string) => call<ChatReply>('chat.send', { text }),
   chatConfirm: (approved: boolean) => call<ChatReply>('chat.confirm', { approved }),
   chatReset: () => call<{ ok: boolean }>('chat.reset'),
+  daemonsStatus: () => call<DaemonStatus>('daemons.status'),
+  daemonsStart: (name?: string) => call<unknown>('daemons.start', name ? { name } : {}),
+  daemonsStop: (name?: string) => call<unknown>('daemons.stop', name ? { name } : {}),
+  daemonsRestart: (name?: string) => call<unknown>('daemons.restart', name ? { name } : {}),
   openFolder: (path: string) => call<{ ok: boolean; error?: string }>('app.open_folder', { path })
 }

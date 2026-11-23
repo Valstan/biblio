@@ -38,8 +38,11 @@ BIN = Path(r"C:\Users\valstan\bin")
 # из которого запущен скрипт, а список файлов — из его origin/master.
 REPO = Path(__file__).resolve().parents[2]
 REL = "tools/minimax-project-areas"
+# Панель и её супервизор в списке НЕ БЫЛИ — 23.11 они архивированы (Ф6):
+# веб-панель :8099 и страница управления :8098 заменены программой
+# «МиниГен» (tools/minigen-gui). Демонов теперь держит сама программа.
 FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
-         "minimax-autheal.py", "mcode-panel-supervisor.js", "mcode-panel.js")
+         "minimax-autheal.py")
 # ⚠️ 23.11: `minimax-autheal.py` в списке НЕ БЫЛ — раскатка выкладывала
 # сторожей, но не лечащего. Отсюда и расхождение «репозиторий ↔ машина»:
 # правки лечащего жили только на машине, а эталон (master) отставал, и
@@ -56,11 +59,9 @@ FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
 # мержа в master. Проверено: живая копия панели отличалась от master РОВНО
 # этой правкой (1 вставка, 7 удалений), посторонних правок на машине нет.
 #
-# ⚠️ Файл панели надо ещё ПЕРЕЗАПУСТИТЬ: процесс панели держит старый код в
-# памяти, а супервизор поднимает панель заново только после её смерти. Без
-# перезапуска записанный файл не применится — панель продолжит писать конфиг
-# неатомарно (см. шаг «перезапуск панели» ниже). Если владелец остановил
-# панель намеренно (состояние «stopped»), её не поднимаем.
+# ⚠️ 23.11 (третий раз, Ф6): с архивированием панели раскатка больше не
+# перезапускает её — перезапуск панели заменён перезапуском ДЕМОНОВ:
+# их поднимает программа «МиниГен» (мост в режиме `--daemon`).
 
 
 
@@ -72,26 +73,23 @@ def master_file(name: str) -> bytes:
     return r.stdout
 
 
-def panel_alive(timeout: int = 5) -> bool:
-    """Отвечает ли панель «МиниГена» на 8099."""
-    import urllib.request
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8099/", timeout=timeout) as resp:
-            return resp.status == 200
-    except Exception:  # noqa: BLE001
-        return False
-
-
-def panel_state(timeout: int = 5) -> str:
-    """Состояние панели по странице управления супервизора (8098)."""
-    import urllib.request
-    try:
-        with urllib.request.urlopen("http://127.0.0.1:8098/status", timeout=timeout) as resp:
-            import json
-            data = json.loads(resp.read().decode("utf-8", "replace"))
-            return str(data.get("state") or "")
-    except Exception:  # noqa: BLE001
-        return ""
+def daemons_alive() -> list[str]:
+    """Какие демоны живы (без аргументов — сам демон, не разовый вызов)."""
+    import re
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+         "Where-Object { $_.CommandLine -like '*minimax-netwatch.py' -or "
+         "$_.CommandLine -like '*minimax-sessionwatch.py' -or "
+         "$_.CommandLine -like '*minimax-autheal.py' } | "
+         "ForEach-Object { $_.CommandLine }"],
+        capture_output=True, text=True, timeout=60)
+    alive = []
+    for line in (out.stdout or "").splitlines():
+        match = re.search(r"(minimax-(?:netwatch|sessionwatch|autheal)\.py)\s*$", line.strip())
+        if match:
+            alive.append(match.group(1))
+    return alive
 
 
 def main() -> int:
@@ -102,35 +100,19 @@ def main() -> int:
         (BIN / name).write_bytes(data)
         print("   записан %-26s %d байт" % (name, len(data)))
 
-    print("--- перезапуск демонов (поднимет супервизор, дублей не будет) ---")
+    print("--- перезапуск демонов (поднимет программа «МиниГен», дублей не будет) ---")
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-         "Where-Object { $_.CommandLine -like '*minimax-netwatch.py*' -or "
-         "$_.CommandLine -like '*minimax-sessionwatch.py*' -or "
-         "$_.CommandLine -like '*minimax-autheal.py*' } | "
+         "Where-Object { $_.CommandLine -like '*minimax-netwatch.py' -or "
+         "$_.CommandLine -like '*minimax-sessionwatch.py' -or "
+         "$_.CommandLine -like '*minimax-autheal.py' } | "
          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
         capture_output=True, text=True, timeout=60)
     time.sleep(12)
-
-    print("--- перезапуск панели (процесс держит старый код в памяти) ---")
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
-         "Where-Object { $_.CommandLine -like '*mcode-panel.js*' } | "
-         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
-        capture_output=True, text=True, timeout=60)
-    time.sleep(8)
-    if panel_alive():
-        print("   панель отвечает на 8099 — новый код уже в работе")
-    else:
-        state = panel_state()
-        print("   панель не отвечает (состояние супервизора: %s)" % (state or "неизвестно"))
-        if state == "stopped":
-            print("   владелец остановил панель намеренно — не поднимаем её, "
-                  "правку панели он получит при следующем запуске")
-        else:
-            print("   ⚠️ панель не поднялась — проверьте супервизор (8098)")
+    alive = daemons_alive()
+    print("   живых демонов: %d из 3%s" % (
+        len(alive), (" (" + ", ".join(alive) + ")") if alive else ""))
 
     print("--- проверка ---")
     ok = True
@@ -141,10 +123,6 @@ def main() -> int:
         good = r.returncode == 0
         ok = ok and good
         print("   компиляция %-26s %s" % (name, "ок" if good else "ОШИБКА " + r.stderr[-200:]))
-    r = subprocess.run(["node", "--check", str(BIN / "mcode-panel-supervisor.js")],
-                       capture_output=True, text=True)
-    ok = ok and r.returncode == 0
-    print("   node --check супервизора      %s" % ("ок" if r.returncode == 0 else "ОШИБКА"))
     r = subprocess.run([sys.executable, str(BIN / "minimax-netwatch.py"), "--status"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace",
                        timeout=180)

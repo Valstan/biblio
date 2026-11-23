@@ -66,5 +66,47 @@ try {
     Write-Host "Ярлык создать не удалось: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
+# ── автозапуск: демоны должны жить без окна ────────────────────────────────
+# Старая панель с супервизором архивирована (23.11): её страницы :8099/:8098
+# больше нет, а демонов (лечащий, сетевой сторож, сторож сессий) держит сама
+# программа — в фоновом режиме моста, без окна и без окна консоли.
+$startup = [Environment]::GetFolderPath("Startup")
+$oldStartup = Join-Path $startup "МиниГен.lnk"
+if (Test-Path $oldStartup) {
+    try {
+        $oldLink = (New-Object -ComObject WScript.Shell).CreateShortcut($oldStartup)
+        if ($oldLink.Arguments -like "*mcode-panel-supervisor*") {
+            Remove-Item $oldStartup -Force
+            Write-Host "Старый автозапуск (супервизор старой панели) убран" -ForegroundColor Yellow
+        }
+    } catch {}
+}
+$pyw = ""
+foreach ($candidate in @(
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\pythonw.exe"),
+    (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\pythonw.exe"))) {
+    if (Test-Path $candidate) { $pyw = $candidate; break }
+}
+if (-not $pyw) {
+    $cmd = Get-Command pythonw -ErrorAction SilentlyContinue
+    if ($cmd) { $pyw = $cmd.Source }
+}
+if ($pyw) {
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $autoLink = $shell.CreateShortcut((Join-Path $startup "МиниГен (демоны).lnk"))
+        $autoLink.TargetPath = $pyw
+        $autoLink.Arguments = '"' + (Join-Path $PSScriptRoot "bridge\minigen_bridge.py") + '" --daemon'
+        $autoLink.WorkingDirectory = (Join-Path $PSScriptRoot "bridge")
+        $autoLink.Description = "МиниГен — фоновый режим: сторожа аккаунтов, сети и сессий"
+        $autoLink.Save()
+        Write-Host "Автозапуск демонов: $(Join-Path $startup 'МиниГен (демоны).lnk')" -ForegroundColor Green
+    } catch {
+        Write-Host "Автозапуск не настроен: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "pythonw.exe не найден — автозапуск демонов не настроен." -ForegroundColor Yellow
+}
+
 Write-Host ""
 Write-Host "Готово. Запуск: ярлык «МиниГен» на рабочем столе или «Запустить.cmd»." -ForegroundColor Green

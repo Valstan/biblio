@@ -48,8 +48,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "refreshMs": 5000,
     # автообновление журнала во вкладке «Журнал»
     "journalTail": 200,
-    # поднимать ли демонов, если супервизора панели нет (осторожная вещь)
-    "manageDaemons": False,
+    # поднимать ли демонов, если их не жилёт (старая панель архивирована —
+    # демонов держит сама программа)
+    "manageDaemons": True,
     # область, чей конфиг провайдера использует чат
     "modelArea": "minigen",
     # модель по умолчанию (пусто = взять defaultModel из config.yaml)
@@ -346,31 +347,17 @@ def network_state(mods: dict[str, Any], probe: bool = False) -> dict[str, Any]:
 
 
 def daemons_status(mods: dict[str, Any]) -> dict[str, Any]:
-    """Кто из демонов жив: супервизор, панель, сторожа, лечащий."""
-    core = mods["core"]
-    names = {
-        "supervisor": "mcode-panel-supervisor",
-        "panel": "mcode-panel.js",
-        "autheal": "minimax-autheal",
-        "netwatch": "minimax-netwatch",
-        "sessionwatch": "minimax-sessionwatch",
-    }
-    out: dict[str, Any] = {"supervisor": core.supervisor_alive(), "procs": {}}
+    """Кто из демонов жив.
+
+    С 23.11 (Ф6) старая панель и её супервизор архивированы — демонов держит
+    сама программа «МиниГен». Поэтому смотрим на процессы демонов, а не на
+    порт 8098.
+    """
     try:
-        ps = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match "
-              "'minimax-(autheal|netwatch|sessionwatch)|mcode-panel' } | "
-              "ForEach-Object { $_.CommandLine }")
-        raw = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                             capture_output=True, text=True, timeout=25,
-                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        blob = raw.stdout or ""
+        import minigen_daemons as daemons
+        return daemons.status()
     except Exception:  # noqa: BLE001
-        blob = ""
-    for key, needle in names.items():
-        if key == "supervisor":
-            continue
-        out["procs"][key] = needle in blob
-    return out
+        return {"daemons": [], "alive_count": 0, "total": 0}
 
 
 # ────────────────────────────────────────────────────────────── журнал
