@@ -33,7 +33,7 @@ BIN = Path(r"C:\Users\valstan\bin")
 REPO = Path(r"D:\valstan\REPO\biblio")
 REL = "tools/minimax-project-areas"
 FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
-         "minimax-autheal.py", "mcode-panel-supervisor.js")
+         "minimax-autheal.py", "mcode-panel-supervisor.js", "mcode-panel.js")
 # ⚠️ 23.11: `minimax-autheal.py` в списке НЕ БЫЛ — раскатка выкладывала
 # сторожей, но не лечащего. Отсюда и расхождение «репозиторий ↔ машина»:
 # правки лечащего жили только на машине, а эталон (master) отставал, и
@@ -44,6 +44,18 @@ FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
 # проходе (процесс жив ⇒ супервизор его не перезапускает ⇒ 9,5 часов никто
 # не оживал сессий). Скрипт обязан это видеть и сказать, а не отчитаться
 # «готово».
+#
+# ⚠️ 23.11 (второй раз): `mcode-panel.js` в списке НЕ БЫЛ — правку атомарной
+# записи конфига областей раскатка на машину не везла ⇒ гонка жила и после
+# мержа в master. Проверено: живая копия панели отличалась от master РОВНО
+# этой правкой (1 вставка, 7 удалений), посторонних правок на машине нет.
+#
+# ⚠️ Файл панели надо ещё ПЕРЕЗАПУСТИТЬ: процесс панели держит старый код в
+# памяти, а супервизор поднимает панель заново только после её смерти. Без
+# перезапуска записанный файл не применится — панель продолжит писать конфиг
+# неатомарно (см. шаг «перезапуск панели» ниже). Если владелец остановил
+# панель намеренно (состояние «stopped»), её не поднимаем.
+
 
 
 def master_file(name: str) -> bytes:
@@ -52,6 +64,28 @@ def master_file(name: str) -> bytes:
     if r.returncode != 0 or not r.stdout.strip():
         raise SystemExit("не прочитал из master: " + name)
     return r.stdout
+
+
+def panel_alive(timeout: int = 5) -> bool:
+    """Отвечает ли панель «МиниГена» на 8099."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8099/", timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def panel_state(timeout: int = 5) -> str:
+    """Состояние панели по странице управления супервизора (8098)."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:8098/status", timeout=timeout) as resp:
+            import json
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+            return str(data.get("state") or "")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def main() -> int:
@@ -72,6 +106,25 @@ def main() -> int:
          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
         capture_output=True, text=True, timeout=60)
     time.sleep(12)
+
+    print("--- перезапуск панели (процесс держит старый код в памяти) ---")
+    subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | "
+         "Where-Object { $_.CommandLine -like '*mcode-panel.js*' } | "
+         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+        capture_output=True, text=True, timeout=60)
+    time.sleep(8)
+    if panel_alive():
+        print("   панель отвечает на 8099 — новый код уже в работе")
+    else:
+        state = panel_state()
+        print("   панель не отвечает (состояние супервизора: %s)" % (state or "неизвестно"))
+        if state == "stopped":
+            print("   владелец остановил панель намеренно — не поднимаем её, "
+                  "правку панели он получит при следующем запуске")
+        else:
+            print("   ⚠️ панель не поднялась — проверьте супервизор (8098)")
 
     print("--- проверка ---")
     ok = True

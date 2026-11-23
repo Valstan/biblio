@@ -27,3 +27,5 @@ jobs:
         run: python3 tools/minimax-project-areas/check_panel.py --source-only
       - name: Приёмка переключения серверов Happ
         run: python3 tools/minimax-project-areas/test_minimax_netwatch_switch.py
+      - name: Приёмка записи конфига областей
+        run: python3 tools/minimax-project-areas/test_config_write_race.py

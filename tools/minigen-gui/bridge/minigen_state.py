@@ -164,7 +164,15 @@ def read_projects() -> dict[str, Any]:
 
 
 def write_projects(cfg: dict[str, Any]) -> tuple[bool, str]:
-    """Записать конфиг областей АТОМАРНО (иначе читатель поймает половину)."""
+    """Записать конфиг областей АТОМАРНО (иначе читатель поймает половину).
+
+    Атомарность на Windows не бесплатна: `os.replace` поверх файла, который
+    сейчас открыт другим процессом (читатель в Python держит файл без
+    FILE_SHARE_DELETE), отказывает с PermissionError. Поэтому
+    переименование повторяем: окно у читателя — миллисекунды. Если и это
+    не помогло — пишем на место: действие владельца важнее атомарности, а
+    читатель при сбое разбора перечитывает файл.
+    """
     core = load_daemons()["core"]
     try:
         cfg = dict(cfg)
@@ -172,8 +180,24 @@ def write_projects(cfg: dict[str, Any]) -> tuple[bool, str]:
         core.CONFIG.parent.mkdir(parents=True, exist_ok=True)
         tmp = core.CONFIG.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(core.CONFIG)
-        return True, ""
+        last = ""
+        for _ in range(30):
+            try:
+                os.replace(str(tmp), str(core.CONFIG))
+                return True, ""
+            except PermissionError as exc:
+                last = str(exc)
+                time.sleep(0.1)
+            except OSError as exc:
+                return False, str(exc)
+        # Запасной путь: пишем на место — действие важнее атомарности.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        core.CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                               encoding="utf-8")
+        return True, "записано на место (атомарная замена не удалась: %s)" % last
     except OSError as exc:
         return False, str(exc)
 
