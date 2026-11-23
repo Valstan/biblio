@@ -92,6 +92,141 @@ def daemons_alive() -> list[str]:
     return alive
 
 
+# ─────────────────────────────────────────────── установка программы
+
+PROGRAM_SRC = REPO / "tools" / "minigen-gui"
+PROGRAM_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Programs" / "МиниГен"
+
+LAUNCHER_CMD = """@echo off
+rem MiniGen launcher (installed copy, ASCII only).
+setlocal
+cd /d "%~dp0"
+if not exist "%~dp0electron\\dist\\electron.exe" (
+  echo Electron runtime not found - re-run the rollout.
+  pause
+  exit /b 1
+)
+start "" "%~dp0electron\\dist\\electron.exe" "%~dp0app"
+"""
+
+AUTOSTART_CMD = """@echo off
+rem MiniGen background mode: the daemons (healer, network watcher, session
+rem watcher) stay alive without a window. ASCII only.
+setlocal
+cd /d "%~dp0"
+set "PYTHONW=%LOCALAPPDATA%\\Programs\\Python\\Python312\\pythonw.exe"
+if not exist "%PYTHONW%" set "PYTHONW=pythonw.exe"
+start "" "%PYTHONW%" "%~dp0app\\bridge\\minigen_bridge.py" --daemon
+"""
+
+
+def _copy_tree(src: Path, dst: Path, skip=()) -> int:
+    import shutil
+    if not src.is_dir():
+        return 0
+    shutil.copytree(src, dst, dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns(*skip) if skip else None)
+    return sum(1 for path in dst.rglob("*") if path.is_file())
+
+
+def install_program() -> bool:
+    """Поставить программу в своё место и переписать ярлыки.
+
+    ⚠️ Зачем отдельно от репозитория (23.11): если программа живёт в
+    рабочем дереве, её версия зависит от того, какая ветка там checkout.
+    Любой `git checkout` (у нас этим занимаются агенты) молча меняет
+    программу, запущенную у владельца, — и ярлыки «указывают на ветку».
+    Своё место: версия определена, репозиторий её не трогает.
+
+    Исходники при этом остаются в репозитории: программа знает их
+    (настройка `codeRepo`) и правит их через PR.
+    """
+    import json
+    import shutil
+
+    if not (PROGRAM_SRC / "out" / "main" / "index.js").is_file():
+        print("   ⚠️ программа не собрана (нет out/main/index.js) — "
+              "запустите `npm run build` в tools/minigen-gui и повторите")
+        return False
+    app = PROGRAM_ROOT / "app"
+    electron = PROGRAM_ROOT / "electron"
+    app.mkdir(parents=True, exist_ok=True)
+    electron.mkdir(parents=True, exist_ok=True)
+
+    count = _copy_tree(PROGRAM_SRC / "node_modules" / "electron" / "dist",
+                       electron / "dist")
+    for name in ("package.json", "path.txt"):
+        src = PROGRAM_SRC / "node_modules" / "electron" / name
+        if src.is_file():
+            shutil.copy2(src, electron / name)
+    _copy_tree(PROGRAM_SRC / "out", app / "out")
+    _copy_tree(PROGRAM_SRC / "bridge", app / "bridge", skip=("__pycache__", "*.pyc"))
+    (app / "docs").mkdir(parents=True, exist_ok=True)
+    src = PROGRAM_SRC / "docs" / "knowledge-pack.md"
+    if src.is_file():
+        shutil.copy2(src, app / "docs" / "knowledge-pack.md")
+    shutil.copy2(PROGRAM_SRC / "package.json", app / "package.json")
+    (PROGRAM_ROOT / "Запустить.cmd").write_bytes(LAUNCHER_CMD.encode("ascii"))
+    (PROGRAM_ROOT / "Автозапуск.cmd").write_bytes(AUTOSTART_CMD.encode("ascii"))
+
+    # настройки: где исходники (для правок и PR)
+    settings_path = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                     / "minigen-gui" / "settings.json")
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if settings_path.is_file():
+        try:
+            data = json.loads(settings_path.read_text(encoding="utf-8"))
+        except ValueError:
+            data = {}
+    if not data.get("codeRepo"):
+        data["codeRepo"] = str(REPO)
+        settings_path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+    print("   программа поставлена: %s (electron: %d файлов)" % (PROGRAM_ROOT, count))
+
+    # ярлыки: рабочий стол + автозапуск (старый ярлык панели — в архив)
+    ps = r'''
+$ErrorActionPreference = "SilentlyContinue"
+$root = "%s"
+$shell = New-Object -ComObject WScript.Shell
+$desktop = [Environment]::GetFolderPath("Desktop")
+$link = $shell.CreateShortcut((Join-Path $desktop "МиниГен.lnk"))
+$link.TargetPath = (Join-Path $root "Запустить.cmd")
+$link.Arguments = ""
+$link.WorkingDirectory = $root
+$link.Description = "МиниГен — единая программа с графическим интерфейсом"
+$link.Save()
+$old = Join-Path $desktop "МиниГен — панель (управление).lnk"
+if (Test-Path $old) { Move-Item $old (Join-Path $root "МиниГен — панель (управление).lnk") -Force }
+$startup = [Environment]::GetFolderPath("Startup")
+$pyw = @(
+  (Join-Path $env:LOCALAPPDATA "Programs\Python\Python312\pythonw.exe"),
+  (Join-Path $env:LOCALAPPDATA "Programs\Python\Python313\pythonw.exe")) |
+  Where-Object { Test-Path $_ } | Select-Object -First 1
+if ($pyw) {
+  $auto = $shell.CreateShortcut((Join-Path $startup "МиниГен (демоны).lnk"))
+  $auto.TargetPath = $pyw
+  $auto.Arguments = '"' + (Join-Path $root "app\bridge\minigen_bridge.py") + '" --daemon'
+  $auto.WorkingDirectory = (Join-Path $root "app\bridge")
+  $auto.Description = "МиниГен — фоновый режим: сторожа аккаунтов, сети и сессий"
+  $auto.Save()
+}
+$oldStartup = Join-Path $startup "МиниГен.lnk"
+if (Test-Path $oldStartup) {
+  $oldLink = $shell.CreateShortcut($oldStartup)
+  if ($oldLink.Arguments -like "*mcode-panel-supervisor*") { Remove-Item $oldStartup -Force }
+}
+''' % str(PROGRAM_ROOT)
+    proc = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                          capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        print("   ⚠️ ярлыки: %s" % ((proc.stderr or "").strip()[:200]))
+    else:
+        print("   ярлыки: рабочий стол + автозапуск → %s" % PROGRAM_ROOT)
+    return True
+
+
 def main() -> int:
     # Источник кода: по умолчанию master. `--ref` — раскатать из другой
     # ветки (нужно, когда правка срочная, а слияние PR ещё не прошло):
@@ -131,6 +266,12 @@ def main() -> int:
         good = r.returncode == 0
         ok = ok and good
         print("   компиляция %-26s %s" % (name, "ок" if good else "ОШИБКА " + r.stderr[-200:]))
+
+    print("--- установка программы (Ф6: раскатка ставит новую программу) ---")
+    if "--no-program" not in sys.argv:
+        ok = install_program() and ok
+    else:
+        print("   пропущено (--no-program)")
     r = subprocess.run([sys.executable, str(BIN / "minimax-netwatch.py"), "--status"],
                        capture_output=True, text=True, encoding="utf-8", errors="replace",
                        timeout=180)

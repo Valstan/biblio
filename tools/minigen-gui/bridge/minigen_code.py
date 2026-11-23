@@ -41,10 +41,32 @@ from typing import Any
 # ─────────────────────────────────────────────────────────── репозиторий
 
 def repo_root() -> Path:
-    """Корень репозитория программы (вверх от папки моста)."""
+    """Корень репозитория с исходниками программы (для правок и PR).
+
+    Порядок поиска:
+
+    1. `MINIGEN_CODE_REPO` — явное указание;
+    2. настройка `codeRepo` (её пишет установщик): программа может стоять
+       в своём месте (`%LOCALAPPDATA%\\Programs\\МиниГен`), а исходники —
+       в репозитории; правки и PR делаются по исходникам;
+    3. вверх по дереву до каталога с `.git` — когда программа запущена из
+       самого репозитория (разработка);
+    4. иначе — каталог программы (правки работать не смогут, и команда
+       это скажет).
+    """
     env = os.environ.get("MINIGEN_CODE_REPO")
     if env:
         return Path(env).resolve()
+    try:
+        import json
+        settings = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) \
+            / "minigen-gui" / "settings.json"
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        configured = str(data.get("codeRepo") or "").strip()
+        if configured:
+            return Path(configured).resolve()
+    except (OSError, ValueError, AttributeError):
+        pass
     here = Path(__file__).resolve()
     for parent in here.parents:
         if (parent / ".git").exists():
