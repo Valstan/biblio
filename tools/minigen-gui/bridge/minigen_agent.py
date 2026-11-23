@@ -245,14 +245,16 @@ class Agent:
         settings = self.settings_provider() if self.settings_provider else {}
         try:
             eff = provider.effective(area_slug, settings)
-        except provider.ProviderUnavailable:
+        except Exception:  # noqa: BLE001
+            # каталог/конфиг недоступны — чат всё равно должен работать
+            # (модель и токен берём из обычного конфига провайдера)
             eff = {}
         if model:
             # явная модель из запроса — важнее настроек (её выбирает оператор
             # в этом же чате), но параметры модели всё равно родные
             try:
                 eff = provider.effective(area_slug, {**settings, "model": model})
-            except provider.ProviderUnavailable:
+            except Exception:  # noqa: BLE001
                 eff = {"model": model}
         if eff.get("model"):
             cfg["model"] = eff["model"]

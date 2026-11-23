@@ -57,11 +57,13 @@ def area_config_path(area_slug: str) -> Path:
 
 def read_area_config(area_slug: str) -> dict[str, Any]:
     """Прочитать `config.yaml` области (как это делает рантайм)."""
-    import yaml
-
     path = area_config_path(area_slug)
     if not path.is_file():
         raise ProviderUnavailable("нет конфига провайдера: %s" % path)
+    try:
+        import yaml
+    except ImportError as exc:
+        raise ProviderUnavailable("PyYAML не установлен: %s" % exc)
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception as exc:  # noqa: BLE001
