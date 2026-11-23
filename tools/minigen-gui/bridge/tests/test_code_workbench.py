@@ -29,7 +29,12 @@ import minigen_code as code  # noqa: E402
 
 
 def make_repo(path: Path) -> None:
-    """Мини-репозиторий с одним файлом."""
+    """Мини-репозиторий с одним файлом.
+
+    ⚠️ 23.11: identity git задаётся **в самом репозитории**, а не только через
+    переменные окружения. Иначе тесты проходят на машине владельца (где
+    глобальный `user.name` есть) и падают в CI: «Author identity unknown».
+    """
     path.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     env["GIT_AUTHOR_NAME"] = "Тест"
@@ -38,6 +43,10 @@ def make_repo(path: Path) -> None:
     env["GIT_COMMITTER_EMAIL"] = "test@example.invalid"
     subprocess.run(["git", "init", "-q", "-b", "master"], cwd=str(path), check=True,
                    env=env, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Тест"], cwd=str(path),
+                   check=True, env=env, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.invalid"],
+                   cwd=str(path), check=True, env=env, capture_output=True)
     (path / "mod.py").write_text("VALUE = 1\nprint(VALUE)\n", encoding="utf-8")
     (path / "config.yaml").write_text("apiKey: secret\n", encoding="utf-8")
     subprocess.run(["git", "add", "-A"], cwd=str(path), check=True, env=env,

@@ -432,7 +432,12 @@ def commit(message: str) -> dict[str, Any]:
     git(["add", "-A"], worktree)
     res = git(["commit", "-m", message], worktree, timeout=180)
     if not res["ok"]:
-        return {"error": "коммит не прошёл: %s" % (res["err"] or res["out"])}
+        err = res["err"] or res["out"]
+        low = err.lower()
+        if "identity" in low or "tell me who you are" in low:
+            err = ("не задана identity git в этом репозитории "
+                   "(git config user.name / user.email)")
+        return {"error": "коммит не прошёл: %s" % err}
     return {"ok": True, "branch": branch, "files": files, "note": note,
             "out": res["out"]}
 
