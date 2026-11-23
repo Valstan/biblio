@@ -79,7 +79,50 @@ try {
 
 // ────────────────────────────── утилиты ──────────────────────────────
 
-function readJson(p) { try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; } }
+function sleepSync(ms) {
+  const sab = new SharedArrayBuffer(4);
+  Atomics.wait(new Int32Array(sab), 0, 0, ms);
+}
+
+// Чтение JSON с повтором: файл могут в эту секунду переписывать (гонка на
+// записи). Один неудачный разбор — не причина сказать «конфиг не читается».
+function readJson(p) {
+  for (let i = 0; i < 5; i++) {
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (e) {
+      if (i === 4) return null;
+      sleepSync(40);
+    }
+  }
+  return null;
+}
+
+// Запись JSON АТОМАРНО: временный файл рядом + переименование.
+//
+// ⚠️ Windows: `rename` поверх файла, который сейчас открыт другим
+// процессом, может отказать (ERROR_ACCESS_DENIED) — читатель в Python
+// держит файл без FILE_SHARE_DELETE. Поэтому переименование повторяем
+// (окно у читателя — миллисекунды), и если и это не помогло — пишем на
+// место: действие владельца («Автомат/Вручную») важнее атомарности, а
+// читатель теперь терпимо перечитывает файл при сбое разбора.
+function writeJsonAtomic(file, text) {
+  const tmp = file + '.tmp';
+  fs.writeFileSync(tmp, text, 'utf8');
+  let lastErr = null;
+  for (let i = 0; i < 30; i++) {
+    try {
+      fs.renameSync(tmp, file);
+      return true;
+    } catch (e) {
+      lastErr = e;
+      sleepSync(100);
+    }
+  }
+  try { fs.unlinkSync(tmp); } catch {}
+  log('ВНИМАНИЕ: атомарная запись ' + file + ' не удалась (' +
+      String(lastErr && lastErr.code) + ') — пишу на место');
+  fs.writeFileSync(file, text, 'utf8');
+  return false;
+}
 
 function log(line) {
   // Время МЕСТНОЕ, как у лечащего: тот пишет в тот же файл и по местному,
@@ -243,9 +286,7 @@ function setMode(slug, mode) {
     // Прямая запись обрывает файл на середине, и читатель (демон, новая
     // программа) ловит обрывок JSON: в журнале это выглядит как
     // «конфиг … не читается (Expecting ',' delimiter)» — 23.11, дважды.
-    const tmp = PROJECTS_FILE + '.tmp';
-    fs.writeFileSync(tmp, renderConfig(cfg), 'utf8');
-    fs.renameSync(tmp, PROJECTS_FILE);
+    writeJsonAtomic(PROJECTS_FILE, renderConfig(cfg));
   } catch (e) {
     return { ok: false, error: String(e && e.message || e) };
   }
