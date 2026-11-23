@@ -266,12 +266,22 @@ if (Test-Path $oldStartup) {
 # ─────────────────────────────────────────────── менеджеры фонового режима
 
 def manager_processes() -> list[tuple[int, str]]:
-    """Живые фоновые менеджеры программы: (pid, командная строка)."""
-    ps = ("Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | "
+    """Живые фоновые менеджеры программы: (pid, командная строка).
+
+    ⚠️ Кодировка вывода PowerShell — UTF-8 **явно**: в команде менеджера есть
+    кириллица (путь установки «МиниГен»), и при декодировании по умолчанию
+    (кодовая страница консоли) она превращалась в мусор ⇒ сравнение с
+    `PROGRAM_ROOT` не сходилось, и установленный менеджер в журнале раскатки
+    назывался «устаревшим». Раньше это было безобидно (старый код пропускал
+    установленного), теперь — нет: всех надо останавливать.
+    """
+    ps = ("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+          "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | "
           "Where-Object { $_.CommandLine -like '*minigen_bridge.py*' } | "
           "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }")
     res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True, errors="replace", timeout=60)
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=60)
     out: list[tuple[int, str]] = []
     for line in (res.stdout or "").splitlines():
         line = line.strip()
@@ -384,7 +394,16 @@ def main() -> int:
 
     print("--- установка программы (Ф6: раскатка ставит новую программу) ---")
     if "--no-program" not in sys.argv:
-        ok = install_program() and ok
+        try:
+            ok = install_program() and ok
+        except OSError as exc:
+            # ⚠️ Чаще всего: открыто окно «МиниГена» — файлы Electron заняты
+            # (WinError 32). Демоны к этому моменту УЖЕ обновлены, поэтому
+            # ронять всю раскатку нельзя: говорим и идём дальше.
+            print("   ⚠️ программа не обновлена: %s" % (exc,))
+            print("      (обычно это открытое окно «МиниГен» — файлы заняты; "
+                  "закройте окно и повторите раскатку)")
+            ok = False
         print("--- фоновый режим из установленного места ---")
         if start_installed_manager():
             # демоны поднимаются с паузой (20 с) по очереди — сторож может
