@@ -140,6 +140,8 @@ def install_program() -> bool:
 
     Исходники при этом остаются в репозитории: программа знает их
     (настройка `codeRepo`) и правит их через PR.
+
+    Рядом с программой пишется `version.json` — какая версия установлена.
     """
     import json
     import shutil
@@ -168,6 +170,22 @@ def install_program() -> bool:
     shutil.copy2(PROGRAM_SRC / "package.json", app / "package.json")
     (PROGRAM_ROOT / "Запустить.cmd").write_bytes(LAUNCHER_CMD.encode("ascii"))
     (PROGRAM_ROOT / "Автозапуск.cmd").write_bytes(AUTOSTART_CMD.encode("ascii"))
+
+    # Версия установленной копии: коммит исходников + время установки.
+    # Урок 23.11: программа без версии меняется вместе с веткой репозитория;
+    # установленная копия версию имеет, и показывает её в окне.
+    import time
+    commit = ""
+    try:
+        res = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True, timeout=15)
+        commit = (res.stdout or "").strip()
+    except Exception:  # noqa: BLE001
+        commit = ""
+    version = {"commit": commit, "installed_at": int(time.time()),
+               "source": str(REPO)}
+    (PROGRAM_ROOT / "version.json").write_text(
+        json.dumps(version, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # настройки: где исходники (для правок и PR)
     settings_path = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))

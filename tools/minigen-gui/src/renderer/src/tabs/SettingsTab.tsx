@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import type { DaemonStatus, Settings, Snapshot } from '@shared/types'
+import type { DaemonStatus, ProgramVersion, Settings, Snapshot } from '@shared/types'
 import { api } from '../api'
 
 interface Props {
@@ -12,6 +12,7 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   const [form, setForm] = useState<Settings | null>(settings)
   const [note, setNote] = useState('')
   const [daemons, setDaemons] = useState<DaemonStatus | null>(null)
+  const [version, setVersion] = useState<ProgramVersion | null>(null)
 
   useEffect(() => {
     if (settings && !form) setForm(settings)
@@ -20,6 +21,7 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   useEffect(() => {
     const load = () => api.daemonsStatus().then(setDaemons).catch(() => undefined)
     void load()
+    void api.programVersion().then(setVersion).catch(() => undefined)
     const timer = window.setInterval(() => void load(), 5000)
     return () => window.clearInterval(timer)
   }, [])
@@ -50,6 +52,35 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
         </button>
       </div>
       {note && <div className="banner">{note}</div>}
+
+      <div className="card">
+        <h3>Программа</h3>
+        <table className="grid compact">
+          <tbody>
+            <tr>
+              <td>Версия</td>
+              <td className="muted">
+                {version?.commit ? `коммит ${version.commit}` : 'неизвестна'}
+                {version?.installed_at
+                  ? ` · установлено ${new Date(version.installed_at).toLocaleString('ru-RU')}`
+                  : ''}
+              </td>
+            </tr>
+            <tr>
+              <td>Запущена из</td>
+              <td className="muted">{version?.running_from ?? '—'}</td>
+            </tr>
+            <tr>
+              <td>Исходники (для правок и PR)</td>
+              <td className="muted">{version?.source || '—'}</td>
+            </tr>
+          </tbody>
+        </table>
+        <p className="muted small">
+          Программа стоит отдельно от репозитория — её версия не зависит от того,
+          какая ветка checkout в исходниках.
+        </p>
+      </div>
 
       <div className="card">
         <h3>Демоны «МиниГена»</h3>

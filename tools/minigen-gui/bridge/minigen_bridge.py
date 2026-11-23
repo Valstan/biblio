@@ -141,6 +141,8 @@ class Bridge:
             "daemons.start": self.cmd_daemons_start,
             "daemons.stop": self.cmd_daemons_stop,
             "daemons.restart": self.cmd_daemons_restart,
+            # версия программы
+            "program.version": self.cmd_program_version,
         }
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -561,6 +563,9 @@ class Bridge:
         return code.discard_worktree()
 
     # ──────────────────────────────────────────────────────────── демоны
+    def cmd_program_version(self, args: dict[str, Any]) -> dict[str, Any]:
+        return state.jsonable(state.program_version())
+
     def cmd_daemons_status(self, args: dict[str, Any]) -> dict[str, Any]:
         return state.jsonable(daemons.status())
 

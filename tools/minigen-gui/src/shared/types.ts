@@ -156,6 +156,14 @@ export interface DaemonStatus {
   checked_at: number
 }
 
+export interface ProgramVersion {
+  commit: string
+  installed_at: number
+  source: string
+  installed: boolean
+  running_from: string
+}
+
 export interface BridgeEvent {
   kind: 'bridge-status' | 'bridge-error'
   message: string
