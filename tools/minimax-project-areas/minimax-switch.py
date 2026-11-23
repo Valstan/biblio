@@ -202,7 +202,7 @@ def panel(token: str, action: str = "status") -> tuple:
         # 8 с, а не 25: вендор обычно отвечает за секунду, а «не отвечает» в
         # панели нам и так означает «токен мёртв» — ждать дольше бессмысленно,
         # из-за этих ожиданий страница панели висела по минуте (15.11).
-        with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as resp:
+        with _open_direct_then_proxy(req, timeout=8) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, {}
@@ -276,6 +276,8 @@ def running_areas() -> set:
             # ⚠️ CREATE_NO_WINDOW обязателен: вызывающий демон идёт
             # отсоединённо (консоли у него нет), а дочерний powershell без
             # этого флага получает свою консоль — на экране мигает окно (23.11).
+            # Эту проверку зовёт сторож сессий каждые ~10 с — то есть окно
+            # мигало постоянно.
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         for line in (out.stdout or "").splitlines():
@@ -401,6 +403,47 @@ def karman_token() -> str:
     return os.environ.get("KARMAN_ROOM_TOKEN") or secrets().get("SECRETS_TOKEN") or ""
 
 
+# ────────────────────────── соединение мимо прокси ──────────────────────────
+#
+# На машине владельца стоит локальный прокси (FlyFrogHapp/xray: SOCKS 10808,
+# HTTP 10809), и весь python-код по умолчанию идёт в него через переменные
+# окружения (HTTPS_PROXY=http://127.0.0.1:10809).
+#
+# ЧТО БЫЛО 21.11, 19:26–20:11 МСК: HTTP-порт прокси (10809) перестал слушать
+# (SOCKS 10808 — слушал). Весь python-код получал «connection refused» — и НИ
+# ОДИН запрос ни до КАРМАНА, ни до вендора не доходил. Лечащий писал в журнал
+# «аккаунт не получен (пул Кармана пуст или отказ)»: витрина врала — пул был
+# ни при чём, запрос не уходил вообще. И area-сессии падали с «insufficient
+# balance» не потому, что очек нет, а потому, что новый аккаунт не доехал.
+#
+# Проверено 21.11: и КАРМАН (свой бокс), и панель вендора (agent.minimax.io)
+# ДОСТУПНЫ НАПРЯМУЮ — прокси им не нужен. Поэтому: сначала напрямую
+# (ProxyHandler({})), и только если прямо не вышло — через прокси (на случай,
+# если прямой маршрут когда-нибудь перекроют).
+def _direct_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=SSL_CTX),
+    )
+
+
+def _proxy_opener() -> urllib.request.OpenerDirector:
+    return urllib.request.build_opener(urllib.request.HTTPSHandler(context=SSL_CTX))
+
+
+def _open_direct_then_proxy(req, timeout: int = 30):
+    """Открыть соединение: сначала напрямую, при сетевой ошибке — через прокси."""
+    problems = []
+    for opener in (_direct_opener(), _proxy_opener()):
+        try:
+            return opener.open(req, timeout=timeout)
+        except urllib.error.HTTPError:
+            raise  # ответ сервера (401/403/429) — это не сеть, показываем как есть
+        except Exception as exc:  # noqa: BLE001
+            problems.append("%s: %s" % (type(exc).__name__, str(exc)[:120]))
+    raise urllib.error.URLError("; ".join(problems))
+
+
 def karman_available(project: str = "", area: str = "") -> tuple:
     """GET /api/minimax/accounts/available — отдаёт аккаунт вместе с парой (разово).
 
@@ -425,7 +468,7 @@ def karman_available(project: str = "", area: str = "") -> tuple:
         headers["X-MiniMax-Area"] = area
     req = urllib.request.Request(url, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30, context=SSL_CTX) as resp:
+        with _open_direct_then_proxy(req, timeout=30) as resp:
             return resp.status, json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         try:
@@ -434,7 +477,7 @@ def karman_available(project: str = "", area: str = "") -> tuple:
             body = {}
         return exc.code, body
     except Exception as exc:  # noqa: BLE001
-        return 0, {"error": "%s: %s" % (type(exc).__name__, str(exc)[:120])}
+        return 0, {"error": "%s: %s" % (type(exc).__name__, str(exc)[:160])}
 
 
 def karman_note_activation(email: str, account_id=None, activation_index=None,
@@ -476,7 +519,7 @@ def karman_note_activation(email: str, account_id=None, activation_index=None,
     req = urllib.request.Request("%s/api/minimax/activations" % base, data=data, method="POST",
                                  headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=30, context=SSL_CTX) as resp:
+        with _open_direct_then_proxy(req, timeout=30) as resp:
             return (200 <= resp.status < 300), "HTTP %s" % resp.status
     except urllib.error.HTTPError as exc:
         try:
@@ -486,7 +529,7 @@ def karman_note_activation(email: str, account_id=None, activation_index=None,
         why = payload.get("error") if isinstance(payload, dict) else None
         return False, "HTTP %s: %s" % (exc.code, why or "")
     except Exception as exc:  # noqa: BLE001
-        return False, "%s: %s" % (type(exc).__name__, str(exc)[:120])
+        return False, "%s: %s" % (type(exc).__name__, str(exc)[:160])
 
 
 _KARMAN_PROJECT_CACHE = {"ts": 0.0, "map": {}}
@@ -728,7 +771,11 @@ def cmd_pull(args) -> int:
         return 0
     status, payload = karman_available(area_project(area), area.name)
     if status != 200:
-        print("Карман ответил %s: %s" % (status, payload.get("error") or payload), file=sys.stderr)
+        # В stdout, а не в stderr: лечащий перехватывает stdout и пишет его в
+        # журнал — иначе причина отказа видна только в консоли, а в журнале
+        # остаётся невнятное «аккаунт не получен» (21.11: так и вышло — сеть
+        # была убита прокси, а в журнале читалось «пул пуст»).
+        print("Карман ответил %s: %s" % (status, payload.get("error") or payload))
         return 1
     account = payload.get("account") or {}
     access = str(payload.get("access_token") or "")

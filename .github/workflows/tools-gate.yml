@@ -33,3 +33,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_minigen_contour_restart.py
       - name: Приёмка «без мигающих окон»
         run: python3 tools/minimax-project-areas/test_no_console_windows.py
+      - name: Приёмка списка раскатки (все файлы, что грузят демоны)
+        run: python3 tools/minimax-project-areas/test_rollout_covers_runtime_files.py
