@@ -74,8 +74,56 @@ class DaemonMatchingTest(unittest.TestCase):
         self.assertIsNone(pattern.search(one_shot))
 
 
+class ApiTest(unittest.TestCase):
+    """Локальный API программы (его зовёт сетевой сторож)."""
+
+    def test_contour_excludes_netwatch(self) -> None:
+        import minigen_api
+        names = [spec["script"] for spec in minigen_api.contour_daemons()]
+        self.assertNotIn("minimax-netwatch.py", names,
+                         "сетевой сторож не должен перезапускать сам себя")
+        self.assertIn("minimax-autheal.py", names)
+        self.assertIn("minimax-sessionwatch.py", names)
+
+    def test_api_requires_token(self) -> None:
+        import urllib.error
+        import urllib.request
+
+        import minigen_api
+        old_token_file = minigen_api.TOKEN_FILE
+        old_local = minigen_api.LOCAL
+        with tempfile.TemporaryDirectory() as tmp:
+            minigen_api.LOCAL = Path(tmp)
+            minigen_api.TOKEN_FILE = Path(tmp) / "bridge-token.txt"
+            try:
+                server = minigen_api.HTTPServer(("127.0.0.1", 0),
+                                               minigen_api.Handler)
+                import threading
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                port = server.server_address[1]
+                try:
+                    with urllib.request.urlopen(
+                            "http://127.0.0.1:%d/status" % port, timeout=5) as resp:
+                        self.fail("без токена доступ не должен открываться: %s"
+                                  % resp.status)
+                except urllib.error.HTTPError as exc:
+                    self.assertEqual(exc.code, 401)
+
+                # с токеном — открывается
+                token = minigen_api.token()
+                with urllib.request.urlopen(
+                        "http://127.0.0.1:%d/status?token=%s" % (port, token),
+                        timeout=5) as resp:
+                    self.assertEqual(resp.status, 200)
+                server.shutdown()
+                server.server_close()
+            finally:
+                minigen_api.TOKEN_FILE = old_token_file
+                minigen_api.LOCAL = old_local
+
+
 class ConfigWriteRaceTest(unittest.TestCase):
-    """Настоящая функция записи под параллельным чтением."""
 
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

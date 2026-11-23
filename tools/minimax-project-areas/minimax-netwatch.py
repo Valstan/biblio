@@ -585,18 +585,54 @@ def set_proxy_env(http_proxy: str, socks_proxy: str) -> None:
         pass
 
 
-def restart_contour() -> bool:
-    """Перезапустить панель и лечащего (они должны унаследовать новый прокси).
+def contour_targets() -> list:
+    """К кому звать за перезапуском контура (по убыванию предпочтения).
 
-    Супервизор (:8098) умеет поднять панель; сам супервизор и сторожа не
-    трогаем — иначе восстановление умрёт на полпути.
+    1. **Программа «МиниГен»** (локальный API :8097) — нынешний
+       процесс-менеджер демонов. С 23.11 (Ф6) супервизор старой панели
+       архивирован, и звать его больше некуда: каскад восстановления сети
+       переключал прокси, но контур не перезапускался — лечащий и сторож
+       сессий продолжали работать со СТАРЫМИ прокси-переменными и ходили по
+       мёртвому пути.
+    2. **Старый супервизор** (:8098) — запасной путь для машин, где старая
+       панель ещё работает.
+
+    Токен — из файла, который завела программа; без него запрос не
+    принимается (случайная веб-страница не должна перезапускать демоны).
     """
+    targets = []
+    token = ""
     try:
-        urllib.request.urlopen("http://127.0.0.1:8098/restart-contour", timeout=20).read()
-        return True
-    except Exception as exc:  # noqa: BLE001
-        core.log("перезапуск контура не удался: %s" % exc)
-        return False
+        from pathlib import Path
+        token_file = (Path(os.environ.get("LOCALAPPDATA", "")) / "minigen-gui"
+                       / "bridge-token.txt")
+        token = token_file.read_text(encoding="utf-8").strip()
+    except OSError:
+        token = ""
+    if token:
+        targets.append(("http://127.0.0.1:8097/restart-contour",
+                        {"X-MiniGen-Token": token}))
+    targets.append(("http://127.0.0.1:8098/restart-contour", {}))
+    return targets
+
+
+def restart_contour() -> bool:
+    """Перезапустить контур (лечащий и сторож сессий) — им нужен новый прокси.
+
+    Процессы, запущенные до смены прокси, наследуют старые переменные
+    окружения. Сам сетевой сторож не трогаем — он на середине восстановления.
+    """
+    last = ""
+    for url, headers in contour_targets():
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            urllib.request.urlopen(req, timeout=30).read()
+            core.log("СЕТЬ: контур перезапущен (%s)" % url)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            last = "%s (%s)" % (url, exc)
+    core.log("перезапуск контура не удался: %s" % last)
+    return False
 
 
 def switch_path(to: str, cfg: dict) -> dict:
