@@ -3,6 +3,7 @@ import type {
   ChatReply,
   DaemonStatus,
   JournalLine,
+  ModelCatalog,
   NetworkState,
   ProgramVersion,
   Settings,
@@ -56,6 +57,12 @@ export const api = {
   chatReset: () => call<{ ok: boolean }>('chat.reset'),
   daemonsStatus: () => call<DaemonStatus>('daemons.status'),
   programVersion: () => call<ProgramVersion>('program.version'),
+  modelCatalog: (area?: string) => call<ModelCatalog>('model.catalog', area ? { area } : {}),
+  modelApply: (args: { model?: string; modelContext?: number; modelEffort?: string; areas?: string[] }) =>
+    call<{ applied: unknown[]; failed: unknown[]; changed: number; error?: string }>(
+      'model.apply',
+      args
+    ),
   daemonsStart: (name?: string) => call<unknown>('daemons.start', name ? { name } : {}),
   daemonsStop: (name?: string) => call<unknown>('daemons.stop', name ? { name } : {}),
   daemonsRestart: (name?: string) => call<unknown>('daemons.restart', name ? { name } : {}),

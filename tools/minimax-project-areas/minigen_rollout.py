@@ -139,12 +139,38 @@ start "" "%PYTHONW%" "%~dp0app\\bridge\\minigen_bridge.py" --daemon
 
 
 def _copy_tree(src: Path, dst: Path, skip=()) -> int:
+    """Скопировать дерево, **не падая** на занятых файлах.
+
+    ⚠️ Живой случай (23.11, 00:00): открытое окно «МиниГена» держит файлы
+    Electron-рантайма (`WinError 32`), и раскатка на этом падала целиком —
+    хотя демоны к тому моменту уже были обновлены, а не обновлялся только
+    рантайм (он меняется редко). Теперь занятые файлы пропускаем и говорим
+    о них: программа подхватит их при следующем запуске.
+    """
+    import fnmatch
     import shutil
+
     if not src.is_dir():
         return 0
-    shutil.copytree(src, dst, dirs_exist_ok=True,
-                    ignore=shutil.ignore_patterns(*skip) if skip else None)
-    return sum(1 for path in dst.rglob("*") if path.is_file())
+    copied = 0
+    locked: list[str] = []
+    for path in src.rglob("*"):
+        if any(fnmatch.fnmatch(path.name, pat) for pat in skip):
+            continue
+        target = dst / path.relative_to(src)
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.copy2(path, target)
+            copied += 1
+        except OSError:
+            locked.append(path.name)
+    if locked:
+        print("   ⚠️ %d файлов заняты (открыто окно «МиниГена»?) — пропущены: %s"
+              % (len(locked), ", ".join(locked[:4]) + ("…" if len(locked) > 4 else "")))
+    return copied
 
 
 def install_program() -> bool:

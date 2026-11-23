@@ -92,7 +92,7 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
           Надзиратель:{' '}
           {daemons?.supervisor ? (
             <>
-              pid {daemons.supervisor.pid}
+              {daemons.supervisor.is_self ? 'это окно' : `pid ${daemons.supervisor.pid}`}
               {daemons.supervisor.alive ? '' : ' (процесса нет)'}
               {daemons.supervisor.path ? ` · ${daemons.supervisor.path}` : ''}
             </>

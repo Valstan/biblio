@@ -37,5 +37,7 @@ jobs:
         run: npm test
       - name: Сборка
         run: npm run build
+      - name: Зависимости Python
+        run: pip install pyyaml
       - name: Тесты моста
         run: python -m unittest discover -s bridge/tests -t . -v

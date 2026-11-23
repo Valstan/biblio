@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import type { ChatReply, ToolCall } from '@shared/types'
+import { useEffect, useState } from 'react'
+import type { ChatReply, ModelCatalog, ModelEntry, ToolCall } from '@shared/types'
 import { api } from '../api'
 
 interface Message {
@@ -14,6 +14,11 @@ interface Message {
  * Нейросеть не «говорит» — она вызывает инструменты и выполняет их. Поэтому
  * в чате видно, что она сделала. Опасные действия (перезапуск области, смена
  * аккаунта, отправка сообщения) требуют подтверждения владельца.
+ *
+ * Над чатом — выбор модели, размера контекста и уровня эффорта. Списки
+ * берутся **из родного конфига платформы** (`contextWindowOptions`,
+ * `thinking.effortOptions`), поэтому выбор выглядит как в родной среде и
+ * останется верным, когда появится другая платформа.
  */
 export default function ChatTab() {
   const [messages, setMessages] = useState<Message[]>([
@@ -25,6 +30,65 @@ export default function ChatTab() {
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [pending, setPending] = useState<ChatReply['pending'] | undefined>(undefined)
+  const [catalog, setCatalog] = useState<ModelCatalog | null>(null)
+  const [model, setModel] = useState('')
+  const [context, setContext] = useState(0)
+  const [effort, setEffort] = useState('')
+  const [modelNote, setModelNote] = useState('')
+
+  const loadCatalog = async () => {
+    try {
+      const cat = await api.modelCatalog()
+      setCatalog(cat)
+      const eff = cat.effective
+      setModel(eff?.model ?? cat.default_model)
+      setContext(eff?.context ?? cat.area_context ?? 0)
+      setEffort(eff?.effort ?? cat.area_effort ?? '')
+    } catch (err) {
+      setModelNote(`каталог моделей недоступен: ${(err as Error).message}`)
+    }
+  }
+
+  useEffect(() => {
+    void loadCatalog()
+  }, [])
+
+  const entry: ModelEntry | undefined = catalog?.models.find((m) => m.id === model)
+  const contextOptions = entry?.context_options?.length
+    ? entry.context_options
+    : (catalog?.effective?.context_options ?? [])
+  const effortOptions = entry?.effort_options?.length
+    ? entry.effort_options
+    : (catalog?.effective?.effort_options ?? [])
+
+  const saveModel = async () => {
+    setBusy(true)
+    try {
+      await api.saveSettings({ model, modelContext: context, modelEffort: effort })
+      setModelNote('сохранено: модель, контекст и эффорт — и для чата, и для областей')
+    } catch (err) {
+      setModelNote(`не сохранилось: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const applyToAreas = async () => {
+    setBusy(true)
+    try {
+      await api.saveSettings({ model, modelContext: context, modelEffort: effort })
+      const res = await api.modelApply({ model, modelContext: context, modelEffort: effort })
+      const changed = res.changed ?? 0
+      const failed = res.failed?.length ?? 0
+      setModelNote(
+        `применено к областям: изменено ${changed}${failed ? `, не получилось: ${failed}` : ''}`
+      )
+    } catch (err) {
+      setModelNote(`не применилось: ${(err as Error).message}`)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   const apply = (reply: ChatReply) => {
     setMessages((prev) => [
@@ -87,6 +151,54 @@ export default function ChatTab() {
         >
           Очистить
         </button>
+      </div>
+
+      <div className="card model-bar">
+        <div className="row">
+          <label>
+            Модель{' '}
+            <select value={model} onChange={(e) => setModel(e.target.value)}>
+              {(catalog?.models ?? []).map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name} ({item.id})
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Контекст{' '}
+            <select value={context} onChange={(e) => setContext(Number(e.target.value))}>
+              {contextOptions.map((value) => (
+                <option key={value} value={value}>
+                  {value.toLocaleString('ru-RU')}
+                  {entry?.context_hints?.[String(value)] ? ` (${entry.context_hints[String(value)]})` : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            Эффорт{' '}
+            <select value={effort} onChange={(e) => setEffort(e.target.value)}>
+              {effortOptions.map((value) => (
+                <option key={value} value={value}>
+                  {value}
+                </option>
+              ))}
+            </select>
+          </label>
+          <button className="ghost" onClick={() => void saveModel()} disabled={busy}>
+            Сохранить
+          </button>
+          <button className="ghost" onClick={() => void applyToAreas()} disabled={busy}>
+            Применить к областям
+          </button>
+        </div>
+        <div className="muted small">
+          {catalog
+            ? `Провайдер ${catalog.provider_name} · настройки взяты из его родового конфига${catalog.config_path ? ` (${catalog.config_path})` : ''}`
+            : 'каталог моделей загружается…'}
+          {modelNote ? ` · ${modelNote}` : ''}
+        </div>
       </div>
 
       <div className="chat-log">

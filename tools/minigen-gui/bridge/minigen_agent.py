@@ -36,6 +36,8 @@ from typing import Any, Callable
 HERE = Path(__file__).resolve().parent
 KNOWLEDGE_PACK = HERE.parent / "docs" / "knowledge-pack.md"
 
+import minigen_provider as provider  # noqa: E402
+
 MAX_ROUNDS = 24
 DEFAULT_TIMEOUT = 120
 # Сколько символов ответа инструмента уходит обратно в модель. Файлы кода
@@ -138,7 +140,12 @@ def _post_json(url: str, headers: dict[str, str], body: dict[str, Any],
 def chat_completion(messages: list[dict[str, Any]], system: str,
                     tools: list[dict[str, Any]], cfg: dict[str, Any],
                     timeout: int = DEFAULT_TIMEOUT) -> dict[str, Any]:
-    """Один запрос к модели (Anthropic-совместимый `/messages`)."""
+    """Один запрос к модели (Anthropic-совместимый `/messages`).
+
+    ⚠️ Модель, окно контекста и уровень эффорта берём **родными** для
+    платформы: `thinking: {type: "enabled", effort: "<уровень>"}` — эту форму
+    вендор принимает (проверено пробой 23.11), и ровно её же шлёт рантайм.
+    """
     url = cfg["base_url"] + "/messages"
     headers = {"Content-Type": "application/json",
                "anthropic-version": "2023-06-01"}
@@ -147,15 +154,17 @@ def chat_completion(messages: list[dict[str, Any]], system: str,
     token = cfg.get("token") or cfg.get("api_key") or ""
     if token:
         headers["Authorization"] = "Bearer " + token
+    max_output = int(cfg.get("max_output") or 0)
     body: dict[str, Any] = {
         "model": cfg["model"],
-        "max_tokens": 4096,
+        "max_tokens": max_output if max_output else 4096,
         "messages": messages,
     }
     if system:
         body["system"] = system
     if tools:
         body["tools"] = tools
+    body.update(provider.request_params(cfg))
     return _post_json(url, headers, body, timeout=timeout)
 
 
@@ -202,10 +211,12 @@ class Agent:
 
     def __init__(self, dispatch: Callable[[str, dict[str, Any]], Any],
                  tools: list[dict[str, Any]],
-                 token_provider: Callable[[str], str] | None = None):
+                 token_provider: Callable[[str], str] | None = None,
+                 settings_provider: Callable[[], dict[str, Any]] | None = None):
         self.dispatch = dispatch
         self.tools = tools
         self.token_provider = token_provider
+        self.settings_provider = settings_provider
         self.pending: dict[str, Any] | None = None
 
     # ── низкий уровень ──
@@ -220,13 +231,37 @@ class Agent:
         ]
 
     def _model_config(self, area_slug: str, model: str = "") -> dict[str, Any]:
+        """Конфиг запроса: модель, окно контекста, эффорт — родными словами.
+
+        Порядок выбора: **выбор оператора** (настройки программы) → родной
+        дефолт области → дефолт модели. Значения, которых платформа не
+        объявляет, не выдумываются.
+        """
         cfg = provider_config(area_slug)
         if self.token_provider:
             token = self.token_provider(area_slug)
             if token:
                 cfg["token"] = token
+        settings = self.settings_provider() if self.settings_provider else {}
+        try:
+            eff = provider.effective(area_slug, settings)
+        except Exception:  # noqa: BLE001
+            # каталог/конфиг недоступны — чат всё равно должен работать
+            # (модель и токен берём из обычного конфига провайдера)
+            eff = {}
         if model:
-            cfg["model"] = model
+            # явная модель из запроса — важнее настроек (её выбирает оператор
+            # в этом же чате), но параметры модели всё равно родные
+            try:
+                eff = provider.effective(area_slug, {**settings, "model": model})
+            except Exception:  # noqa: BLE001
+                eff = {"model": model}
+        if eff.get("model"):
+            cfg["model"] = eff["model"]
+        cfg["context"] = int(eff.get("context") or 0)
+        cfg["effort"] = str(eff.get("effort") or "")
+        cfg["variant"] = str(eff.get("variant") or "")
+        cfg["max_output"] = int(eff.get("max_output") or 0)
         return cfg
 
     def _tool_by_name(self, name: str) -> dict[str, Any] | None:

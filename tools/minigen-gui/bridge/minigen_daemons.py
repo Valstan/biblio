@@ -91,6 +91,20 @@ def daemon_pids(spec: dict[str, str]) -> list[int]:
     return pids
 
 
+def _supervisor_info() -> dict[str, Any] | None:
+    """Кто надзирает за демонами — и надзирает ли ЭТОТ процесс.
+
+    `is_self` нужно окну, чтобы сказать владельцу человеческим языком:
+    «надзиратель — это окно» или «надзиратель — фоновый режим». Без этого
+    непонятно, кто держит демонов (23.11, вопрос владельца).
+    """
+    owner = minigen_lock.read_owner()
+    if owner is None:
+        return None
+    owner["is_self"] = int(owner.get("pid") or 0) == os.getpid()
+    return owner
+
+
 def status() -> dict[str, Any]:
     """Состояние демонов: кто жив, чем занят, где лежит скрипт."""
     out: list[dict[str, Any]] = []
@@ -111,7 +125,7 @@ def status() -> dict[str, Any]:
         "total": len(out),
         "checked_at": int(time.time() * 1000),
         # кто надзирает (по блокировке) — чтобы видеть дубль, а не гадать
-        "supervisor": minigen_lock.read_owner(),
+        "supervisor": _supervisor_info(),
     }
 
 

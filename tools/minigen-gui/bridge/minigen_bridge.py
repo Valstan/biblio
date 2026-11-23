@@ -43,6 +43,7 @@ import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
 import minigen_lock as minigen_lock    # noqa: E402
+import minigen_provider as provider_mod  # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
@@ -80,7 +81,9 @@ class Bridge:
         self.mods = state.load_daemons()
         self.core = self.mods["core"]
         self.tools = tools.TOOLS
-        self.agent = Agent(self.dispatch, self.tools, token_provider=self._area_token)
+        self.agent = Agent(self.dispatch, self.tools,
+                           token_provider=self._area_token,
+                           settings_provider=state.read_settings)
         self.chat_history: list[dict[str, Any]] = []
         self._points: dict[str, dict[str, Any]] = {}
         self._points_at: dict[str, int] = {}
@@ -158,6 +161,10 @@ class Bridge:
             "daemons.restart": self.cmd_daemons_restart,
             # версия программы
             "program.version": self.cmd_program_version,
+            # модель нейросети: каталог (родные настройки платформы) и
+            # применение выбора к рабочим областям
+            "model.catalog": self.cmd_model_catalog,
+            "model.apply": self.cmd_model_apply,
         }
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -597,6 +604,58 @@ class Bridge:
     # ──────────────────────────────────────────────────────────── демоны
     def cmd_program_version(self, args: dict[str, Any]) -> dict[str, Any]:
         return state.jsonable(state.program_version())
+
+    # ─────────────────────────────────────────────────── модель нейросети
+    def cmd_model_catalog(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Каталог моделей области — с **родными** настройками платформы.
+
+        Оператор выбирает в интерфейсе ровно то, что платформа объявляет:
+        окна контекста (`contextWindowOptions`), уровни эффорта
+        (`thinking.effortOptions`), варианты мышления. Ничего не выдумано —
+        поэтому список будет верным и для другой платформы, когда появится.
+        """
+        settings = state.read_settings()
+        area = str(args.get("area") or settings.get("modelArea") or "minigen")
+        try:
+            cat = provider_mod.catalog(area)
+        except provider_mod.ProviderUnavailable as exc:
+            return {"error": str(exc)}
+        try:
+            eff = provider_mod.effective(area, settings)
+        except provider_mod.ProviderUnavailable:
+            eff = {}
+        out = state.jsonable(cat)
+        out["effective"] = state.jsonable(eff)
+        out["area"] = area
+        return out
+
+    def cmd_model_apply(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Разложить выбранные модель/контекст/эффорт по рабочим областям.
+
+        Пишем **нативными** ключами (`defaultModel`,
+        `defaultModelContextWindow`, `defaultModelThinking.effort`) — так, как
+        это объявляет сама платформа, чтобы рантайм принял без возражений.
+        """
+        settings = state.read_settings()
+        area = str(args.get("area") or settings.get("modelArea") or "minigen")
+        try:
+            eff = provider_mod.effective(area, {**settings, **{
+                k: v for k, v in (args or {}).items()
+                if k in ("model", "modelContext", "modelEffort")}})
+        except provider_mod.ProviderUnavailable as exc:
+            return {"error": str(exc)}
+        slugs = [str(s) for s in (args.get("areas") or []) if str(s).strip()]
+        if not slugs:
+            slugs = [a["slug"] for a in self.mods["core"].areas()]
+        res = provider_mod.apply_to_areas(
+            slugs, eff["model"], int(eff.get("context") or 0),
+            str(eff.get("effort") or ""), str(eff.get("variant") or ""))
+        res["effective"] = state.jsonable(eff)
+        self.core.log("Панель «МиниГен»: настройки модели %s (контекст %s, эффорт %s) "
+                      "применены к областям: %d" % (eff["model"], eff.get("context"),
+                                                   eff.get("effort"),
+                                                   res.get("changed") or 0))
+        return state.jsonable(res)
 
     def cmd_daemons_status(self, args: dict[str, Any]) -> dict[str, Any]:
         return state.jsonable(daemons.status())

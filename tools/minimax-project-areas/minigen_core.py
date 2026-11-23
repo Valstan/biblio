@@ -205,15 +205,71 @@ def area_env(area_dir: Path) -> dict:
     return env
 
 
+def model_preferences() -> dict:
+    """Модель и эффорт, выбранные оператором в программе «МиниГен».
+
+    Читаются из её настроек (`%LOCALAPPDATA%\\minigen-gui\\settings.json`).
+    Файла нет — пусто: тогда действуют **родные** дефолты области (те, что
+    в её `config.yaml`), то есть выбор оператора ничего не ломает.
+    """
+    out = {"model": "", "effort": ""}
+    path = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+            / "minigen-gui" / "settings.json")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    if isinstance(data, dict):
+        out["model"] = str(data.get("model") or "")
+        out["effort"] = str(data.get("modelEffort") or "")
+    return out
+
+
+def provider_of_area(area_dir: Path) -> str:
+    """Провайдер области по её родному конфигу (`defaultModel: minimax/...`)."""
+    try:
+        text = (area_dir / "config.yaml").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "minimax"
+    match = re.search(r"(?m)^defaultModel:\s*([A-Za-z0-9_.-]+)/", text)
+    return match.group(1) if match else "minimax"
+
+
+def model_flags(area_dir: Path, model: str = "", effort: str = "") -> list:
+    """Флаги `--model/--effort` для запуска рантайма — родными словами.
+
+    Рантайм умеет `--model <провайдер/модель>` и `--effort <уровень>`
+    («override ... for this Run only»), поэтому выбор оператора действует и
+    на уже открытые сессии, а не только на новые.
+    """
+    prefs = model_preferences()
+    model = model or prefs["model"]
+    effort = effort or prefs["effort"]
+    out: list = []
+    if model:
+        out += ["--model", "%s/%s" % (provider_of_area(area_dir), model)]
+    if effort:
+        out += ["--effort", effort]
+    return out
+
+
 def mcode_run(args: list, area_dir: Path, timeout: int = 300,
-              background: bool = False, logfile=None):
+              background: bool = False, logfile=None, model: str = "",
+              effort: str = ""):
     """Запустить `mcode` в контексте области.
 
     `background=True` — ход уходит в фоне (как «Продолжай»): ждать его в
     цикле нельзя, цикл должен обходить области по очереди.
+
+    Флаги модели/эффорта вставляются **перед** текстом запроса: текст —
+    позиционный аргумент, и флаг после него рантайм может принять за часть
+    запроса.
     """
     env = area_env(area_dir)
     cmd = [str(MCODE)] + list(args)
+    model_flags_list = model_flags(area_dir, model, effort)
+    if model_flags_list and len(cmd) > 1:
+        cmd = cmd[:1] + cmd[1:-1] + model_flags_list + cmd[-1:]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     if background:
         out = logfile if logfile is not None else subprocess.DEVNULL
