@@ -23,6 +23,7 @@
  2. Останавливает демонов — поднимает их **супервизор** (дублей не будет).
  3. Проверяет: компиляция, вердикты сессий, состояние сети.
 """
+import os
 import subprocess
 import sys
 import time
@@ -32,7 +33,17 @@ BIN = Path(r"C:\Users\valstan\bin")
 REPO = Path(r"D:\valstan\REPO\biblio")
 REL = "tools/minimax-project-areas"
 FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
-         "mcode-panel-supervisor.js")
+         "minimax-autheal.py", "mcode-panel-supervisor.js")
+# ⚠️ 23.11: `minimax-autheal.py` в списке НЕ БЫЛ — раскатка выкладывала
+# сторожей, но не лечащего. Отсюда и расхождение «репозиторий ↔ машина»:
+# правки лечащего жили только на машине, а эталон (master) отставал, и
+# раскатка откатывала бы свежие правки. Лечащий — самый опасный демон
+# (перезапускает десктопы), значит его-то и не выкладывали.
+#
+# Плюс проверка журнала на «сбой прохода»: демон может молча падать на каждом
+# проходе (процесс жив ⇒ супервизор его не перезапускает ⇒ 9,5 часов никто
+# не оживал сессий). Скрипт обязан это видеть и сказать, а не отчитаться
+# «готово».
 
 
 def master_file(name: str) -> bytes:
@@ -64,7 +75,8 @@ def main() -> int:
 
     print("--- проверка ---")
     ok = True
-    for name in ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py"):
+    for name in ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
+                 "minimax-autheal.py"):
         r = subprocess.run([sys.executable, "-m", "py_compile", str(BIN / name)],
                            capture_output=True, text=True)
         good = r.returncode == 0
@@ -93,6 +105,27 @@ def main() -> int:
          "Where-Object { $_.CommandLine -like '*minimax-*' }).Count"],
         capture_output=True, text=True, timeout=60)
     print("   живых процессов МиниГена: %s" % (live.stdout or "?").strip())
+
+    # ── проверка журнала: демон может молча падать на каждом проходе ──
+    # (процесс жив ⇒ супервизор его не перезапускает ⇒ «всё живо» снаружи,
+    #  а внутри журнал полон «сбой прохода»). 22.11 это стоило 9,5 часов.
+    journal = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" / "journal.log"
+    fails = []
+    try:
+        if journal.is_file():
+            tail = journal.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]
+            fails = [ln for ln in tail if "сбой прохода" in ln]
+    except OSError:
+        pass
+    if fails:
+        ok = False
+        print("   ⚠️ ЖУРНАЛ: сбой прохода (сторож падает) — %d строк, последние:" % len(fails))
+        for line in fails[-3:]:
+            print("     " + line.strip())
+        print("   ⚠️ раскатка без этого НЕ ЗАВЕРШЕНА: демон молча падает")
+    else:
+        print("   журнал: «сбой прохода» нет — сторож проходит")
+
     print("=== готово ===" if ok else "=== ЕСТЬ ОШИБКИ ===")
     return 0 if ok else 1
 
