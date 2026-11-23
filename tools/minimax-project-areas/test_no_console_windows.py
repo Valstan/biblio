@@ -33,9 +33,12 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import os
 import pathlib
 import socket
+import subprocess
 import sys
+from pathlib import Path
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -72,6 +75,46 @@ def load_netwatch():
     sys.argv = ["x"]
     spec.loader.exec_module(mod)
     return mod
+
+
+def visible_console_window(flags: int) -> int | None:
+    """Есть ли **видимое** окно у дочернего powershell с такими флагами.
+
+    ⚠️ Проверять надо именно окно, а не процесс `conhost.exe`: с флагом
+    `CREATE_NO_WINDOW` консоль у процесса **всё равно создаётся** (conhost
+    появляется!), но без окна — `GetConsoleWindow()` = 0. Поэтому «появился
+    conhost» ≠ «мигнуло окно» (на этом обманулся первый наблюдатель).
+
+    Возвращает дескриптор окна (0 — окна нет) или None, если проверить не
+    вышло.
+    """
+    import os
+    import tempfile
+
+    if os.name != "nt":
+        return None
+    script = (
+        "Add-Type -Namespace W -Name K -MemberDefinition "
+        "'[DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow();';"
+        "[W.K]::GetConsoleWindow().ToInt64() | Set-Content -Path $env:MG_WIN_PROBE"
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        probe = Path(tmp) / "win.txt"
+        env = dict(os.environ)
+        env["MG_WIN_PROBE"] = str(probe)
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True, text=True, timeout=60, env=env,
+                creationflags=flags)
+        except Exception:  # noqa: BLE001
+            return None
+        if proc.returncode != 0 or not probe.is_file():
+            return None
+        try:
+            return int(probe.read_text(encoding="utf-8").strip() or 0)
+        except ValueError:
+            return None
 
 
 def main() -> int:
@@ -118,6 +161,21 @@ def main() -> int:
                 pass
     finally:
         netwatch.subprocess.run = original_run
+
+    print("3) на Windows: с флагом окна нет, без флага — есть")
+    flag = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    with_flag = visible_console_window(flag)
+    without_flag = visible_console_window(0)
+    if with_flag is None:
+        print("   пропущено (проверка только для Windows)")
+    else:
+        check(with_flag == 0,
+              "с CREATE_NO_WINDOW окно должно быть скрыто, а GetConsoleWindow=%s"
+              % with_flag)
+        if without_flag is not None:
+            check(without_flag != 0,
+                  "без флага окно должно появляться (иначе проверка бессмысленна), "
+                  "а GetConsoleWindow=%s" % without_flag)
 
     if failures:
         print("❌ окна консоли: FAIL (%d)" % len(failures))
