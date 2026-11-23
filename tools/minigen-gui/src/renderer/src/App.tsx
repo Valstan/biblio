@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import type { Settings, Snapshot } from '@shared/types'
+import type { ProgramVersion, Settings, Snapshot } from '@shared/types'
 import { api } from './api'
 import { buildStatsCsv } from './format'
 import AreasTab from './tabs/AreasTab'
@@ -24,6 +24,7 @@ export default function App() {
   const [tab, setTab] = useState<Tab>('areas')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
+  const [version, setVersion] = useState<ProgramVersion | null>(null)
   const [bridge, setBridge] = useState({ alive: false, message: 'мост не запущен' })
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
@@ -36,6 +37,8 @@ export default function App() {
     } catch (err) {
       setError(String((err as Error).message || err))
     }
+    // версия меняется только при раскатке — но пусть и в шапке будет видна
+    void api.programVersion().then(setVersion).catch(() => undefined)
   }, [])
 
   useEffect(() => {
@@ -89,6 +92,26 @@ export default function App() {
   const areas = snapshot?.areas ?? []
   const running = useMemo(() => areas.filter((area) => area.running).length, [areas])
 
+  // ── индикатор «жив ли МиниГен» (23.11, вопрос владельца) ──────────────
+  // Показываем в шапке, на любой вкладке: сколько демонов живо, кто ими
+  // надзирает (это окно или фоновый режим) и какая версия программы идёт.
+  const daemons = snapshot?.daemons
+  const aliveCount = daemons?.alive_count ?? 0
+  const totalCount = daemons?.total ?? 0
+  const daemonTone = totalCount > 0 && aliveCount === totalCount ? 'ok' : 'bad'
+  const supervisor = daemons?.supervisor ?? null
+  const supervisorLabel = !supervisor
+    ? 'надзирателя нет'
+    : supervisor.is_self
+      ? 'надзиратель: это окно'
+      : supervisor.alive
+        ? 'надзиратель: фоновый режим'
+        : 'надзиратель: его нет'
+  const supervisorTone = supervisor && supervisor.alive ? 'ok' : 'bad'
+  const versionLabel = version?.commit
+    ? `${version.installed ? 'установленная копия' : 'рабочее дерево'} ${version.commit}`
+    : ''
+
   return (
     <div className="app">
       <header className="topbar">
@@ -98,11 +121,14 @@ export default function App() {
             <h1>МиниГен</h1>
             <span className="sub">
               {areas.length} областей · {running} запущено
+              {versionLabel ? ` · ${versionLabel}` : ''}
               {snapshot?.config_error ? ' · конфиг не читается!' : ''}
             </span>
           </div>
         </div>
         <div className="topbar-actions">
+          <span className={`chip ${daemonTone}`}>демоны {aliveCount}/{totalCount}</span>
+          <span className={`chip ${supervisorTone}`}>{supervisorLabel}</span>
           <span className={`status ${bridge.alive ? 'ok' : 'bad'}`}>{bridge.message}</span>
           <button className="ghost" onClick={() => void refresh()} disabled={busy}>
             Обновить

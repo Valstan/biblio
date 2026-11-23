@@ -97,6 +97,12 @@ export interface Settings {
   manageDaemons: boolean
   modelArea: string
   model: string
+  /** окно контекста модели (0 = взять родное значение области/модели) */
+  modelContext: number
+  /** уровень эффорта модели ('' = взять родное значение области/модели) */
+  modelEffort: string
+  /** разложить выбранные настройки по рабочим областям */
+  modelApplyToAreas: boolean
   confirmDangerous: boolean
   statsWindow: number
 }
@@ -149,6 +155,8 @@ export interface SupervisorInfo {
   path: string
   since?: number
   alive: boolean
+  /** Надзиратель — этот самый процесс (окно программы). */
+  is_self?: boolean
 }
 
 export interface DaemonStatus {
@@ -165,6 +173,44 @@ export interface ProgramVersion {
   source: string
   installed: boolean
   running_from: string
+}
+
+/** Модель — с её **родными** настройками (как объявляет платформа). */
+export interface ModelEntry {
+  id: string
+  name: string
+  context_default: number
+  context_options: number[]
+  context_hints: Record<string, string>
+  effort_options: string[]
+  effort_default: string
+  max_output: number
+  variants: { id: string; thinking: Record<string, unknown> }[]
+  reasoning: boolean
+}
+
+/** Каталог моделей провайдера области + что используется сейчас. */
+export interface ModelCatalog {
+  provider: string
+  provider_name: string
+  npm: string
+  models: ModelEntry[]
+  default_model: string
+  area_context: number
+  area_effort: string
+  area_variant: string
+  config_path: string
+  area?: string
+  effective?: {
+    provider: string
+    model: string
+    context: number
+    effort: string
+    variant: string
+    max_output: number
+    effort_options: string[]
+    context_options: number[]
+  }
 }
 
 export interface BridgeEvent {
