@@ -152,6 +152,95 @@ TOOLS: list[dict[str, Any]] = [
            "properties": {"slug": SLUG, "session_id": {"type": "string"}},
            "required": ["slug", "session_id"]},
           "sessions.close", True, "закроет сессию"),
+
+    # ── самообновление программы ────────────────────────────────────────
+    _tool("code.list",
+          "Список файлов репозитория программы (исходники «МиниГена» и "
+          "соседние модули). Начинай с него, если ищешь, где что лежит.",
+          {"type": "object",
+           "properties": {"path": {"type": "string", "description": "подкаталог, пусто — весь репозиторий"}},
+           "required": []},
+          "code.list"),
+
+    _tool("code.read",
+          "Прочитать файл репозитория программы. Файлы с ключами и "
+          "авторизацией закрыты — их читать нельзя (и не нужно). "
+          "Большие файлы можно читать по частям: start_line и end_line.",
+          {"type": "object",
+           "properties": {
+               "path": {"type": "string", "description": "путь относительно корня репозитория"},
+               "start_line": {"type": "integer", "description": "с какой строки читать"},
+               "end_line": {"type": "integer", "description": "до какой строки читать"}},
+           "required": ["path"]},
+          "code.read"),
+
+    _tool("code.search",
+          "Поиск по репозиторию программы: где встречается текст. Возвращает "
+          "файл, номер строки и саму строку.",
+          {"type": "object",
+           "properties": {"query": {"type": "string"}, "path": {"type": "string"}},
+           "required": ["query"]},
+          "code.search"),
+
+    _tool("code.branch",
+          "Начать правку программы: создать отдельный git-worktree и ветку "
+          "под неё. Правка идёт в отдельном дереве (дерево сессии не "
+          "трогается), и только в ветке — никогда в master.",
+          {"type": "object",
+           "properties": {"title": {"type": "string", "description": "что чиним, коротко"}},
+           "required": ["title"]},
+          "code.branch", True, "создаст ветку и отдельное рабочее дерево"),
+
+    _tool("code.patch",
+          "Точечная правка файла в worktree правки: заменить фрагмент "
+          "другим. Фрагмент должен встречаться РОВНО один раз — иначе "
+          "правка не применяется (приблизительная замена — это порча кода).",
+          {"type": "object",
+           "properties": {
+               "path": {"type": "string"},
+               "find": {"type": "string", "description": "что заменить, дословно"},
+               "replace": {"type": "string", "description": "на что заменить"}},
+           "required": ["path", "find", "replace"]},
+          "code.patch", True, "изменит код программы"),
+
+    _tool("code.diff",
+          "Показать текущий diff правки в worktree: какие файлы изменены и "
+          "как. Смотри diff перед коммитом — так видно, что правка не задела "
+          "лишнего.",
+          {"type": "object", "properties": {}},
+          "code.diff"),
+
+    _tool("code.tests",
+          "Прогнать проверки репозитория в worktree правки (тесты моста, "
+          "приёмка панели, приёмка записи конфига). Зелёные проверки — "
+          "условие для PR.",
+          {"type": "object",
+           "properties": {"target": {"type": "string",
+                                     "description": "all | python | panel | race | js"}},
+           "required": []},
+          "code.tests"),
+
+    _tool("code.commit",
+          "Закоммитить правку в ветку worktree (сообщение коммита — по "
+          "правилам репозитория: Conventional Commits, по-английски).",
+          {"type": "object",
+           "properties": {"message": {"type": "string"}},
+           "required": ["message"]},
+          "code.commit", True, "закоммитит правку в ветку"),
+
+    _tool("code.pr",
+          "Отправить ветку и открыть PR в master по правилам репозитория "
+          "(ветка → коммит → push → PR; прямой пуш в master запрещён). "
+          "Решение о слиянии — за владельцем.",
+          {"type": "object",
+           "properties": {"title": {"type": "string"}, "body": {"type": "string"}},
+           "required": ["title"]},
+          "code.pr", True, "отправит ветку и откроет PR"),
+
+    _tool("code.discard",
+          "Убрать worktree правки и её ветку (правка не нужна).",
+          {"type": "object", "properties": {}},
+          "code.discard", True, "удалит worktree правки и её ветку"),
 ]
 
 
