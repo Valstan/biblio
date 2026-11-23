@@ -126,6 +126,34 @@ class StatsTest(unittest.TestCase):
         self.assertIn("ротирую", lines[0]["text"])
 
 
+class DaemonDirTest(unittest.TestCase):
+    """Где мост ищет ядро — и что делает, если живой копии нет.
+
+    ⚠️ 23.11: тут была ошибка (`REPO_TOOLS` считали неверно), и её нашла
+    встроенная нейросеть. Первая правка тоже была неверной, а проверки
+    проходили — потому что запасной путь не был покрыт тестом. Теперь
+    покрыт.
+    """
+
+    def test_repo_tools_holds_the_core(self) -> None:
+        self.assertTrue((state.REPO_TOOLS / "minigen_core.py").is_file(),
+                        "REPO_TOOLS указывает не туда: %s" % state.REPO_TOOLS)
+        self.assertTrue((state.REPO_TOOLS / "minimax-sessionwatch.py").is_file(),
+                        "в эталонах нет сторожа сессий: %s" % state.REPO_TOOLS)
+
+    def test_fallback_uses_repo_copy(self) -> None:
+        import tempfile
+        old = state.LIVE_BIN
+        # подменяем именно константу модуля: она читается при импорте
+        state.LIVE_BIN = Path(tempfile.gettempdir()) / "no-such-bin"
+        try:
+            base = state.daemon_dir()
+        finally:
+            state.LIVE_BIN = old
+        self.assertEqual(base, state.REPO_TOOLS)
+        self.assertTrue((base / "minigen_core.py").is_file())
+
+
 class SettingsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

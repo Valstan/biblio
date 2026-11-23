@@ -19,3 +19,7 @@
 /instructions/linux_commands.txt
 /instructions/install_new_server.txt
 /instructions/crontab_postopus.txt
+
+# Worktree'ы встроенной нейросети «МиниГена» (правка модулей программы) —
+# отдельные рабочие деревья, в главный репозиторий они не попадают
+/.claude/worktrees/

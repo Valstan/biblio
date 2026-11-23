@@ -40,6 +40,7 @@ sys.path.insert(0, str(HERE))
 
 import minigen_state as state          # noqa: E402
 import minigen_tools as tools          # noqa: E402
+import minigen_code as code            # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
@@ -105,6 +106,17 @@ class Bridge:
             "chat.confirm": self.cmd_chat_confirm,
             "chat.reset": self.cmd_chat_reset,
             "app.open_folder": self.cmd_open_folder,
+            # самообновление программы
+            "code.list": self.cmd_code_list,
+            "code.read": self.cmd_code_read,
+            "code.search": self.cmd_code_search,
+            "code.branch": self.cmd_code_branch,
+            "code.patch": self.cmd_code_patch,
+            "code.tests": self.cmd_code_tests,
+            "code.diff": self.cmd_code_diff,
+            "code.commit": self.cmd_code_commit,
+            "code.pr": self.cmd_code_pr,
+            "code.discard": self.cmd_code_discard,
         }
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -487,6 +499,42 @@ class Bridge:
         """История без системного промпта и без хвоста: не пухнет."""
         out = [m for m in history if m.get("role") != "system"]
         return out[-limit:]
+
+    # ──────────────────────────────────────────────────── самообновление
+    def cmd_code_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {"files": code.list_files(str(args.get("path") or ""))}
+
+    def cmd_code_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        return code.read_file(str(args.get("path") or ""),
+                              int(args.get("start_line") or 0),
+                              int(args.get("end_line") or 0))
+
+    def cmd_code_search(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {"hits": code.search(str(args.get("query") or ""),
+                                    str(args.get("path") or ""))}
+
+    def cmd_code_branch(self, args: dict[str, Any]) -> dict[str, Any]:
+        return code.create_worktree(str(args.get("title") or ""))
+
+    def cmd_code_patch(self, args: dict[str, Any]) -> dict[str, Any]:
+        return code.apply_patch(str(args.get("path") or ""),
+                                str(args.get("find") or ""),
+                                str(args.get("replace") or ""))
+
+    def cmd_code_tests(self, args: dict[str, Any]) -> dict[str, Any]:
+        return code.run_tests(str(args.get("target") or "all"))
+
+    def cmd_code_diff(self, args: dict[str, Any]) -> dict[str, Any]:
+        return code.diff()
+
+    def cmd_code_commit(self, args: dict[str, Any]) -> dict[str, Any]:
+        return code.commit(str(args.get("message") or ""))
+
+    def cmd_code_pr(self, args: dict[str, Any]) -> dict[str, Any]:
+        return code.open_pr(str(args.get("title") or ""), str(args.get("body") or ""))
+
+    def cmd_code_discard(self, args: dict[str, Any]) -> dict[str, Any]:
+        return code.discard_worktree()
 
     # ────────────────────────────────────────────────────────────── прочее
     def cmd_open_folder(self, args: dict[str, Any]) -> dict[str, Any]:

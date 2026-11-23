@@ -30,7 +30,13 @@ from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
-REPO_TOOLS = HERE.parent.parent.parent / "minimax-project-areas"
+# Эталон демонов в репозитории: tools/minimax-project-areas.
+# ⚠️ 23.11: тут была ошибка, и её нашла встроенная нейросеть (PR #72).
+# Ошибка была не в «сколько parent'ов», а в том, что папка не была указана:
+# `HERE.parent.parent` — это `tools/`, а нужен `tools/minimax-project-areas`.
+# Первая правка (три parent'а) увела на корень репозитория — мимо.
+# Теперь путь проверяется тестом, а не «на глаз».
+REPO_TOOLS = HERE.parent.parent / "minimax-project-areas"
 LIVE_BIN = Path(os.environ.get("MINIGEN_BIN", r"C:\Users\valstan\bin"))
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT",
                                   str(Path.home() / ".minimax-areas")))
@@ -87,7 +93,14 @@ def load_daemons() -> dict[str, Any]:
     if str(base) not in sys.path:
         sys.path.insert(0, str(base))
     mods: dict[str, Any] = {"dir": base}
-    mods["core"] = _load_module("minigen_core", base / "minigen_core.py")
+    core_path = base / "minigen_core.py"
+    if not core_path.is_file():
+        # Понятное сообщение вместо трассы FileNotFoundError: иначе ошибку
+        # видно только в логе моста, а на экране — пустое окно.
+        raise FileNotFoundError(
+            "не найдено ядро «МиниГена»: %s (искали в %s и в %s)"
+            % (core_path, LIVE_BIN, REPO_TOOLS))
+    mods["core"] = _load_module("minigen_core", core_path)
     for attr, file in (
         ("switch", "minimax-switch.py"),
         ("sessionwatch", "minimax-sessionwatch.py"),

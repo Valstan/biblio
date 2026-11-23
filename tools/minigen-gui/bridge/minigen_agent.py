@@ -36,8 +36,12 @@ from typing import Any, Callable
 HERE = Path(__file__).resolve().parent
 KNOWLEDGE_PACK = HERE.parent / "docs" / "knowledge-pack.md"
 
-MAX_ROUNDS = 6
+MAX_ROUNDS = 24
 DEFAULT_TIMEOUT = 120
+# Сколько символов ответа инструмента уходит обратно в модель. Файлы кода
+# читаются целиком — иначе модель видит только начало модуля и не может
+# найти нестыковку (окно модели — 1 млн токенов, места хватает).
+TOOL_RESULT_LIMIT = 24_000
 
 
 class ModelUnavailable(RuntimeError):
@@ -288,7 +292,9 @@ class Agent:
                  "content": json.dumps(_trim(result), ensure_ascii=False)}
                 for call, result in results
             ]})
-        return {"status": "done", "text": "цикл достиг лимита шагов",
+        return {"status": "done",
+                "text": "достигнут лимит шагов (%d) — сузьте запрос: назни файл "
+                        "или конкретную функцию" % MAX_ROUNDS,
                 "calls": calls, "history": messages}
 
     def confirm(self, approved: bool, history: list[dict[str, Any]],
@@ -331,7 +337,7 @@ def _pending_view(pending: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _trim(value: Any, limit: int = 6000) -> Any:
+def _trim(value: Any, limit: int = TOOL_RESULT_LIMIT) -> Any:
     """Обрезать ответ инструмента: в промпт уходит не всё."""
     if isinstance(value, str):
         return value[:limit]
