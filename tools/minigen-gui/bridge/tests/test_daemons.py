@@ -116,11 +116,21 @@ class ApiTest(unittest.TestCase):
                         "http://127.0.0.1:%d/status?token=%s" % (port, token),
                         timeout=5) as resp:
                     self.assertEqual(resp.status, 200)
+
+                # живой API = другой фоновый экземпляр уже работает
+                self.assertTrue(minigen_api.another_instance_running(port=port))
+
                 server.shutdown()
                 server.server_close()
             finally:
                 minigen_api.TOKEN_FILE = old_token_file
                 minigen_api.LOCAL = old_local
+
+    def test_no_instance_when_api_is_silent(self) -> None:
+        import minigen_api
+        # свободный порт, на котором никто не слушает
+        self.assertFalse(minigen_api.another_instance_running(port=8099,
+                                                              timeout=2))
 
 
 class ConfigWriteRaceTest(unittest.TestCase):
