@@ -18,6 +18,10 @@ const api = {
   saveText(name: string, content: string): Promise<{ ok: boolean; path: string; error?: string }> {
     return ipcRenderer.invoke('minigen:save-text', name, content)
   },
+  /** Флаги проверки (дымовая проверка экспорта CSV). */
+  smoke: {
+    csv: process.env.MINIGEN_SMOKE_CSV || ''
+  },
   /** События моста: он упал / поднялся. */
   onEvent(handler: (event: BridgeEvent) => void): () => void {
     const listener = (_event: unknown, payload: BridgeEvent) => handler(payload)

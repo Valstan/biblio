@@ -48,15 +48,22 @@ POINTS_TTL_MS = 60_000
 
 
 def _run(cmd: list[str], timeout: int = 180) -> dict[str, Any]:
-    """Запустить внешнюю команду и вернуть её вывод."""
+    """Запустить внешнюю команду и вернуть её вывод.
+
+    ⚠️ Набор ключей ВСЕГДА одинаковый: `ok`, `code`, `out`, `err`. Раньше при
+    таймауте возвращались `ok`/`error` без `err` — и вызывающий код падал с
+    `KeyError: 'err'` (ловится в CI: там нет powershell, и ветка таймаута
+    срабатывала).
+    """
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
                               timeout=timeout,
                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
-        return {"ok": False, "error": "команда не ответила за %d с" % timeout}
+        return {"ok": False, "code": -1, "out": "",
+                "err": "команда не ответила за %d с" % timeout}
     except OSError as exc:
-        return {"ok": False, "error": str(exc)}
+        return {"ok": False, "code": -1, "out": "", "err": str(exc)}
     return {
         "ok": proc.returncode == 0,
         "code": proc.returncode,
@@ -363,9 +370,26 @@ class Bridge:
         ok, err = state.write_projects(cfg)
         if not ok:
             return {"error": "конфиг не записан: %s" % err}
-        self.core.log("Панель «МиниГен»: создана область %s (%s)" % (slug, title))
+        # Ярлык на рабочем столе — той же командой, что и для остальных
+        # областей (своя реализация = вторая правда).
+        shortcut_note = ""
+        maker = self.core.BIN / "make-mcode-project-shortcuts.ps1"
+        if maker.is_file():
+            res = _run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-WindowStyle", "Hidden", "-File", str(maker)], timeout=180)
+            shortcut_note = ("ярлыки пересозданы" if res["ok"]
+                             else "ярлыки не пересозданы: %s" % (res["err"] or "")[:120])
+        else:
+            shortcut_note = "нет скрипта ярлыков: %s" % maker
+        folder_note = ""
+        if folder and not Path(folder).is_dir():
+            folder_note = ("рабочая папка не найдена: %s — создай её (или git worktree) "
+                           "до запуска области" % folder)
+        self.core.log("Панель «МиниГен»: создана область %s (%s) — %s" % (
+            slug, title, shortcut_note or "без ярлыков"))
         return {"ok": True, "slug": slug, "dir": str(area_dir),
-                "auth_from": copied, "folder": folder}
+                "auth_from": copied, "folder": folder,
+                "shortcut": shortcut_note, "folder_note": folder_note}
 
     # ────────────────────────────────────────────────────────────── сессии
     def _area(self, slug: str) -> dict[str, Any]:
