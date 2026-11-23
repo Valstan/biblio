@@ -119,18 +119,38 @@ def areas() -> list:
     return out
 
 
+_RUNNING_CACHE = {"ts": 0.0, "set": set(), "mod": None}
+RUNNING_TTL = 20.0          # сек: столько живёт ответ «какие области запущены»
+
+
 def running_areas() -> set:
     """Какие области сейчас запущены (живой список из minimax-switch.py).
 
     Механика одна — `minimax-switch.py`; дублировать её нельзя (17.11:
     две реализации разъехались и лечащий «чинил» несуществующие области).
+
+    ⚠️ Кэш и модуль держим **здесь**, а не внутри `minimax-switch.py`: модуль
+    каждый раз грузится заново (`spec_from_file_location` + `exec_module`),
+    и его собственный кэш (5 с) обнулялся бы на каждом вызове. Без этого
+    кэша сторож сессий (проход каждые ~10 с) порождал новый PowerShell на
+    каждый вызов — то есть «слишком много запросов» и мигающие окна (23.11).
     """
     import importlib.util
+    now = time.time()
+    if now - _RUNNING_CACHE["ts"] < RUNNING_TTL:
+        return set(_RUNNING_CACHE["set"])
     try:
-        spec = importlib.util.spec_from_file_location("minimax_switch", str(BIN / "minimax-switch.py"))
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod.running_areas() or set()
+        mod = _RUNNING_CACHE["mod"]
+        if mod is None:
+            spec = importlib.util.spec_from_file_location(
+                "minimax_switch", str(BIN / "minimax-switch.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _RUNNING_CACHE["mod"] = mod
+        result = mod.running_areas() or set()
+        _RUNNING_CACHE["ts"] = now
+        _RUNNING_CACHE["set"] = set(result)
+        return set(result)
     except Exception:  # noqa: BLE001
         return set()
 
