@@ -149,6 +149,26 @@ def base_url(port: int = PORT) -> str:
     return "http://127.0.0.1:%d" % port
 
 
+def another_instance_running(port: int = PORT, timeout: int = 5) -> bool:
+    """Живой ли уже другой фоновый экземпляр программы.
+
+    Проверка по **ответу API**, а не по файлу-флагу: флаг может остаться
+    от процесса, который упал, и тогда новый экземпляр не поднимется
+    (сторожа останутся без присмотра). API отвечает — значит, экземпляр
+    жив и второй поднимать не надо: два процесса-менеджера демонов — это
+    ровно то, из-за чего лечащий брал аккаунты дважды.
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            base_url(port) + "/status",
+            headers={"X-MiniGen-Token": token()})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def call(path: str, port: int = PORT, timeout: int = 60) -> dict[str, Any]:
     """Дёрнуть свой API (из демона или проверки)."""
     import urllib.request
