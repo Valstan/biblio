@@ -63,6 +63,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +81,8 @@ HAPP_SERVERS_FILE = core.BIN / "happ-servers.json"       # кандидаты с
 SUBS_LOG = Path(os.environ.get("LOCALAPPDATA", "")) / "Happ" / "logs" / "subscription_log.txt"
 
 RECOVER_COOLDOWN = 600      # секунд между попытками восстановления
+# Негодный сервер Happ возвращается в список через 6 ч (нода могла подняться).
+BAD_SERVER_TTL_S = 6 * 3600
 STEP_COOLDOWN = 120         # секунд между шагами каскада
 VENDOR_EVERY = 10           # как часто проверять вендора «по расписанию» (иначе — по событию)
 
@@ -133,8 +136,16 @@ def probe_path(path_cfg: dict, cfg: dict) -> dict:
             pass
     expect = (path_cfg.get("expect_country") or "").upper()
     if out["country"] and expect and out["country"].upper() != expect:
-        out["note"] = ("страна выхода %s вместо ожидаемой %s — нода упала, трафик ушёл "
-                       "напрямую" % (out["country"], expect))
+        # ⚠️ Несовпадение страны САМО ПО СЕБЕ — не поломка (23.11). Вендор
+        # Happ отдаёт разные серверы (NL/DE/AT/PL/CA…), и «ожидаемая страна»
+        # в конфиге устаревает. Прежний вывод «нода упала, трафик ушёл напрямую»
+        # приводил к каскаду восстановления (смена сервера → перезапуск ядра
+        # Happ → прокси на 30 с умирал) ⇒ в десктопах «The model service is
+        # unstable. Please try again.». Проверять надо не страну, а ЖИВ ЛИ ПУТЬ.
+        out["note"] = ("страна выхода %s вместо ожидаемой %s — вендор по этому пути "
+                       "отвечает (%s), значит нода жива, это просто другой сервер"
+                       % (out["country"], expect, out["code"]))
+        out["country_mismatch"] = True
     else:
         out["note"] = "путь живой"
     return out
@@ -255,6 +266,83 @@ def happ_scheme(action: str) -> bool:
         return False
 
 
+def machine_hwid() -> str:
+    """Windows MachineGuid — им Happ подписывает запрос (заголовок X-HWID).
+
+    Провайдер подписки NextGenVPN отдаёт список серверов **только** с этим
+    заголовком: без него — 404 (проверено 22.11: с `X-HWID: <MachineGuid>`
+    приходит 200 и 8898 байт, без него — 404 и 0 байт).
+    """
+    if winreg is None:
+        return ""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Cryptography") as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+            return str(value)
+    except OSError:
+        return ""
+
+
+def fetch_happ_servers() -> list:
+    r"""Список серверов Happ: тянем его подписку и разбираем.
+
+    Кэш — `%LOCALAPPDATA%\mcode-web\happ-servers.json` (12 ч).
+    """
+    cache = core.LOCAL / "happ-servers.json"
+    cached = core.read_state(cache)
+    if cached.get("servers"):
+        if core.now_ms() - int(cached.get("at") or 0) < 12 * 3600 * 1000:
+            return cached["servers"]
+    url = subscription_url()
+    hwid = machine_hwid()
+    if not url or not hwid:
+        return (cached.get("servers") or [])
+    try:
+        req = urllib.request.Request(url, headers={"X-HWID": hwid,
+                                                   "User-Agent": "Happ/1.6.16"})
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except Exception as exc:  # noqa: BLE001
+        core.log("СЕТЬ: подписку Happ не прочитать (%s) — беру кэш" % exc)
+        return (cached.get("servers") or [])
+    servers = []
+    for line in raw.replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        m = re.match(r"^(vless|vmess|trojan|ss)://[^@]*@([^/?#]+)\?[^#]*#?(.*)$", line)
+        if not m:
+            continue
+        scheme, hp, frag = m.groups()
+        host, _, port = hp.rpartition(":")
+        name = urllib.parse.unquote(frag) if frag else ""
+        servers.append({"name": name, "host": host.strip("[]"), "port": port,
+                        "scheme": scheme})
+    if servers:
+        core.write_state(cache, {"at": core.now_ms(), "servers": servers})
+        core.log("СЕТЬ: подписка Happ прочитана — серверов: %d" % len(servers))
+    return servers or (cached.get("servers") or [])
+
+
+def reg_delete(names) -> None:
+    """Убрать значения из реестра Happ."""
+    if winreg is None:
+        return
+    for name in names:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, HAPP_PREF_KEY, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                try:
+                    winreg.DeleteValue(key, name)
+                except FileNotFoundError:
+                    pass
+        except OSError:
+            pass
+
+
 def port_listening(port: int) -> bool:
     try:
         out = subprocess.run(["powershell", "-NoProfile", "-Command",
@@ -269,13 +357,10 @@ def port_listening(port: int) -> bool:
 def happ_candidates() -> list:
     """Список серверов Happ для переключения.
 
-    Источник — локальный файл `happ-servers.json` (его заполняет владелец
-    или сам сторож, когда подписка отвечает). Формат:
-        {"servers": [{"name": "...", "guid": "...", "host": "...", "port": "..."}]}
-    Файла нет ⇒ переключать сервер нечем, и сторож честно пишет об этом.
+    Формат элемента: {"name": ..., "host": ..., "port": ...} — ровно то, что
+    Happ пишет в реестр (`lastServerName/Host/Port`).
     """
-    data = core.read_state(HAPP_SERVERS_FILE)
-    return [s for s in (data.get("servers") or []) if s.get("host")]
+    return [s for s in (fetch_happ_servers() or []) if s.get("host")]
 
 
 def subscription_url() -> str:
@@ -288,16 +373,69 @@ def subscription_url() -> str:
     return urls[-1] if urls else ""
 
 
+def bad_servers(state: dict = None) -> set:
+    """Серверы Happ, помеченные негодными (отметка ещё свежая).
+
+    Пометка живёт TTL: нода могла подняться, и через пару часов сервер
+    снова годится. Старые пометки в список не возвращают.
+    """
+    state = state if state is not None else core.read_state(core.NET_STATE)
+    hosts = list(state.get("bad_servers") or [])
+    at = state.get("bad_servers_at") or {}
+    now = int(time.time())
+    out = set()
+    for h in hosts:
+        marked = int(at.get(h) or 0)
+        if marked and (now - marked) < BAD_SERVER_TTL_S:
+            out.add(h)
+    return out
+
+
+def mark_bad_server(host: str, state: dict, why: str = "") -> None:
+    """Пометить сервер Happ негодным — иначе выборщик снова возьмёт его первым.
+
+    22.11: список `bad_servers` читался, но не заполнялся — потому негодный
+    сервер снова оказывался первым кандидатом, и сеть зависала по кругу.
+    Пометку пишем сразу в файл состояния: выборщик читает его из файла.
+    """
+    if not host:
+        return
+    hosts = [h for h in (state.get("bad_servers") or []) if h != host]
+    hosts.append(host)
+    state["bad_servers"] = hosts[-20:]
+    at = dict(state.get("bad_servers_at") or {})
+    at[host] = int(time.time())
+    state["bad_servers_at"] = {k: v for k, v in at.items() if k in state["bad_servers"]}
+    try:
+        core.write_state(core.NET_STATE, state)
+    except OSError:
+        pass
+    core.log("СЕТЬ: сервер Happ %s помечен негодным (%s) — следующим возьмём другой"
+             % (host, why or "без причины"))
+
+
 def pick_candidate(current_host: str) -> dict:
-    """Кандидат на смену: первый из файла, кто не текущий и не в «плохом» списке."""
-    bad = set(core.read_state(core.NET_STATE).get("bad_servers") or [])
-    for srv in happ_candidates():
-        if srv.get("host") == current_host:
-            continue
-        if srv.get("host") in bad:
-            continue
-        return srv
-    return {}
+    r"""Кандидат на смену: первый из подписки Happ, кто не текущий и не в «плохом» списке.
+
+    Источник — подписка самого Happ (`X-HWID`), кэш в
+    `%LOCALAPPDATA%\mcode-web\happ-servers.json`; раньше список лежал в
+    зашифрованной `subs.db` и был недоступен.
+    """
+    bad = bad_servers()
+    cands = [s for s in happ_candidates()
+             if s.get("host") != current_host and s.get("host") not in bad]
+    if not cands and bad:
+        # Все помечены — сбрасываем пометки: иначе переключаться больше не на что.
+        state = core.read_state(core.NET_STATE)
+        state["bad_servers"] = []
+        state["bad_servers_at"] = {}
+        try:
+            core.write_state(core.NET_STATE, state)
+        except OSError:
+            pass
+        core.log("СЕТЬ: все серверы помечены негодными — пометки сброшены, пробуем снова")
+        cands = [s for s in happ_candidates() if s.get("host") != current_host]
+    return cands[0] if cands else {}
 
 
 def switch_happ_server() -> dict:
@@ -319,17 +457,50 @@ def switch_happ_server() -> dict:
            ("lastServer", "lastServerName", "lastServerGuid", "lastServerHost", "lastServerPort")}
     new = {
         "lastServerName": srv.get("name") or cur.get("lastServerName"),
-        "lastServerGuid": srv.get("guid") or cur.get("lastServerGuid"),
         "lastServerHost": srv.get("host"),
         "lastServerPort": srv.get("port") or cur.get("lastServerPort"),
     }
     if not reg_write(new):
         return {"ok": False, "why": "реестр Happ не пишется"}
+    # `lastServerGuid`/`lastServer` — внутренние идентификаторы Happ; чужие
+    # значения только мешают. Убираем ⇒ Happ ищет сервер по имени и хосту.
+    reg_delete(("lastServerGuid", "lastServer"))
     happ_scheme("disconnect")
     time.sleep(3)
     happ_scheme("connect")
     time.sleep(8)
     return {"ok": True, "from": cur_host, "to": new["lastServerHost"], "old": old, "new": new}
+
+
+def switch_happ_server_verified(cfg: dict, state: dict, tries: int = 3) -> dict:
+    """Смена сервера Happ С ПРОВЕРКОЙ: негодные серверы уходят в «плохой» список.
+
+    22.11 (находка владельца): сервер всегда выбирался первым из подписки, а
+    список негодных не вёлся ⇒ после смены каскад снова брал тот же сервер,
+    сеть зависала, и дальше серверы не менялись. Теперь каждый кандидат
+    проверяется: не ожил — помечается негодным и пропускается, пока не
+    найдётся живой.
+    """
+    paths = {p.get("name"): p for p in (cfg.get("paths") or [])}
+    want = (paths.get("happ") or {}).get("expect_country")
+    tried = []
+    for _ in range(max(1, tries)):
+        res = switch_happ_server()
+        if not res.get("ok"):
+            res["tried"] = tried
+            return res
+        host = res.get("to") or ""
+        tried.append(host)
+        probe = probe_path(paths.get("happ") or {}, cfg)
+        if probe.get("alive") and (not want or probe.get("country") == want):
+            core.log("СЕТЬ: сервер Happ переключён на %s (выход %s)"
+                     % (host, probe.get("country")))
+            return {"ok": True, "from": res.get("from"), "to": host, "tried": tried}
+        mark_bad_server(host, state, "после смены путь не ожил: %s"
+                        % (probe.get("note") or probe.get("country") or "нет ответа"))
+        core.log("СЕТЬ: сервер %s не ожил — помечен негодным, пробую следующий" % host)
+    return {"ok": False, "why": "ни один сервер Happ не ожил (%d попыток: %s)"
+            % (len(tried), ", ".join(tried)), "tried": tried}
 
 
 def rollback_happ_server(old: dict) -> None:
@@ -500,7 +671,15 @@ def proxy_state() -> dict:
         if proc.get(key) and reg.get(key) and proc[key] != reg[key]:
             out["stale_process"] = True
             out["dead"].append("process:%s" % key)
-    out["broken"] = bool(out["dead"]) or not (reg.get("HTTP_PROXY") or proc.get("HTTP_PROXY"))
+    # ⚠️ Важно (22.11): «сломаны переменные» и «сеть сломана» — РАЗНЫЕ вещи.
+    # Сеть сломана, только если мёртв прокси В РЕЕСТРЕ (его читают новые
+    # процессы). Расхождение «реестр ↔ процесс» — устаревшие переменные у уже
+    # работающих процессов: их надо освежить, но сеть при этом ЖИВА, и лечащему
+    # нельзя говорить «сеть не в порядке» (иначе он откладывает живые проверки
+    # и видит ложное «подозрение» — так было в 00:18:55).
+    reg_dead = [k for k, v in out["registry_ports"].items() if v["url"] and not v["listening"]]
+    out["registry_dead"] = reg_dead
+    out["broken"] = bool(reg_dead) or not reg.get("HTTP_PROXY")
     return out
 
 
@@ -534,8 +713,12 @@ def repair_proxy(cfg: dict) -> dict:
     state = proxy_state()
     if not state["broken"]:
         return {"ok": True, "why": "прокси-переменные в порядке", "changed": False}
-    core.log("СЕТЬ: прокси-переменные сломаны (%s) — чиню" %
-             ", ".join(state["dead"] or ["не заданы"]))
+    if state.get("stale_process") and not state.get("broken"):
+        core.log("СЕТЬ: процессы держат устаревшие прокси-переменные (%s) — освежаю "
+                 "(сеть при этом жива)" % ", ".join(state["dead"][:3]))
+    else:
+        core.log("СЕТЬ: прокси-переменные сломаны (%s) — чиню" %
+                 ", ".join(state["dead"] or ["не заданы"]))
 
     # 1) Реестр живой, процесс отстал — забираем правильные значения.
     reg = state["registry"]
@@ -579,7 +762,7 @@ def recover(cfg: dict, state: dict, dry_run: bool = False) -> dict:
     # 1) Переподключение Happ на том же сервере (дешевле всего, без риска).
     steps.append(("reconnect happ", lambda: happ_scheme("disconnect") or happ_scheme("connect")))
     # 2) Смена сервера в Happ (нужен список кандидатов).
-    steps.append(("смена сервера Happ", lambda: switch_happ_server()))
+    steps.append(("смена сервера Happ", lambda: switch_happ_server_verified(cfg, state)))
     # 3) Уход на резервный путь.
     steps.append(("переход на резерв 11081", lambda: switch_path("reserve", cfg)))
     # 4) Смена апстрима резерва.
@@ -603,9 +786,15 @@ def recover(cfg: dict, state: dict, dry_run: bool = False) -> dict:
         time.sleep(STEP_COOLDOWN)
         # Проверяем результат шага прежде, чем идти дальше.
         probe = probe_path(paths.get("happ", {}), cfg)
-        if probe.get("alive") and probe.get("country") == paths.get("happ", {}).get("expect_country"):
+        want = paths.get("happ", {}).get("expect_country")
+        if probe.get("alive") and (not want or probe.get("country") == want):
             core.log("СЕТЬ: шаг «%s» вернул связь (выход %s)" % (name, probe.get("country")))
             break
+        # Путь не ожил или страна не та — нынешний сервер Happ негоден.
+        # Запоминаем: иначе выборщик снова возьмёт его первым (22.11).
+        if name == "смена сервера Happ":
+            mark_bad_server(str(reg_read().get("lastServerHost") or ""), state,
+                            "путь: %s" % (probe.get("note") or probe.get("country") or "не отвечает"))
     return {"steps": done, "current_server": cur_host}
 
 
@@ -683,6 +872,21 @@ def cycle(cfg: dict, state: dict, dry_run: bool = False) -> dict:
         core.write_state(core.NET_STATE, state)
         return report
 
+    # 0a) Только расхождение «реестр ↔ процесс»: сеть жива, но процессы держат
+    #     устаревшие переменные ⇒ освежаем их и идём дальше.
+    if proxy.get("stale_process"):
+        if dry_run:
+            report["action"] = "освежение прокси-переменных у процессов (сухой прогон)"
+        else:
+            rep = repair_proxy(cfg)
+            report["proxy_repair"] = rep
+            report["action"] = "освежены прокси-переменные у процессов"
+            if rep.get("ok"):
+                report["probes"] = probes = [probe_path(p, cfg) for p in paths]
+                alive = [p for p in probes if p.get("alive")]
+                report["stable"] = bool(alive)
+            core.log("СЕТЬ: прокси-переменные у процессов освежены (%s)" % rep.get("why"))
+
     # Плановый заход к вендору — не каждый проход (лишний трафик).
     state["cycles"] = int(state.get("cycles") or 0) + 1
     if int(state.get("cycles") or 0) % VENDOR_EVERY == 1:
@@ -708,12 +912,25 @@ def cycle(cfg: dict, state: dict, dry_run: bool = False) -> dict:
                 else:
                     core.log("СЕТЬ: устойчивого доступа нет — %s" % json.dumps(stable, ensure_ascii=False)[:300])
     else:
-        # Путь есть, но geo может быть «упал на прямой выход» — это ловим
-        # по стране выхода против ожидаемой.
+        # Путь есть. Страна выхода — НЕ повод для каскада: вендор по пути
+        # отвечает ⇒ нода жива. Каскад запускаем только когда путь реально
+        # не работает (вендор отдаёт 5xx или нет ответа).
         bad = [p for p in alive if p.get("note") and "вместо ожидаемой" in p["note"]]
-        if bad and not dry_run:
-            report["action"] = "путь жив, но выход не тот — пробуем смену"
-            core.log("СЕТЬ: %s" % bad[0]["note"])
+        broken = [p for p in bad if int(p.get("code") or 0) >= 500]
+        if bad and not broken:
+            # Строка действия остаётся ровно «всё живо» — на неё смотрит
+            # лечащий (`network_unhealthy`): любое другое значение он читает как
+            # «сеть плохая» и ОТКЛАДЫВАЕТ лечение (так потеря входа РМЗ 2 и
+            # не чинилась). Подробности — в отдельном поле.
+            report["action"] = "всё живо"
+            report["stable"] = True
+            report["geo_note"] = bad[0].get("note")
+            core.log("СЕТЬ: %s — каскад НЕ запускаю: путь живой, вендор отвечает" % bad[0].get("note"))
+        elif broken and not dry_run:
+            report["action"] = "путь жив, но вендор отдаёт 5xx — пробуем смену"
+            core.log("СЕТЬ: %s" % broken[0]["note"])
+            mark_bad_server(str(reg_read().get("lastServerHost") or ""), state,
+                            "вендор 5xx: %s" % (broken[0].get("code") or "-"))
             state["last_recover"] = int(time.time())
             report["recovery"] = recover(cfg, state, dry_run=False)
             stable = verify_stable(cfg)
@@ -789,8 +1006,16 @@ def main() -> int:
 
     # демон
     core.log("СЕТЬ: сторож запущен")
+    stamp = core.script_stamp(Path(__file__))
     while True:
         try:
+            if core.script_stamp(Path(__file__)) != stamp:
+                core.log("СЕТЬ: файл сторожа изменился — перезапускаюсь "
+                         "(правка на диске не действует в живом процессе)")
+                if core.supervisor_alive():
+                    return 0              # супервизор поднимет свежий процесс
+                core.respawn_self()
+                return 0
             cycle(cfg, core.read_state(core.NET_STATE), dry_run=False)
         except Exception as exc:  # noqa: BLE001
             core.log("СЕТЬ: сбой прохода: %s" % exc)

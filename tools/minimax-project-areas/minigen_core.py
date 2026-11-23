@@ -205,6 +205,49 @@ def now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def script_stamp(path: Path) -> float:
+    """Время изменения файла скрипта (0 — файла нет).
+
+    Нужен демонам: правка кода на диске не действует, пока процесс не
+    перезапущен, а супервизор перезапускает демон только по смерти процесса
+    ⇒ демон сам перезапускается, увидев, что его файл изменился (урок 22.11).
+    """
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def supervisor_alive(port: int = 8098) -> bool:
+    """Жив ли супервизор «МиниГена» (страница управления на 8098)?"""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1.5):
+            return True
+    except OSError:
+        return False
+
+
+def respawn_self() -> None:
+    """Перезапустить себя на свежем коде — когда супервизора нет.
+
+    С супервизором демона поднимает он (по смерти процесса); без него —
+    поднимаем себя сами, иначе раскатанный код останется мёртвым.
+    """
+    import sys
+    script = sys.argv[0] if sys.argv else ""
+    if not script:
+        return
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen([sys.executable, script] + sys.argv[1:],
+                         cwd=str(Path(script).parent), creationflags=flags,
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def fmt_ms(ms: int) -> str:
     if not ms:
         return "—"

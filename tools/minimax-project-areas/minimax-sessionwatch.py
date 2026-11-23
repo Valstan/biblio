@@ -78,12 +78,35 @@ NET_MARKERS = ("fetch failed", "econnrefused", "econnreset", "etimedout",
 FINAL_MARKERS = ("готово", "закрыто", "завершено", "сделано", "итог", "сводка",
                  "работа завершена", "закрытие сессии", "финальная сводка",
                  "готово.", "закрыто.")
+# Признаки сбоя ВЕНДОРА (не сети и не аккаунта) — 23.11: в десктопе это
+# «The model service is unstable. Please try again.» с кнопкой Retry.
+# В базе рантайма такой ход остаётся `aborted`/`failed` без кода ошибки.
+VENDOR_MARKERS = ("the model service is unstable", "model service is unstable",
+                  "service unavailable", "service_unavailable", "upstream error",
+                  "overloaded", "too many requests", "internal server error",
+                  "bad gateway", "gateway timeout", "model unavailable",
+                  "the model is unstable", "please try again")
 # Служебные сессии-пробы лечащего (`mcode exec --cwd … ping`): это не работа
 # владельца, их не показываем и не «оживляем» — иначе будем будить пробы.
 PROBE_TITLES = ("ping", "пинг", "probe")
+PROBE_TEXTS = ("ping", "пинг", "probe")
+# Области, где работает «Управляющий» — сессия, которая управляет сессиями.
+# Правило: **один Управляющий на область** (урок ночи, G679): вторая живая
+# сессия там = два писателя в одном worktree.
+MANAGER_AREAS = ("brain2",)
 RECOVERY_WAIT = 900      # после восстановления сети ждём 15 минут перед «Продолжай»
 REVIVE_COOLDOWN = 900    # не чаще одного «Продолжай» на сессию за 15 минут
-CONTEXT_LIMIT = 95       # процент заполнения контекста, после которого ротация
+CONTEXT_LIMIT = 95       # верхняя граница: процент заполнения контекста, после которого ротация
+CONTEXT_ROTATE = 60      # backstop: НИЖЕ минимальной наблюдённой точки сжатия.
+                          # ⚠️ Точка сжатия не выражается стабильным процентом (замер 22.11
+                          #  по всем областям: 345k–835k токенов ⇒ 68–84 % при окне 1 000 000),
+                          #  поэтому процентный порог между сессиями не переносится, а 70 %
+                          #  был бы ХУЖЕ минимальной точки сжатия и не сработал бы как
+                          #  страховка. Основной триггер — СОБЫТИЕ компактизации
+                          #  (context_compaction_checkpoint_generated), процент — только
+                          #  страховка снизу [G680].
+COMPACT_MARK = "context_compaction_checkpoint_generated"   # событие рантайма о сжатии
+COMPACT_WINDOW_MS = 6 * 3600 * 1000   # окно, в котором сжатие считается свежим
 CLOSE_TIMEOUT = 900      # сколько ждём корректного закрытия сессии, сек
 
 
@@ -144,7 +167,7 @@ def last_message(con, session_id: str, final_only: bool = False) -> dict:
     except ValueError:
         return {}
     return {"id": r[0][0], "at": r[0][2] or 0, "msg_type": data.get("msg_type"),
-            "text": data.get("msg_content") or ""}
+            "text": data.get("msg_content") or "", "turn_id": data.get("turnId") or ""}
 
 
 def context_fill(con, session_id: str, extra: dict) -> dict:
@@ -169,11 +192,24 @@ def context_fill(con, session_id: str, extra: dict) -> dict:
             "input": inp, "output": out, "cache_read": cache}
 
 
-def broken_subagents(con) -> list:
-    """Оборванные субагенты: работа пропала, её надо поднять."""
+def broken_subagents(con, session_id: str = "", max_age_ms: int = 24 * 3600 * 1000) -> list:
+    """Оборванные субагенты **этой** сессии: работа пропала, её надо поднять.
+
+    ⚠️ 22.11: счёт шёл по всем задачам области — включая старые и чужие ⇒ живая
+    сессия объявлялась «незаконченной» из-за субагента, который оборвался вчера
+    в другой нитке (на Мозга пришло лишнее «Продолжай»). Теперь — только задачи
+    этой сессии и только за последние сутки.
+    """
     out = []
-    for rec in core.rows(con, "select record_json from local_runtime_background_tasks "
-                              "where kind='subagent' and status in ('failed','canceled','aborted')"):
+    sql = ("select record_json, created_at_ms from local_runtime_background_tasks "
+           "where kind='subagent' and status in ('failed','canceled','aborted','lost')")
+    args = []
+    if session_id:
+        sql += " and owner_session_id = ?"
+        args.append(session_id)
+    for rec in core.rows(con, sql, tuple(args)):
+        if max_age_ms and rec[1] and (core.now_ms() - int(rec[1])) > max_age_ms:
+            continue
         try:
             task = json.loads(rec[0] or "{}")
         except ValueError:
@@ -212,15 +248,86 @@ def asks_owner(text: str) -> bool:
 
 # ────────────────────────────────────────────────────────── вердикт
 
-def classify(area: dict, sess: dict, con) -> dict:
+def compacted_sessions(area_dir: Path, window_ms: int = COMPACT_WINDOW_MS) -> dict:
+    """Сессии, которые рантайм недавно СЖАЛ (компактизация контекста).
+
+    Источник — журнал рантайма области (`v2/observability/logs/runtime-*.log`):
+    `context_compaction_checkpoint_generated` и `beforeLlmCall replaced context
+    messages`.
+
+    Почему это важно: после сжатия метрика заполнения падает до ~10 %, и сторож
+    по «последнему ходу» никогда не увидит переполнения ⇒ сессия остаётся
+    затушенной (а в замере 22.11 сводки не осталось вовсе: `summary_length: 0`).
+    Сжатие надо ловить **событием**, а не процентом.
+    """
+    out = {}
+    log_dir = area_dir / "v2" / "observability" / "logs"
+    if not log_dir.is_dir():
+        return out
+    try:
+        files = sorted(log_dir.glob("runtime-*.log"))[-3:]
+    except OSError:
+        return out
+    for f in files:
+        try:
+            raw = f.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in raw.splitlines():
+            if COMPACT_MARK not in line:
+                continue
+            m = re.search(r'"session_id":\s*"([^"]+)"', line)
+            ts = re.search(r"\[(\d\d):(\d\d):(\d\d)", line)
+            if not m:
+                continue
+            at = 0
+            if ts:
+                try:
+                    import datetime as _dt
+                    hh, mm, ss = (int(x) for x in ts.groups())
+                    now = _dt.datetime.now()
+                    at = int(now.replace(hour=hh, minute=mm, second=ss,
+                                         microsecond=0).timestamp() * 1000)
+                except Exception:  # noqa: BLE001
+                    at = 0
+            sid = m.group(1)
+            if at and (core.now_ms() - at) > window_ms:
+                continue
+            out[sid] = max(out.get(sid, 0), at)
+    return out
+
+
+def context_peak(con, session_id: str, window_ms: int = 24 * 3600 * 1000) -> dict:
+    """Пик заполнения контекста сессии (максимум по ходам за сутки).
+
+    ⚠️ Нужен именно **пик**, а не последний ход: после компактизации рантайма
+    последний ход показывает ~10 %, и заполнение кажется нормальным — а сессия
+    уже была большой (замер 22.11: было 68 %, стало 10 %).
+    """
+    since = core.now_ms() - window_ms
+    r = core.rows(con, "select max(input_tokens + output_tokens + cache_read_tokens) "
+                       "from local_runtime_token_usage where session_id=? and ts>=?",
+                  (session_id, since))
+    return {"peak_tokens": int(r[0][0] or 0) if r else 0}
+
+
+def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
     """Вердикт по сессии: что с ней и надо ли что-то делать."""
     sid = sess["session_id"]
+    compacted = compacted or {}
     turn = last_turn(con, sid)
     outcome = terminal_outcome(con, sid)
     last_msg = last_message(con, sid)
-    final_msg = last_message(con, sid, final_only=True)
+    # Финальный ответ хода — по метке САМОГО рантайма: assistant с msg_type=1 —
+    # это финальный ответ хода, и он привязан к turnId. Ответ из ПРОШЛОГО хода
+    # сводкой этого хода не считаем (22.11: ложное «Продолжай» в живую сессию —
+    # отчёт без слов «готово/закрыто» считался брошенной ниткой).
+    legacy_final = last_message(con, sid, final_only=True)
+    turn_id = turn.get("turn_id") or ""
+    final_msg = legacy_final if (not legacy_final.get("turn_id")
+                                  or legacy_final.get("turn_id") == turn_id) else {}
     fill = context_fill(con, sid, sess.get("extra") or {})
-    kids = broken_subagents(con)
+    kids = broken_subagents(con, sid)
 
     v = {
         "session_id": sid, "title": sess["title"][:70], "status": sess["status"],
@@ -235,7 +342,7 @@ def classify(area: dict, sess: dict, con) -> dict:
         return v
     if sess["kind"] != "conversation":
         return v                      # задачи и субагенты — не наши разговоры
-    if (sess["title"] or "").strip().lower() in PROBE_TITLES:
+    if is_probe(con, sess):
         v["verdict"] = "проба"
         v["reason"] = "служебная сессия-проба лечащего"
         return v
@@ -257,43 +364,153 @@ def classify(area: dict, sess: dict, con) -> dict:
             v["reason"] = "ход идёт"
         return v
 
-    # 3) Упавший ход: сеть или нет?
-    if turn.get("status") == "failed" or sess["status"] == "error" or outcome == "failed":
+    # 3) Упавший ход: сеть, вендор или нет?
+    if (turn.get("status") in ("failed", "aborted")
+            or sess["status"] in ("error", "aborted")
+            or outcome in ("failed", "aborted")):
         blob = ("%s %s" % (sess["error_message"] or "", turn.get("input_json") or "")).lower()
         net = any(m in blob for m in NET_MARKERS) or sess["error_code"] == NET_CODE
-        v["verdict"] = "упала по сети" if net else "ошибка"
         v["reason"] = "ход упал: %s" % ((sess["error_message"] or "без текста")[:120])
+        if net:
+            v["verdict"] = "упала по сети"
+            return v
+        # ⚠️ «Вендор недоступен» (23.11). В десктопе это выглядит как
+        # «The model service is unstable. Please try again.» с кнопкой Retry —
+        # вендор отвечает 5xx/перегрузом. В базе рантайма такой ход остаётся
+        # `aborted`/`failed` БЕЗ кода ошибки, и раньше он попадал в «ошибка»/
+        # «непонятно» ⇒ никто его не продолжал, а область стояла мёртвой.
+        #
+        # Лечение здесь НЕ «новый аккаунт» и НЕ «перезапуск десктопа»:
+        # вендор чинит себя (сетевой сторож), а сессию надо просто продолжить.
+        if any(m in blob for m in VENDOR_MARKERS) or not sess["error_code"]:
+            v["verdict"] = "вендор недоступен"
+            v["reason"] = ("ход упал без кода ошибки (%s) — похоже на «модель нестабильна»: "
+                           "ждём восстановления вендора и продолжаем сессию"
+                           % ((sess["error_message"] or "без текста")[:100]))
+            return v
+        v["verdict"] = "ошибка"
         return v
 
     # 4) Ход завершён — смотрим, закончена ли работа.
     if turn.get("status") == "completed" or outcome == "completed":
-        if fill.get("fill", 0) >= CONTEXT_LIMIT:
+        if compacted.get(sid):
+            v["verdict"] = "скомпактилась"
+            v["reason"] = ("рантайм сжал контекст (%s) — сессия дальше «тупеет», "
+                           "нужно корректно закрыть и открыть новую" % COMPACT_MARK)
+            return v
+        peak = context_peak(con, sid)
+        # Окно контекста — из context_fill() (там оно и считается);
+        # раньше здесь был NameError: демон падал на каждом проходе.
+        win = int(fill.get("window") or 0)
+        peak_fill = (100.0 * peak.get("peak_tokens", 0) / win) if win else 0.0
+        if peak_fill >= CONTEXT_ROTATE or fill.get("fill", 0) >= CONTEXT_LIMIT:
             v["verdict"] = "контекст заполнен"
-            v["reason"] = "занято %s%% контекста" % fill.get("fill")
+            v["reason"] = "пик %s%% контекста (сейчас %s%%)" % (
+                round(peak_fill, 1), fill.get("fill"))
+            v["peak_fill"] = round(peak_fill, 1)
             return v
-        if kids:
-            v["verdict"] = "есть оборванные субагенты"
-            v["reason"] = "%d оборванных субагентов — работа не закончена" % len(kids)
-            return v
+        # ⚠️ ПОРЯДОК ПРАВИЛ (22.11, находка Управляющего): «итоговая сводка»
+        # проверяется ПЕРВОЙ. D-249 ⑤ (владелец: «работу реально законченную
+        # продолжать не надо принудительно») сильнее D-230 (будить сессии с
+        # оборванными субагентами): сессия со сводкой НЕ оживает, а её сироты —
+        # забота Управляющего (task_append), а не «Продолжай» в закрытую сессию.
         if final_msg and looks_finished(final_msg.get("text")):
             v["verdict"] = "готова"
-            v["reason"] = "последний ход завершён, напечатана итоговая сводка"
+            v["reason"] = ("последний ход завершён, напечатана итоговая сводка"
+                           + (" · есть %d оборванных субагентов — их поднимает "
+                              "Управляющий (task_append)" % len(kids) if kids else ""))
             return v
         if asks_owner(last_msg.get("text")):
             v["verdict"] = "ждёт владельца"
             v["reason"] = "последнее сообщение — вопрос владельцу"
             return v
+        # 22.11 (находка Управляющего): ход завершён, рантайм пометил его
+        # финальным ответом (msg_type=1), сирот нет ⇒ работа закончена. Раньше
+        # тут был только путь «сводка по ключевым словам» ⇒ обычный отчёт без
+        # слов «готово/закрыто» считался брошенной ниткой, и сторож слал
+        # «Продолжай» в живую сессию (ложное пробуждение 13:51).
+        if final_msg and not kids:
+            v["verdict"] = "готова"
+            v["reason"] = "ход завершён, у него есть финальный ответ — работа закончена"
+            return v
+        if kids:
+            v["verdict"] = "есть оборванные субагенты"
+            v["reason"] = "%d оборванных субагентов — работа не закончена" % len(kids)
+            return v
         v["verdict"] = "брошена"
-        v["reason"] = "ход завершён, но итоговой сводки нет"
+        v["reason"] = "ход завершён, но финального ответа нет (агент оборвался)"
         return v
 
     v["reason"] = "нет ходов"
     return v
 
 
+def is_probe(con, sess: dict) -> bool:
+    """Проба лечащего — служебная сессия, а не работа владельца.
+
+    Два признака: заголовок («ping») и первая реплика пользователя («ping»).
+    Одного заголовка мало: пробу переименовали — и по заголовку она проходит
+    как обычная сессия (и ротация её закрывает). У пробы первая реплика всегда
+    ровно «ping» (`mcode exec --cwd … ping`).
+    """
+    if (sess.get("title") or "").strip().lower() in PROBE_TITLES:
+        return True
+    if con is None:
+        return False
+    r = core.rows(con, "select data_json from local_runtime_message_rows "
+                       "where session_id=? and role='user' order by id asc limit 1",
+                  (sess.get("session_id") or "",))
+    if not r:
+        return False
+    try:
+        data = json.loads(r[0][0] or "{}")
+    except ValueError:
+        return False
+    return (data.get("msg_content") or "").strip().lower() in PROBE_TEXTS
+
+
+def probe_of(area: dict, sess: dict) -> bool:
+    """Проба ли это — без уже открытого соединения с базой."""
+    con = core.connect(core.area_db(area["dir"]))
+    try:
+        return is_probe(con, sess)
+    finally:
+        if con:
+            con.close()
+
+
 # ────────────────────────────────────────────────────────── действия
 
-def send_to_session(area: dict, sess: dict, text: str, background: bool = True) -> dict:
+def live_manager_session(area: dict) -> str:
+    """Живая сессия Управляющего в области (id или пусто).
+
+    «Живая» = идёт ход либо рантайм считает сессию занятой. Одна такая сессия на
+    область — и всё, что запускает вторую (оживление, ручное открытие), должно
+    остановиться: два писателя в одном worktree (G679).
+    """
+    if area.get("slug") not in MANAGER_AREAS:
+        return ""
+    con = core.connect(core.area_db(area["dir"]))
+    if not con:
+        return ""
+    try:
+        for s in sessions_of(area["dir"]):
+            if s["archived"] or s["kind"] != "conversation":
+                continue
+            if is_probe(con, s):
+                continue
+            turn = last_turn(con, s["session_id"])
+            if turn.get("status") == "accepted" and not turn.get("completed_at_ms"):
+                return s["session_id"]
+            if s["status"] == "started":
+                return s["session_id"]
+    finally:
+        con.close()
+    return ""
+
+
+def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
+                     force: bool = False) -> dict:
     """Отправить сообщение в СУЩЕСТВУЮЩУЮ сессию области.
 
     `mcode exec --session <id>` работает в контексте области (через
@@ -304,6 +521,9 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True) 
     упал бы с «Connection error» ([G]: `fetch failed` = мёртвый прокси).
     """
     core.refresh_env()
+    if not force and probe_of(area, sess):
+        # Пробу не будим: сообщение в пробу = лишний ход и лишние очки.
+        return {"ok": False, "why": "это проба лечащего — сообщение не отправлено"}
     folder = sess.get("workspace_dir") or area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
         return {"ok": False, "why": "папка проекта недоступна: %s" % folder}
@@ -329,8 +549,22 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True) 
     return {"ok": bool(proc and proc.returncode == 0), "why": out[-400:]}
 
 
-def new_session(area: dict, prompt: str) -> dict:
-    """Открыть НОВУЮ сессию в области с начальной командой."""
+def new_session(area: dict, prompt: str, force: bool = False) -> dict:
+    """Открыть НОВУЮ сессию в области с начальной командой.
+
+    В области Управляющего — только если там нет живой сессии (один
+    Управляющий на область, G679); `force` обходит запрет.
+    """
+    # Прокси-переменные — из реестра (22.11, находка Управляющего): сетевой
+    # сторож мог починить мёртвый прокси, а вызывающий процесс держит старые
+    # значения ⇒ новый ход упал бы с «Connection error». В send_to_session()
+    # это уже есть, здесь — нет.
+    core.refresh_env()
+    if not force:
+        busy = live_manager_session(area)
+        if busy:
+            return {"ok": False, "why": "в области уже живая сессия Управляющего %s — "
+                                        "вторая не открывается (один Управляющий на область)" % busy[:12]}
     folder = area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
         return {"ok": False, "why": "папка проекта недоступна: %s" % folder}
@@ -423,6 +657,11 @@ def rotate_session(area: dict, sess: dict, brief: str = "") -> dict:
     новую с начальной командой — чтобы нитка не потеряла контекст.
     """
     report = {"session_id": sess["session_id"], "steps": []}
+    if probe_of(area, sess):
+        report["ok"] = False
+        report["why"] = "это проба лечащего — ротация запрещена"
+        core.log("СЕССИИ: ротация запрещена — проба %s" % sess["session_id"][:12])
+        return report
     core.log("СЕССИИ: ротация %s (%s)" % (sess["session_id"][:12], sess["title"][:50]))
     res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
     report["steps"].append({"close_command": res})
@@ -515,13 +754,14 @@ def survey(area: dict, state: dict) -> list:
     if not con:
         return []
     out = []
+    compacted = compacted_sessions(area["dir"])
     try:
         for sess in sessions_of(area["dir"]):
             if sess["kind"] != "conversation":
                 continue
             if sess["updated_at_ms"] and core.now_ms() - sess["updated_at_ms"] < 5 * 60 * 1000:
                 pass  # свежая сессия — всё равно показываем, но не трогаем
-            out.append(classify(area, sess, con))
+            out.append(classify(area, sess, con, compacted))
     finally:
         con.close()
     return out
@@ -535,6 +775,17 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
         last = int((state.get("revived") or {}).get(v["session_id"]) or 0)
         cool = int(time.time()) - last < REVIVE_COOLDOWN
         if v["verdict"] in ("готова", "работает", "кончились очки", "ждёт владельца"):
+            continue
+        if v["verdict"] == "скомпактилась":
+            if dry_run:
+                actions.append({"session": v["session_id"], "action": "ротация после компактизации (сухой прогон)"})
+                continue
+            sess = {"session_id": v["session_id"], "title": v["title"],
+                    "workspace_dir": area.get("folder", "")}
+            rep = rotate_session(area, sess)
+            actions.append({"session": v["session_id"], "action": "ротация после компактизации", "report": rep})
+            core.log("СЕССИИ: %s — сессия %s сжата рантаймом, ротирую: %s" % (
+                slug, v["session_id"][:12], rep.get("why")))
             continue
         if v["verdict"] == "контекст заполнен":
             if dry_run:
@@ -570,7 +821,37 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
             core.log("СЕССИИ: %s — сессия %s упала по сети, связь вернулась: %s" % (
                 slug, v["session_id"][:12], res.get("why")))
             continue
+        if v["verdict"] == "вендор недоступен":
+            # «The model service is unstable. Please try again.» — это сбой
+            # ВЕНДОРА, а не сети-области и не аккаунта. Лечение: дождаться, когда
+            # вендор (или путь до него) оживёт, и продолжить сессию «Продолжай».
+            # Перезапуск десктопа тут НЕ нужен и вреден: он убивает живые
+            # сессии области (23.11 — так «умер» рабочий десктоп РМЗ 2).
+            net = core.read_state(core.NET_STATE).get("last_run") or {}
+            if not net.get("stable"):
+                actions.append({"session": v["session_id"], "action": "ждём вендора/сеть"})
+                continue
+            failed_at = int(v.get("updated_at_ms") or 0)
+            if failed_at and core.now_ms() - failed_at < 120000:
+                actions.append({"session": v["session_id"], "action": "ход ещё мог упасть — ждём"})
+                continue
+            if cool:
+                continue
+            if dry_run:
+                actions.append({"session": v["session_id"], "action": "«Продолжай» после вендора (сухой прогон)"})
+                continue
+            res = send_to_session(area, {"session_id": v["session_id"],
+                                  "workspace_dir": area.get("folder", "")},
+                                  REVIVE_PROMPT, background=True)
+            state.setdefault("revived", {})[v["session_id"]] = int(time.time())
+            actions.append({"session": v["session_id"], "action": "«Продолжай» после вендора", "result": res})
+            core.log("СЕССИИ: %s — сессия %s упала на нестабильности модели, вендор ожил: %s" % (
+                slug, v["session_id"][:12], res.get("why")))
+            continue
         if v["verdict"] in ("брошена", "есть оборванные субагенты"):
+            if area["slug"] in MANAGER_AREAS and live_manager_session(area) not in ("", v["session_id"]):
+                actions.append({"session": v["session_id"], "action": "место занято (один Управляющий на область)"})
+                continue
             # «Ход завис» сюда НЕ входит: сорвать зависший ход и положить
             # «Продолжай» в начало умеет лечащий (перезапуск области) — если
             # послать «Продолжай» сюда, оно встанет в очередь за висящим ходом
@@ -732,6 +1013,9 @@ def cli_rotate(args) -> int:
     if not sess:
         print("сессии нет")
         return 1
+    if not getattr(args, "force", False) and probe_of(area, sess):
+        print("это служебная сессия-проба — ротировать её нельзя (--force — если очень надо)")
+        return 1
     rep = rotate_session(area, sess)
     print(json.dumps(rep, ensure_ascii=False, indent=2)[:3000])
     return 0 if rep.get("ok") else 1
@@ -767,6 +1051,8 @@ def main() -> int:
     ap.add_argument("--close", nargs=2, metavar=("ОБЛАСТЬ", "SESSION_ID"))
     ap.add_argument("--new", nargs=2, metavar=("ОБЛАСТЬ", "ТЕКСТ"))
     ap.add_argument("--rotate", nargs=2, metavar=("ОБЛАСТЬ", "SESSION_ID"))
+    ap.add_argument("--force", action="store_true",
+                    help="действовать с пробой лечащего (обычно нельзя)")
     args = ap.parse_args()
 
     if args.list:
@@ -789,8 +1075,16 @@ def main() -> int:
         return 0
 
     core.log("СЕССИИ: сторож запущен")
+    stamp = core.script_stamp(Path(__file__))
     while True:
         try:
+            if core.script_stamp(Path(__file__)) != stamp:
+                core.log("СЕССИИ: файл сторожа изменился — перезапускаюсь "
+                         "(правка на диске не действует в живом процессе)")
+                if core.supervisor_alive():
+                    return 0              # супервизор поднимет свежий процесс
+                core.respawn_self()
+                return 0
             cycle(core.read_state(core.SESSION_STATE), dry_run=False)
         except Exception as exc:  # noqa: BLE001
             core.log("СЕССИИ: сбой прохода: %s" % exc)
