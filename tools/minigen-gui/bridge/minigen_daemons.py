@@ -137,6 +137,12 @@ def start(spec: dict[str, str], grace: float = 0.0) -> dict[str, Any]:
     path = script_path(spec)
     if not path.is_file():
         return {"ok": False, "error": "нет скрипта: %s" % path}
+    # ⚠️ Демон должен быть БЕЗ консоли. Проверено на этой машине (23.11):
+    # `DETACHED_PROCESS` даёт демону консоли нет вовсе (`GetConsoleWindow()`
+    # = 0) — окно мигает не он, а его ДЕТИ: дочерний `powershell`/`cmd`
+    # без `CREATE_NO_WINDOW` получает свою консоль. Поэтому флаг обязателен
+    # на каждом дочернем запуске (см. `minimax-netwatch.py`, `minimax-switch.py`,
+    # `minimax-autheal.py`), а не только здесь.
     flags = (getattr(subprocess, "DETACHED_PROCESS", 0)
              | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
              | getattr(subprocess, "CREATE_NO_WINDOW", 0))

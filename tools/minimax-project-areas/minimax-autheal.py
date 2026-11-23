@@ -899,8 +899,14 @@ def restart_area(slug: str) -> None:
       - после «старт» — что окно поднялось (иначе «Продолжай» уйдёт в никуда).
     """
     ps = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"]
+    # ⚠️ CREATE_NO_WINDOW обязателен: лечащий идёт отсоединённо (консоли у него
+    # нет), а дочерний powershell без этого флага получает свою консоль — на
+    # экране мигает окно (23.11). `-WindowStyle Hidden` — только для PowerShell,
+    # окно самой консоли всё равно создаётся.
+    hidden = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.run(ps + [str(BIN / "mcode-project-stop.ps1"), "-Project", slug],
-                   capture_output=True, text=True, errors="replace", timeout=120)
+                   capture_output=True, text=True, errors="replace", timeout=120,
+                   creationflags=hidden)
     if not wait_area_stopped(slug, 30):
         n = kill_area_processes(slug)
         log("СЕССИИ: десктоп %s не остановился stop-скриптом — добиваю дерево (%d процессов)" % (
@@ -910,7 +916,8 @@ def restart_area(slug: str) -> None:
             return
     time.sleep(3)
     subprocess.run(ps + [str(BIN / "mcode-project-start.ps1"), "-Project", slug],
-                   capture_output=True, text=True, errors="replace", timeout=180)
+                   capture_output=True, text=True, errors="replace", timeout=180,
+                   creationflags=hidden)
     deadline = time.time() + 60
     while time.time() < deadline:
         if area_process_ids(slug):
