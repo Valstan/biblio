@@ -30,7 +30,13 @@ import time
 from pathlib import Path
 
 BIN = Path(r"C:\Users\valstan\bin")
-REPO = Path(r"D:\valstan\REPO\biblio")
+# Репозиторий-эталон — ТОТ ЖЕ, где лежит этот скрипт.
+# ⚠️ 23.11: раньше путь был зашит (`D:\valstan\REPO\biblio`), и скрипт,
+# запущенный из другой копии (например, из worktree на старой ветке),
+# раскатывал по СТАРОМУ списку файлов и без перезапуска панели: правки
+# в master доезжали не полностью. Теперь эталон — всегда тот репозиторий,
+# из которого запущен скрипт, а список файлов — из его origin/master.
+REPO = Path(__file__).resolve().parents[2]
 REL = "tools/minimax-project-areas"
 FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
          "minimax-autheal.py", "mcode-panel-supervisor.js", "mcode-panel.js")
