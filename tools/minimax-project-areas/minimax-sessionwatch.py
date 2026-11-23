@@ -78,6 +78,14 @@ NET_MARKERS = ("fetch failed", "econnrefused", "econnreset", "etimedout",
 FINAL_MARKERS = ("готово", "закрыто", "завершено", "сделано", "итог", "сводка",
                  "работа завершена", "закрытие сессии", "финальная сводка",
                  "готово.", "закрыто.")
+# Признаки сбоя ВЕНДОРА (не сети и не аккаунта) — 23.11: в десктопе это
+# «The model service is unstable. Please try again.» с кнопкой Retry.
+# В базе рантайма такой ход остаётся `aborted`/`failed` без кода ошибки.
+VENDOR_MARKERS = ("the model service is unstable", "model service is unstable",
+                  "service unavailable", "service_unavailable", "upstream error",
+                  "overloaded", "too many requests", "internal server error",
+                  "bad gateway", "gateway timeout", "model unavailable",
+                  "the model is unstable", "please try again")
 # Служебные сессии-пробы лечащего (`mcode exec --cwd … ping`): это не работа
 # владельца, их не показываем и не «оживляем» — иначе будем будить пробы.
 PROBE_TITLES = ("ping", "пинг", "probe")
@@ -356,12 +364,31 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
             v["reason"] = "ход идёт"
         return v
 
-    # 3) Упавший ход: сеть или нет?
-    if turn.get("status") == "failed" or sess["status"] == "error" or outcome == "failed":
+    # 3) Упавший ход: сеть, вендор или нет?
+    if (turn.get("status") in ("failed", "aborted")
+            or sess["status"] in ("error", "aborted")
+            or outcome in ("failed", "aborted")):
         blob = ("%s %s" % (sess["error_message"] or "", turn.get("input_json") or "")).lower()
         net = any(m in blob for m in NET_MARKERS) or sess["error_code"] == NET_CODE
-        v["verdict"] = "упала по сети" if net else "ошибка"
         v["reason"] = "ход упал: %s" % ((sess["error_message"] or "без текста")[:120])
+        if net:
+            v["verdict"] = "упала по сети"
+            return v
+        # ⚠️ «Вендор недоступен» (23.11). В десктопе это выглядит как
+        # «The model service is unstable. Please try again.» с кнопкой Retry —
+        # вендор отвечает 5xx/перегрузом. В базе рантайма такой ход остаётся
+        # `aborted`/`failed` БЕЗ кода ошибки, и раньше он попадал в «ошибка»/
+        # «непонятно» ⇒ никто его не продолжал, а область стояла мёртвой.
+        #
+        # Лечение здесь НЕ «новый аккаунт» и НЕ «перезапуск десктопа»:
+        # вендор чинит себя (сетевой сторож), а сессию надо просто продолжить.
+        if any(m in blob for m in VENDOR_MARKERS) or not sess["error_code"]:
+            v["verdict"] = "вендор недоступен"
+            v["reason"] = ("ход упал без кода ошибки (%s) — похоже на «модель нестабильна»: "
+                           "ждём восстановления вендора и продолжаем сессию"
+                           % ((sess["error_message"] or "без текста")[:100]))
+            return v
+        v["verdict"] = "ошибка"
         return v
 
     # 4) Ход завершён — смотрим, закончена ли работа.
@@ -792,6 +819,33 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
             state.setdefault("revived", {})[v["session_id"]] = int(time.time())
             actions.append({"session": v["session_id"], "action": "«Продолжай» после сети", "result": res})
             core.log("СЕССИИ: %s — сессия %s упала по сети, связь вернулась: %s" % (
+                slug, v["session_id"][:12], res.get("why")))
+            continue
+        if v["verdict"] == "вендор недоступен":
+            # «The model service is unstable. Please try again.» — это сбой
+            # ВЕНДОРА, а не сети-области и не аккаунта. Лечение: дождаться, когда
+            # вендор (или путь до него) оживёт, и продолжить сессию «Продолжай».
+            # Перезапуск десктопа тут НЕ нужен и вреден: он убивает живые
+            # сессии области (23.11 — так «умер» рабочий десктоп РМЗ 2).
+            net = core.read_state(core.NET_STATE).get("last_run") or {}
+            if not net.get("stable"):
+                actions.append({"session": v["session_id"], "action": "ждём вендора/сеть"})
+                continue
+            failed_at = int(v.get("updated_at_ms") or 0)
+            if failed_at and core.now_ms() - failed_at < 120000:
+                actions.append({"session": v["session_id"], "action": "ход ещё мог упасть — ждём"})
+                continue
+            if cool:
+                continue
+            if dry_run:
+                actions.append({"session": v["session_id"], "action": "«Продолжай» после вендора (сухой прогон)"})
+                continue
+            res = send_to_session(area, {"session_id": v["session_id"],
+                                  "workspace_dir": area.get("folder", "")},
+                                  REVIVE_PROMPT, background=True)
+            state.setdefault("revived", {})[v["session_id"]] = int(time.time())
+            actions.append({"session": v["session_id"], "action": "«Продолжай» после вендора", "result": res})
+            core.log("СЕССИИ: %s — сессия %s упала на нестабильности модели, вендор ожил: %s" % (
                 slug, v["session_id"][:12], res.get("why")))
             continue
         if v["verdict"] in ("брошена", "есть оборванные субагенты"):
