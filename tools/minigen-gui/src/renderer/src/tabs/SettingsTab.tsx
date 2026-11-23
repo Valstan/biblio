@@ -88,6 +88,18 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
           Сторожа аккаунтов, сети и сессий. Старая веб-панель (:8099) и страница
           управления (:8098) архивированы — демонов держит эта программа.
         </p>
+        <p className="muted small">
+          Надзиратель:{' '}
+          {daemons?.supervisor ? (
+            <>
+              pid {daemons.supervisor.pid}
+              {daemons.supervisor.alive ? '' : ' (процесса нет)'}
+              {daemons.supervisor.path ? ` · ${daemons.supervisor.path}` : ''}
+            </>
+          ) : (
+            'сейчас никто (демоны поднимают себя сами)'
+          )}
+        </p>
         <table className="grid compact">
           <thead>
             <tr>

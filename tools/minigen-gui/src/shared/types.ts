@@ -57,11 +57,6 @@ export interface NetworkState {
   probed: boolean
 }
 
-export interface DaemonStatus {
-  supervisor: boolean
-  procs: Record<string, boolean>
-}
-
 export interface StatsArea {
   slug: string
   total: number
@@ -149,11 +144,19 @@ export interface DaemonInfo {
   pids: number[]
 }
 
+export interface SupervisorInfo {
+  pid: number
+  path: string
+  since?: number
+  alive: boolean
+}
+
 export interface DaemonStatus {
   daemons: DaemonInfo[]
   alive_count: number
   total: number
   checked_at: number
+  supervisor?: SupervisorInfo | null
 }
 
 export interface ProgramVersion {

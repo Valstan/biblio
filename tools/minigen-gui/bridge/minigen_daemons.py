@@ -16,6 +16,11 @@
   такой процесс (правило «один писатель на область» и «демоны не должны
   дублироваться» — урок 22.11: две копии лечащего брали аккаунты у Кармана
   дважды);
+- **надзиратель — один**: следить за демонами имеет право только владелец
+  системной блокировки (`minigen_lock`). Надзор нужен и фоновой копии, и
+  окну программы — но получают его по очереди, а не вдвоём; иначе два
+  надзирателя поднимают демона в один и тот же момент (живой случай 23.11:
+  демоны перезапустились дважды за две минуты);
 - **процесс переживает окно**: демоны запускаются отсоединёнными
   (DETACHED_PROCESS), поэтому закрытие окна программы их не убивает;
 - **страховка без программы**: если демон упал, а супервизора нет, он
@@ -33,6 +38,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+
+import minigen_lock
 
 # Три демона: имя — для журнала и окна, скрипт — что запускать.
 DAEMONS = (
@@ -103,6 +110,8 @@ def status() -> dict[str, Any]:
         "alive_count": len([d for d in out if d["alive"]]),
         "total": len(out),
         "checked_at": int(time.time() * 1000),
+        # кто надзирает (по блокировке) — чтобы видеть дубль, а не гадать
+        "supervisor": minigen_lock.read_owner(),
     }
 
 
@@ -199,7 +208,8 @@ def restart_all() -> dict[str, Any]:
     return {"results": [dict(restart(spec), name=spec["name"]) for spec in DAEMONS]}
 
 
-def supervise_loop(stop_flag: threading.Event | None = None) -> None:
+def supervise_loop(stop_flag: threading.Event | None = None,
+                    lock: minigen_lock.SupervisorLock | None = None) -> None:
     """Следить за демонами: поднимать упавшего (пока программа жива).
 
     Вызывается из фонового потока моста. Остановка — через `stop_flag`.
@@ -208,9 +218,20 @@ def supervise_loop(stop_flag: threading.Event | None = None) -> None:
     себя сам, когда его файл изменился (раскатка). Без паузы программа
     подняла бы вторую копию, а две копии лечащего брали аккаунты у КАРМАНА
     дважды (урок 22.11).
+
+    ⚠️ Надзиратель — **один**. Блокировка (`minigen_lock`) достаётся тому
+    процессу, кто первый её взял; остальные молча ждут своей очереди (и
+    подхватят надзор, если владелец умрёт — блокировку снимет ОС). Поэтому
+    окно программы и фоновая копия не мешают друг другу.
     """
     stop_flag = stop_flag or threading.Event()
+    lock = lock if lock is not None else minigen_lock.get_lock()
     while not stop_flag.is_set():
+        if not lock.acquire():
+            # надзиратель есть — второй не нужен (две копии лечащего брали
+            # аккаунты у КАРМАНА дважды)
+            stop_flag.wait(RESPAWN_EVERY)
+            continue
         for spec in DAEMONS:
             try:
                 if not daemon_pids(spec):

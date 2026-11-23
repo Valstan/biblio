@@ -42,6 +42,7 @@ import minigen_state as state          # noqa: E402
 import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
+import minigen_lock as minigen_lock    # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
@@ -95,13 +96,20 @@ class Bridge:
         Старая панель архивирована (23.11) — сторожей держит программа. Пока
         программа жива, упавший демон поднимается в течение минуты; если
         программа закрыта, демон поднимает себя сам (`respawn_self`).
+
+        ⚠️ Надзиратель — **один** (`minigen_lock`): и фоновая копия, и окно
+        программы начинают следить, но блокировку получает только один — тот
+        и надзирает. Если её держит другой (например, жива фоновая копия, а
+        владелец открыл окно), окно просто показывает состояние, не мешая
+        надзирателю.
         """
         if not state.read_settings().get("manageDaemons", True):
             return
         if self._daemon_thread is not None:
             return
         self._daemon_thread = threading.Thread(
-            target=daemons.supervise_loop, args=(self._daemon_stop,), daemon=True)
+            target=daemons.supervise_loop,
+            args=(self._daemon_stop, minigen_lock.get_lock()), daemon=True)
         self._daemon_thread.start()
 
     # ───────────────────────────────────────────────────────── реестр команд
@@ -681,19 +689,33 @@ def daemon_mode() -> int:
     except Exception:  # noqa: BLE001
         pass          # никто не отвечает — значит, мы первые
 
-    bridge = Bridge()
-    bridge.start_daemon_supervision()
+    # Системная блокировка — против гонки: два экземпляра, стартовавшие
+    # одновременно, оба увидели бы «никого не отвечает» и оба стали бы
+    # надзирателем. Блокировку получает один, второй выходит.
+    lock = minigen_lock.get_lock()
+    if not lock.acquire():
+        print("МиниГен: надзиратель демонов уже есть — выхожу")
+        return 0
+
     try:
         import minigen_api
         minigen_api.serve()
+    except Exception as exc:  # noqa: BLE001
+        # Порт занят (или иная причина) — надзирателем быть нельзя: процесс
+        # без API всё равно следил бы за демонами, а это ровно тот дубль,
+        # ради которого всё затевалось. Раньше ошибка проглатывалась, и лишний
+        # менеджер оставался жить (живой случай 23.11).
+        lock.release()
+        print("МиниГен: локальный API не поднялся (%s) — выхожу" % exc)
+        return 0
+
+    bridge = Bridge()
+    try:
         bridge.core.log("ДЕМОНЫ: программа «МиниГен» в фоновом режиме — "
                         "демоны подняты и следятся (API на %s)"
                         % minigen_api.base_url())
-    except Exception as exc:  # noqa: BLE001
-        try:
-            bridge.core.log("ДЕМОНЫ: локальный API не поднялся: %s" % exc)
-        except Exception:  # noqa: BLE001
-            pass
+    except Exception:  # noqa: BLE001
+        pass
     while True:
         time.sleep(3600)
 
