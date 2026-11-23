@@ -30,7 +30,7 @@ from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
-REPO_TOOLS = HERE.parent.parent          # tools/minimax-project-areas
+REPO_TOOLS = HERE.parent.parent.parent / "minimax-project-areas"
 LIVE_BIN = Path(os.environ.get("MINIGEN_BIN", r"C:\Users\valstan\bin"))
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT",
                                   str(Path.home() / ".minimax-areas")))
