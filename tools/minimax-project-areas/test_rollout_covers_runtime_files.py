@@ -38,7 +38,7 @@ def rollout_files() -> set[str]:
     match = re.search(r"^FILES\s*=\s*\((.*?)\)", text, re.S | re.M)
     if not match:
         return set()
-    return set(re.findall(r'"([^"]+\.py)"', match.group(1)))
+    return set(re.findall(r'"([^"]+\.(?:py|ps1))"', match.group(1)))
 
 
 def runtime_files() -> set[str]:
@@ -49,8 +49,9 @@ def runtime_files() -> set[str]:
         if not path.is_file():
             continue
         text = path.read_text(encoding="utf-8-sig")
-        # `BIN / "minimax-switch.py"`, `core.BIN / "..."`, `ORPHANS = BIN / "..."`
-        found |= set(re.findall(r'BIN\s*/\s*"([^"]+\.py)"', text))
+        # `BIN / "minimax-switch.py"`, `core.BIN / "..."`, `ORPHANS = BIN / "..."`,
+        # а также PowerShell-скрипты, которые демоны зовут (`BIN / "mcode-....ps1"`)
+        found |= set(re.findall(r'BIN\s*/\s*"([^"]+\.(?:py|ps1))"', text))
         # `import minigen_core as core`
         if re.search(r"^\s*import\s+minigen_core\b", text, re.M):
             found.add("minigen_core.py")

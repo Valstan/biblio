@@ -47,7 +47,9 @@ REL = "tools/minimax-project-areas"
 # веб-панель :8099 и страница управления :8098 заменены программой
 # «МиниГен» (tools/minigen-gui). Демонов теперь держит сама программа.
 FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
-         "minimax-autheal.py", "minimax-switch.py", "minimax-orphans.py")
+         "minimax-autheal.py", "minimax-switch.py", "minimax-orphans.py",
+         "mcode-project-start.ps1", "mcode-project-stop.ps1",
+         "mcode-project-title.ps1", "make-mcode-project-shortcuts.ps1")
 # ⚠️ 23.11: `minimax-autheal.py` в списке НЕ БЫЛ — раскатка выкладывала
 # сторожей, но не лечащего. Отсюда и расхождение «репозиторий ↔ машина»:
 # правки лечащего жили только на машине, а эталон (master) отставал, и
