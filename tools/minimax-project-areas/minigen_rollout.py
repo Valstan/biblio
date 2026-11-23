@@ -20,8 +20,13 @@
 
 Что делает:
  1. Копирует файлы сторожей из `biblio` `master` в `C:\\Users\\valstan\\bin`.
- 2. Останавливает демонов — поднимает их **супервизор** (дублей не будет).
- 3. Проверяет: компиляция, вердикты сессий, состояние сети.
+ 2. Останавливает **устаревших менеджеров фонового режима** — копии из дерева
+    репозитория (программа живёт в своём месте, PR #79). Оставшийся такой
+    менеджер — второй надзиратель демонов: демоны поднимаются в один и тот
+    же момент (живой случай 23.11).
+ 3. Ставит программу в своё место и поднимает фоновый режим **оттуда**.
+ 4. Останавливает демонов — поднимает их программа (дублей не будет).
+ 5. Проверяет: компиляция, живые демоны, вердикты сессий, состояние сети.
 """
 import os
 import subprocess
@@ -245,6 +250,62 @@ if (Test-Path $oldStartup) {
     return True
 
 
+# ─────────────────────────────────────────────── менеджеры фонового режима
+
+def manager_processes() -> list[tuple[int, str]]:
+    """Живые фоновые менеджеры программы: (pid, командная строка)."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | "
+          "Where-Object { $_.CommandLine -like '*minigen_bridge.py*' } | "
+          "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }")
+    res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, errors="replace", timeout=60)
+    out: list[tuple[int, str]] = []
+    for line in (res.stdout or "").splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        pid_text, _, cmd = line.partition("|")
+        try:
+            pid = int(pid_text.strip())
+        except ValueError:
+            continue
+        out.append((pid, cmd.strip()))
+    return out
+
+
+def stop_stale_managers() -> int:
+    """Остановить менеджеров, запущенных НЕ из установленного места.
+
+    ⚠️ Зачем (живой случай 23.11): программа живёт в своём месте (PR #79),
+    а копии из дерева репозитория живут до перезагрузки. Каждая такая копия
+    — ещё один надзиратель демонов: два надзирателя поднимают демона в один
+    и тот же момент (наблюдалось: демоны перезапустились дважды за две
+    минуты), а на Windows перехват порта `:8097` ещё и делит вызовы между
+    экземплярами. Установленную копию не трогаем — её перезапустит автозапуск.
+    """
+    stopped = 0
+    for pid, cmd in manager_processes():
+        if str(PROGRAM_ROOT).lower() in cmd.lower():
+            continue
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, text=True, timeout=60,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        print("   остановлен устаревший менеджер (pid %d): %s" % (pid, cmd[:100]))
+        stopped += 1
+    return stopped
+
+
+def start_installed_manager() -> bool:
+    """Поднять фоновый режим из установленного места (как при входе в Windows)."""
+    autostart = PROGRAM_ROOT / "Автозапуск.cmd"
+    if not autostart.is_file():
+        print("   ⚠️ нет %s — фоновый режим не поднят" % autostart)
+        return False
+    subprocess.run(["cmd", "/c", str(autostart)], capture_output=True, text=True,
+                   timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return True
+
+
 def main() -> int:
     # Источник кода: по умолчанию master. `--ref` — раскатать из другой
     # ветки (нужно, когда правка срочная, а слияние PR ещё не прошло):
@@ -261,7 +322,14 @@ def main() -> int:
         (BIN / name).write_bytes(data)
         print("   записан %-26s %d байт" % (name, len(data)))
 
-    print("--- перезапуск демонов (поднимет программа «МиниГен», дублей не будет) ---")
+    print("--- устаревшие менеджеры фонового режима ---")
+    # Из дерева репозитория: программа живёт в своём месте (PR #79), а эти
+    # копии — лишние надзиратели демонов (живой случай 23.11).
+    stopped = stop_stale_managers()
+    if not stopped:
+        print("   устаревших менеджеров нет")
+
+    print("--- остановка демонов (поднимет программа «МиниГен», дублей не будет) ---")
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
@@ -270,10 +338,7 @@ def main() -> int:
          "$_.CommandLine -like '*minimax-autheal.py' } | "
          "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
         capture_output=True, text=True, timeout=60)
-    time.sleep(12)
-    alive = daemons_alive()
-    print("   живых демонов: %d из 3%s" % (
-        len(alive), (" (" + ", ".join(alive) + ")") if alive else ""))
+    time.sleep(6)
 
     print("--- проверка ---")
     ok = True
@@ -288,6 +353,19 @@ def main() -> int:
     print("--- установка программы (Ф6: раскатка ставит новую программу) ---")
     if "--no-program" not in sys.argv:
         ok = install_program() and ok
+        print("--- фоновый режим из установленного места ---")
+        if start_installed_manager():
+            # демоны поднимаются с паузой (20 с) — сторож может поднять себя
+            # сам, вторая копия не нужна
+            time.sleep(25)
+            alive = daemons_alive()
+            print("   живых демонов: %d из 3%s" % (
+                len(alive), (" (" + ", ".join(alive) + ")") if alive else ""))
+            if len(alive) != 3:
+                ok = False
+                print("   ⚠️ не все демоны поднялись — смотри журнал")
+        else:
+            ok = False
     else:
         print("   пропущено (--no-program)")
     r = subprocess.run([sys.executable, str(BIN / "minimax-netwatch.py"), "--status"],

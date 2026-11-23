@@ -76,6 +76,38 @@ def restart_contour() -> dict[str, Any]:
     return {"ok": all(r.get("ok") for r in results), "results": results}
 
 
+class ApiServer(HTTPServer):
+    """Сервер API, который **нельзя перехватить**.
+
+    ⚠️ На Windows `HTTPServer` по умолчанию ставит `SO_REUSEADDR`
+    (`allow_reuse_address = 1`), а с ним второй процесс **занимает тот же
+    порт** — проверено на этой машине: две копии API слушали `:8097`
+    одновременно. Значит, обращение сетевого сторожа («перезапусти контур»)
+    могло уйти не к тому экземпляру: у одного был API без надзирателя, у
+    другого — надзиратель без API. Итог — восстановление сети работает
+    наполовину, а снаружи выглядит как «интернет плохой».
+
+    Поэтому на Windows: `SO_REUSEADDR` выключаем, а эксклюзивность задаём
+    `SO_EXCLUSIVEADDRUSE` (это штатный способ для серверов: перехват
+    запрещён, а после закрытия порт освобождается как надо). На POSIX
+    `SO_REUSEADDR` безопасен (перехватить активный слушатель нельзя), и он
+    нужен, чтобы порт освобождался мгновенно после TIME_WAIT.
+    """
+
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self) -> None:
+        if os.name == "nt":
+            import socket
+
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET,
+                                       socket.SO_EXCLUSIVEADDRUSE, 1)
+            except (AttributeError, OSError):
+                pass
+        super().server_bind()
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "MiniGen/1.0"
 
@@ -133,13 +165,20 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(port: int = PORT) -> None:
-    """Запустить локальный API (в потоке)."""
+    """Запустить локальный API (в потоке).
+
+    ⚠️ Порт занимается **эксклюзивно**: если он уже занят, `serve()`
+    бросает исключение, и вызывающий код обязан отказаться от роли
+    менеджера (иначе получится второй надзиратель демонов — ровно то, чего
+    мы избегаем). Раньше ошибка проглатывалась, и лишний процесс оставался
+    жить (живой случай 23.11).
+    """
     # Токен создаём СРАЗУ, при старте: сетевой сторож читает файл, чтобы
     # звать программу при смене прокси. Если токен появлялся бы только при
     # первом обращении, до него дело не дошло бы никогда (замкнутый круг:
     # позвать — нечем, токена нет; токен есть — никто не звал).
     token()
-    server = HTTPServer(("127.0.0.1", port), Handler)
+    server = ApiServer(("127.0.0.1", port), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     return None
