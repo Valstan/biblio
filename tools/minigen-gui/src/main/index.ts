@@ -9,7 +9,21 @@ import { Bridge } from './bridge'
  * Окно не делает работу само: оно спрашивает Python-мост и показывает ответ.
  * Мост, в свою очередь, зовёт боевые демоны — поэтому логика сторожей
  * остаётся в одном месте.
+ *
+ * Два режима одной программы:
+ * - **окно** — владелец смотрит состояние и общается с нейросетью;
+ * - **без окна** (`--daemon-mode`) — автозапуск при входе в Windows: окна
+ *   нет, но демоны «МиниГена» подняты и следятся. Старая панель с её
+ *   супервизором архивирована, и теперь эту роль держит программа.
  */
+
+const daemonMode = process.argv.includes('--daemon-mode')
+
+if (daemonMode) {
+  // Отдельный профиль: иначе включится блокировка одного экземпляра и
+  // окно владельца не откроется (или откроется вместо фонового режима).
+  app.setPath('userData', join(app.getPath('appData'), 'minigen-gui-daemon'))
+}
 
 let mainWindow: BrowserWindow | null = null
 let bridge: Bridge | null = null
@@ -23,6 +37,7 @@ function createWindow(): void {
     title: 'МиниГен',
     backgroundColor: '#101418',
     show: false,
+    skipTaskbar: daemonMode,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
       sandbox: false,
@@ -31,7 +46,10 @@ function createWindow(): void {
     }
   })
 
-  mainWindow.on('ready-to-show', () => mainWindow?.show())
+  mainWindow.on('ready-to-show', () => {
+    // В режиме без окна (автозапуск при входе в Windows) окно невидимо.
+    if (!daemonMode) mainWindow?.show()
+  })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
     return { action: 'deny' }
@@ -93,12 +111,20 @@ app.whenReady().then(() => {
     })
   }
 
+  if (daemonMode) {
+    // Режим без окна: программа живёт и держит демонов. Окно скрыто, но
+    // существует — иначе Electron завершился бы (нет окон — нет процесса).
+    console.log('МиниГен: режим без окна — демоны под наблюдением')
+  }
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
 
 app.on('window-all-closed', () => {
+  // В режиме без окна закрывать нечего: программа продолжает держать демонов.
+  if (daemonMode) return
   bridge?.stop()
   if (process.platform !== 'darwin') app.quit()
 })

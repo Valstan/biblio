@@ -23,8 +23,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
-      - name: Приёмка панели «МиниГен»
-        run: python3 tools/minimax-project-areas/check_panel.py --source-only
+      - name: Приёмка панели «МиниГен» (архив)
+        run: python3 tools/minimax-project-areas/archive/check_panel.py --source-only
       - name: Приёмка переключения серверов Happ
         run: python3 tools/minimax-project-areas/test_minimax_netwatch_switch.py
       - name: Приёмка записи конфига областей

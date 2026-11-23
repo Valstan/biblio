@@ -74,9 +74,9 @@ export default function JournalTab({ snapshot }: Props) {
 
       {snapshot && (
         <p className="muted small">
-          Демоны: супервизор {snapshot.daemons.supervisor ? 'жив' : 'нет'} ·{' '}
-          {Object.entries(snapshot.daemons.procs)
-            .map(([name, alive]) => `${name}: ${alive ? 'жив' : 'нет'}`)
+          Демоны:{' '}
+          {(snapshot.daemons.daemons ?? [])
+            .map((daemon) => `${daemon.name}: ${daemon.alive ? 'жив' : 'нет'}`)
             .join(' · ')}
         </p>
       )}

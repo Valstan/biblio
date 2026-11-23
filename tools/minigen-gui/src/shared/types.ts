@@ -140,6 +140,22 @@ export interface Snapshot {
   daemon_dir: string
 }
 
+export interface DaemonInfo {
+  name: string
+  role: string
+  script: string
+  exists: boolean
+  alive: boolean
+  pids: number[]
+}
+
+export interface DaemonStatus {
+  daemons: DaemonInfo[]
+  alive_count: number
+  total: number
+  checked_at: number
+}
+
 export interface BridgeEvent {
   kind: 'bridge-status' | 'bridge-error'
   message: string

@@ -41,6 +41,14 @@ import sys
 import tempfile
 import urllib.request
 
+# Печать значков (🟢/🔴) в консоли Windows ломается на кодовой странице
+# консоли (charmap) — скрипт падал с UnicodeEncodeError. Принудительно UTF-8
+# с заменой непечатаемого: приёмка должна работать отовсюду.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except AttributeError:
+    pass
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 PANEL_JS = os.path.join(HERE, "mcode-panel.js")
 RENDER_JS = os.path.join(HERE, "render_panel_html.js")

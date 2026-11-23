@@ -107,12 +107,9 @@ export default function NetworkTab({ snapshot, run, busy }: Props) {
             <div className="card">
               <h3>Демоны</h3>
               <div className="chips">
-                <span className={`chip ${snapshot.daemons.supervisor ? 'ok' : 'muted'}`}>
-                  супервизор: {snapshot.daemons.supervisor ? 'жив' : 'нет'}
-                </span>
-                {Object.entries(snapshot.daemons.procs).map(([name, alive]) => (
-                  <span key={name} className={`chip ${alive ? 'ok' : 'muted'}`}>
-                    {name}: {alive ? 'жив' : 'нет'}
+                {(snapshot.daemons.daemons ?? []).map((daemon) => (
+                  <span key={daemon.name} className={`chip ${daemon.alive ? 'ok' : 'bad'}`}>
+                    {daemon.name}: {daemon.alive ? 'жив' : 'не работает'}
                   </span>
                 ))}
               </div>
