@@ -849,14 +849,74 @@ def desktop_running(slug: str) -> bool:
         return True
 
 
+def area_process_ids(slug: str) -> list:
+    """PID'ы процессов десктопа области (главный + дети) — по её каталогу данных."""
+    ps = ["powershell", "-NoProfile", "-Command",
+          "(Get-CimInstance Win32_Process -Filter \"Name='MiniMax Code.exe'\" | "
+          "Where-Object { $_.CommandLine -like '*minimax-areas\\p-%s\\*' }).ProcessId" % slug]
+    try:
+        out = subprocess.run(ps, capture_output=True, text=True, errors="replace", timeout=40,
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:  # noqa: BLE001
+        return []
+    ids = []
+    for line in (out.stdout or "").split():
+        if line.strip().isdigit():
+            ids.append(int(line.strip()))
+    return ids
+
+
+def wait_area_stopped(slug: str, timeout: int = 30) -> bool:
+    """Ушёл ли десктоп области на самом деле (а не только по отчёту скрипта)."""
+    deadline = time.time() + timeout
+    while True:
+        if not area_process_ids(slug):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(2)
+
+
+def kill_area_processes(slug: str) -> int:
+    """Добить дерево процессов десктопа области (главный + дети)."""
+    ids = area_process_ids(slug)
+    for pid in ids:
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)],
+                       capture_output=True, text=True, errors="replace", timeout=90,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return len(ids)
+
+
 def restart_area(slug: str) -> None:
-    """Перезапуск области: стоп → старт (собственный каталог, свой AUMID, свой ярлык)."""
+    """Перезапуск области: стоп → проверка → старт → проверка.
+
+    ⚠️ 23.11, разбор «полузависшего» окна: stop-скрипт **не всегда убивает главный
+    процесс** десктопа. Тогда «перезапуск» был фикцией: старый экземпляр оставался
+    жив (и висел на экране «Create an account or log in to continue»), а новый
+    умирал от single-instance lock — владелец видел окно, которое не вернулось в
+    строй. Теперь после каждой команды ПРОВЕРЯЕМ результат:
+      - после «стоп» — что процесс действительно ушёл (иначе добиваем дерево);
+      - после «старт» — что окно поднялось (иначе «Продолжай» уйдёт в никуда).
+    """
     ps = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"]
     subprocess.run(ps + [str(BIN / "mcode-project-stop.ps1"), "-Project", slug],
                    capture_output=True, text=True, errors="replace", timeout=120)
+    if not wait_area_stopped(slug, 30):
+        n = kill_area_processes(slug)
+        log("СЕССИИ: десктоп %s не остановился stop-скриптом — добиваю дерево (%d процессов)" % (
+            slug, n))
+        if not wait_area_stopped(slug, 20):
+            log("СЕССИИ: десктоп %s всё ещё жив — перезапуск не удался, старт не делаю" % slug)
+            return
     time.sleep(3)
     subprocess.run(ps + [str(BIN / "mcode-project-start.ps1"), "-Project", slug],
                    capture_output=True, text=True, errors="replace", timeout=180)
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        if area_process_ids(slug):
+            return
+        time.sleep(2)
+    log("СЕССИИ: десктоп %s не поднялся после старта" % slug)
 
 
 def broken_subagents(area_dir: Path) -> list:
