@@ -165,6 +165,8 @@ class Bridge:
             # применение выбора к рабочим областям
             "model.catalog": self.cmd_model_catalog,
             "model.apply": self.cmd_model_apply,
+            # сброс сессии на месте (заказ владельца 24.11)
+            "sessions.reset": self.cmd_sessions_reset,
         }
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -491,6 +493,30 @@ class Bridge:
         rep = watcher.rotate_session(area, sess)
         self.core.log("Панель «МиниГен»: %s — ротация сессии %s" % (
             area["slug"], sess["session_id"][:12]))
+        return state.jsonable(rep)
+
+    def cmd_sessions_reset(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Сбросить сессию НА МЕСТЕ: правильно завершить → очистить → продолжить.
+
+        Заказ владельца (24.11): не открывать новую сессию, а в этой же —
+        сессия сама доходит до конца и печатает сводку, рантайм сжимает
+        контекст, и та же сессия продолжает нитку.
+        """
+        area = self._area(str(args.get("slug") or ""))
+        watcher = self.mods.get("sessionwatch")
+        if watcher is None:
+            return {"error": "сторож сессий недоступен"}
+        sess = self._session(area, str(args.get("session_id") or ""))
+        reset = getattr(watcher, "reset_session", None)
+        if reset is None:
+            return {"error": "сброс на месте в этой версии сторожа нет"}
+        rep = reset(area, sess)
+        if not rep.get("ok"):
+            # откат на прежнее поведение — ротацию
+            rep = watcher.rotate_session(area, sess)
+            rep["fallback"] = "ротация"
+        self.core.log("Панель «МиниГен»: %s — сброс сессии %s на месте: %s" % (
+            area["slug"], sess["session_id"][:12], rep.get("why")))
         return state.jsonable(rep)
 
     # ──────────────────────────────────────────────────────────────── сеть

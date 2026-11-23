@@ -32,6 +32,7 @@
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -251,6 +252,47 @@ def model_flags(area_dir: Path, model: str = "", effort: str = "") -> list:
     if effort:
         out += ["--effort", effort]
     return out
+
+
+def set_compaction_trigger(area_dir: Path, fraction: float) -> dict:
+    """Порог компактизации контекста рантайма — нативно.
+
+    Рантайм сам сжимает контекст сессии, когда он близок к пределу
+    (`contextManagement.compactionTriggerAt` в `config.yaml`; по умолчанию
+    ~95 % окна). Если порог опустить, сжатие случится **внутри** сессии:
+    контекст очистится, а сама сессия (её id и нитка) останется прежней —
+    ровно то «очистить и начать заново, не начиная новую сессию».
+
+    Значение — доля окна (0.5 = 50 %) или абсолютное число токенов.
+
+    ⚠️ Правка текстом: в конфиге есть YAML-якоря, пересборка файла их бы
+    развернула. Правится только нужная строка внутри блока
+    `contextManagement`.
+    """
+    path = area_dir / "config.yaml"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return {"ok": False, "why": "не читается %s: %s" % (path, exc)}
+    line = "  compactionTriggerAt: %s" % (fraction if fraction > 1 else float(fraction))
+    block = re.compile(r"(?ms)^contextManagement:[^\n]*\n(?:[ \t]+[^\n]*\n)*")
+    inner = re.compile(r"(?m)^[ \t]+compactionTriggerAt:.*$")
+    if block.search(text):
+        if inner.search(text):
+            new = block.sub(lambda m: inner.sub(line, m.group(0), count=1), text, count=1)
+        else:
+            new = block.sub(lambda m: m.group(0).rstrip("\n") + "\n" + line + "\n", text, count=1)
+    else:
+        new = text.rstrip("\n") + "\ncontextManagement:\n" + line + "\n"
+    if new == text:
+        return {"ok": True, "changed": False, "why": "уже так"}
+    tmp = path.with_suffix(".yaml.tmp")
+    try:
+        tmp.write_text(new, encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        return {"ok": False, "why": "не записалось: %s" % exc}
+    return {"ok": True, "changed": True, "trigger": fraction}
 
 
 def mcode_run(args: list, area_dir: Path, timeout: int = 300,

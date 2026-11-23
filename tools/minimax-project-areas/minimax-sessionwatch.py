@@ -107,7 +107,12 @@ CONTEXT_ROTATE = 60      # backstop: НИЖЕ минимальной наблю�
                           #  страховка снизу [G680].
 COMPACT_MARK = "context_compaction_checkpoint_generated"   # событие рантайма о сжатии
 COMPACT_WINDOW_MS = 6 * 3600 * 1000   # окно, в котором сжатие считается свежим
-CLOSE_TIMEOUT = 900      # сколько ждём корректного закрытия сессии, сек
+CLOSE_TIMEOUT = 900
+# ⚠️ Сброс сессии НА МЕСТЕ (заказ владельца 24.11): не открываем новую
+# сессию, а в этой же — правильно завершаем, чистим контекст и продолжаем.
+RESET_COOLDOWN = 7200     # 2 ч: после сброса ту же сессию не трогаем
+                          # (пик заполнения остаётся высоким — иначе цикл)
+COMPACTION_TRIGGER = 0.5  # порог сжатия контекста рантайма (доля окна)      # сколько ждём корректного закрытия сессии, сек
 
 
 # ────────────────────────────────────────────────────────── чтение рантайма
@@ -649,6 +654,66 @@ CLOSE_COMMAND = (
 )
 
 
+RESET_COMMAND = (
+    "Завершай работу в этой сессии правильно:\n"
+    "1) сохрани состояние нитки в handoff-файл репозитория (для репозитория Мозг — "
+    "команда /close_session; для обычного проекта — запиши, что сделано и что дальше, "
+    "в файл состояния нитки);\n"
+    "2) напечатай ИТОГОВУЮ СВОДКУ работы сессии: что сделано, что не сделано, что дальше;\n"
+    "3) после сводки остановись — эту сессию сейчас очистят и продолжат В НЕЙ ЖЕ."
+)
+
+
+def reset_session(area: dict, sess: dict, brief: str = "") -> dict:
+    """Сброс сессии НА МЕСТЕ: правильно завершить -> очистить -> начать заново.
+
+    Заказ владельца (24.11): **не начинать новую сессию**, а в этой же —
+    1) сессия сама доходит до конца и печатает сводку (нить не теряется);
+    2) контекст очищается: порог компактизации опускается, и рантайм сжимает
+       контекст САМ, внутри этой же сессии;
+    3) та же сессия продолжается с командой «продолжи нитку».
+
+    Почему так: новая сессия — это новая нитка с нуля (агент всё перечитывает
+    заново), а сброс на месте сохраняет идентичность сессии и её историю.
+
+    ⚠️ Откат: если сброс не удался (сессия не откликнулась) — прежнее
+    поведение, ротация (архивирование + новая сессия). Сброс на месте не
+    должен быть хуже прежнего.
+    """
+    report = {"session_id": sess["session_id"], "steps": [], "mode": "на месте"}
+    if probe_of(area, sess):
+        report["ok"] = False
+        report["why"] = "это проба лечащего — сброс запрещён"
+        core.log("СЕССИИ: сброс запрещён — проба %s" % sess["session_id"][:12])
+        return report
+    core.log("СЕССИИ: сброс на месте %s (%s)" % (sess["session_id"][:12], sess["title"][:50]))
+    # 0) опускаем порог компактизации: рантайм сожмёт контекст сам, внутри
+    #    этой сессии (новая сессия не понадобится)
+    trig = core.set_compaction_trigger(area["dir"], COMPACTION_TRIGGER)
+    report["steps"].append({"compaction_trigger": trig})
+    # 1) правильно завершить: сводка + handoff (нить не теряется)
+    res = send_to_session(area, sess, RESET_COMMAND, background=True)
+    report["steps"].append({"close_command": res})
+    if not res.get("ok"):
+        report["ok"] = False
+        report["why"] = "команду завершения не приняли: %s" % res.get("why")
+        return report
+    closed = wait_closed(area, sess["session_id"])
+    report["steps"].append({"closed": closed})
+    if not closed:
+        report["ok"] = False
+        report["why"] = "сессия не закончила ход за отведённое время"
+        return report
+    # 2) продолжить ТУ ЖЕ сессию: контекст при этом сожмётся (это и есть
+    #    «очистка» — рантайм делает это сам, своими родными средствами)
+    text = brief or continuation_brief(area, sess)
+    again = send_to_session(area, sess, text, background=True)
+    report["steps"].append({"continued": again})
+    report["ok"] = bool(again.get("ok"))
+    report["why"] = again.get("why")
+    return report
+
+
 def rotate_session(area: dict, sess: dict, brief: str = "") -> dict:
     """Ротация сессии: корректное закрытие → архивирование → новая сессия.
 
@@ -776,26 +841,29 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
         cool = int(time.time()) - last < REVIVE_COOLDOWN
         if v["verdict"] in ("готова", "работает", "кончились очки", "ждёт владельца"):
             continue
-        if v["verdict"] == "скомпактилась":
+        if v["verdict"] in ("скомпактилась", "контекст заполнен"):
+            # ⚠️ Заказ владельца (24.11): НЕ открывать новую сессию, а сбросить
+            # текущую на месте: правильно завершить -> рантайм сожмёт контекст ->
+            # та же сессия продолжит нитку. Ротация (новая сессия) — только если
+            # сброс не удался.
             if dry_run:
-                actions.append({"session": v["session_id"], "action": "ротация после компактизации (сухой прогон)"})
+                actions.append({"session": v["session_id"], "action": "сброс на месте (сухой прогон)"})
+                continue
+            last_reset = int((state.get("reset") or {}).get(v["session_id"]) or 0)
+            if last_reset and int(time.time()) - last_reset < RESET_COOLDOWN:
+                actions.append({"session": v["session_id"], "action": "сброс был недавно — не трогаем"})
                 continue
             sess = {"session_id": v["session_id"], "title": v["title"],
                     "workspace_dir": area.get("folder", "")}
-            rep = rotate_session(area, sess)
-            actions.append({"session": v["session_id"], "action": "ротация после компактизации", "report": rep})
-            core.log("СЕССИИ: %s — сессия %s сжата рантаймом, ротирую: %s" % (
-                slug, v["session_id"][:12], rep.get("why")))
-            continue
-        if v["verdict"] == "контекст заполнен":
-            if dry_run:
-                actions.append({"session": v["session_id"], "action": "ротация (сухой прогон)"})
-                continue
-            sess = {"session_id": v["session_id"], "title": v["title"],
-                    "workspace_dir": area.get("folder", "")}
-            rep = rotate_session(area, sess)
-            actions.append({"session": v["session_id"], "action": "ротация", "report": rep})
-            core.log("СЕССИИ: %s — ротация: %s" % (slug, rep.get("why")))
+            rep = reset_session(area, sess)
+            if not rep.get("ok"):
+                rep = rotate_session(area, sess)
+                rep["fallback"] = "ротация"
+            state.setdefault("reset", {})[v["session_id"]] = int(time.time())
+            actions.append({"session": v["session_id"], "action": "сброс на месте", "report": rep})
+            core.log("СЕССИИ: %s — %s: %s" % (
+                slug, "сброс на месте" if not rep.get("fallback") else "сброс не удался — ротация",
+                rep.get("why")))
             continue
         if v["verdict"] == "упала по сети":
             # Поднимаем, когда сеть **сейчас** в порядке (по данным сетевого
@@ -1002,6 +1070,32 @@ def cli_new(args) -> int:
     return 0 if res.get("ok") else 1
 
 
+def cli_reset(args) -> int:
+    """Сбросить сессию на месте: завершить -> очистить -> продолжить её же."""
+    area_slug, session_id = args.reset[0], args.reset[1]
+    area = area_by_slug(area_slug)
+    if not area:
+        print("область не найдена: %s" % area_slug)
+        return 2
+    sess = None
+    for s in sessions_of(area["dir"]):
+        if s["session_id"] == session_id or s["session_id"].startswith(session_id):
+            sess = s
+            break
+    if not sess:
+        print("сессия не найдена: %s" % session_id)
+        return 2
+    if not getattr(args, "force", False) and probe_of(area, sess):
+        print("это служебная сессия-проба — сбрасывать её нельзя (--force — если очень надо)")
+        return 2
+    rep = reset_session(area, sess)
+    if not rep.get("ok"):
+        rep = rotate_session(area, sess)
+        rep["fallback"] = "ротация"
+    print(json.dumps(rep, ensure_ascii=False, indent=2)[:2000])
+    return 0 if rep.get("ok") else 1
+
+
 def cli_rotate(args) -> int:
     area_slug, session_id = args.rotate[0], args.rotate[1]
     area = area_by_slug(area_slug)
@@ -1051,6 +1145,9 @@ def main() -> int:
     ap.add_argument("--close", nargs=2, metavar=("ОБЛАСТЬ", "SESSION_ID"))
     ap.add_argument("--new", nargs=2, metavar=("ОБЛАСТЬ", "ТЕКСТ"))
     ap.add_argument("--rotate", nargs=2, metavar=("ОБЛАСТЬ", "SESSION_ID"))
+    ap.add_argument("--reset", nargs=2, metavar=("ОБЛАСТЬ", "SESSION_ID"),
+                    help="сбросить сессию НА МЕСТЕ: правильно завершить, "
+                         "очистить контекст и продолжить эту же сессию")
     ap.add_argument("--force", action="store_true",
                     help="действовать с пробой лечащего (обычно нельзя)")
     args = ap.parse_args()
@@ -1065,6 +1162,8 @@ def main() -> int:
         return cli_close(args)
     if args.new:
         return cli_new(args)
+    if args.reset:
+        return cli_reset(args)
     if args.rotate:
         return cli_rotate(args)
     if args.status:
