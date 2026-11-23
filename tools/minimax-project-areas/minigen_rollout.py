@@ -307,13 +307,23 @@ def stop_stale_managers() -> int:
 
 
 def start_installed_manager() -> bool:
-    """Поднять фоновый режим из установленного места (как при входе в Windows)."""
+    """Поднять фоновый режим из установленного места (как при входе в Windows).
+
+    ⚠️ Вывод перенаправляем в DEVNULL, а **не перехватываем**: `Автозапуск.cmd`
+    запускает менеджера через `start`, и тот наследует дескрипторы. При
+    `capture_output=True` труба остаётся открытой, пока жив менеджер (а он живёт
+    всегда), ⇒ `subprocess.run` ждёт EOF **вечно** и раскатка зависает на
+    последнем шаге. С DEVNULL дескриптор не наследуется по трубе — команда
+    возвращается сразу.
+    """
     autostart = PROGRAM_ROOT / "Автозапуск.cmd"
     if not autostart.is_file():
         print("   ⚠️ нет %s — фоновый режим не поднят" % autostart)
         return False
-    subprocess.run(["cmd", "/c", str(autostart)], capture_output=True, text=True,
-                   timeout=60, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    subprocess.run(["cmd", "/c", str(autostart)], stdin=subprocess.DEVNULL,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   timeout=60,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return True
 
 
