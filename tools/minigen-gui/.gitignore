@@ -1,0 +1,15 @@
+# Зависимости и сборка — не в репозиторий
+node_modules/
+out/
+release/
+dist/
+
+# Локальное окружение и логи
+.venv/
+__pycache__/
+*.pyc
+*.log
+
+# Сборка Python-моста
+bridge/__pycache__/
+bridge/tests/__pycache__/

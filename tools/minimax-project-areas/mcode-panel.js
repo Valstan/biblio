@@ -239,7 +239,13 @@ function setMode(slug, mode) {
   proj.autoheal = want;
   try {
     fs.copyFileSync(PROJECTS_FILE, PROJECTS_FILE + '.bak-mode');
-    fs.writeFileSync(PROJECTS_FILE, renderConfig(cfg), 'utf8');
+    // Запись АТОМАРНАЯ: сначала во временный файл рядом, потом переименование.
+    // Прямая запись обрывает файл на середине, и читатель (демон, новая
+    // программа) ловит обрывок JSON: в журнале это выглядит как
+    // «конфиг … не читается (Expecting ',' delimiter)» — 23.11, дважды.
+    const tmp = PROJECTS_FILE + '.tmp';
+    fs.writeFileSync(tmp, renderConfig(cfg), 'utf8');
+    fs.renameSync(tmp, PROJECTS_FILE);
   } catch (e) {
     return { ok: false, error: String(e && e.message || e) };
   }
