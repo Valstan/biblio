@@ -98,11 +98,17 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:                               # noqa: N802
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
-        if parsed.path != "/status":
-            self._send(404, {"error": "not found"})
-            return
         if not self._authorized(query):
             self._send(401, {"error": "нужен токен"})
+            return
+        # /restart-contour принимаем и на GET — старый супервизор отвечал на
+        # любой метод, и поломка «GET ушёл в 404» стоила нам одного шага
+        # диагностики. Лишним это не мешает: действие и так под токеном.
+        if parsed.path == "/restart-contour":
+            self._send(200, restart_contour())
+            return
+        if parsed.path != "/status":
+            self._send(404, {"error": "not found"})
             return
         self._send(200, daemons.status())
 
@@ -128,6 +134,11 @@ class Handler(BaseHTTPRequestHandler):
 
 def serve(port: int = PORT) -> None:
     """Запустить локальный API (в потоке)."""
+    # Токен создаём СРАЗУ, при старте: сетевой сторож читает файл, чтобы
+    # звать программу при смене прокси. Если токен появлялся бы только при
+    # первом обращении, до него дело не дошло бы никогда (замкнутый круг:
+    # позвать — нечем, токена нет; токен есть — никто не звал).
+    token()
     server = HTTPServer(("127.0.0.1", port), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

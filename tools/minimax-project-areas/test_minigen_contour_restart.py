@@ -78,7 +78,11 @@ def main() -> int:
         def fake_urlopen(req, timeout=None):
             url = req.full_url if hasattr(req, "full_url") else str(req)
             tried.append(url)
+            # метод тоже важен: программа различает GET (чтение) и POST
+            # (действие) — GET на /restart-contour уходит в 404
             if "8097" in url:
+                if getattr(req, "method", "GET") != "POST":
+                    raise OSError("запрос должен быть POST")
                 raise OSError("программа не отвечает")
             return FakeResponse()
 

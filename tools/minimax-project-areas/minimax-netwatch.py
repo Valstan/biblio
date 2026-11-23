@@ -625,7 +625,11 @@ def restart_contour() -> bool:
     last = ""
     for url, headers in contour_targets():
         try:
-            req = urllib.request.Request(url, headers=headers)
+            # Именно POST: программа различает методы (/status — чтение,
+            # /restart-contour — действие). Старый супервизор отвечал на
+            # любой метод — на этом и подвох: GET на действие молча уходил
+            # в 404, и цепочка падала, не досказав почему.
+            req = urllib.request.Request(url, headers=headers, method="POST")
             urllib.request.urlopen(req, timeout=30).read()
             core.log("СЕТЬ: контур перезапущен (%s)" % url)
             return True
