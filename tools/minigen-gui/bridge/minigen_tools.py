@@ -88,6 +88,34 @@ TOOLS: list[dict[str, Any]] = [
           {"type": "object", "properties": {}},
           "lineage.show"),
 
+    _tool("clone.status",
+          "Свой клон копии на GitHub: есть ли он, где лежит, какие репозитории "
+          "подключены (свой и upstream), в какой ветке работа и есть ли "
+          "незакоммиченные правки.",
+          {"type": "object", "properties": {}},
+          "clone.status"),
+
+    _tool("clone.setup",
+          "Завести свою копию на GitHub: создать репозиторий копии, взять клон "
+          "рядом с программой, подключить upstream (репозиторий программы) и "
+          "клон пула наработок. После этого правки и PR идут из своего клона.",
+          {"type": "object",
+           "properties": {"upstream": {"type": "string",
+                                       "description": "репозиторий программы (по умолчанию Valstan/biblio)"},
+                          "pool": {"type": "string",
+                                   "description": "репозиторий пула наработок"},
+                          "private": {"type": "boolean",
+                                      "description": "свой репозиторий приватный (по умолчанию да)"}},
+           "required": []},
+          "clone.setup", True,
+          "создаст репозитории в вашем GitHub-аккаунте"),
+
+    _tool("clone.sync",
+          "Обновить свой клон и пул наработок (только fast-forward; локальные "
+          "правки не трогаются).",
+          {"type": "object", "properties": {}},
+          "clone.sync"),
+
     _tool("stats.summary",
           "Сводка работы за период: сколько раз перезапускались области и по "
           "каким причинам (отказ по очкам, обрыв сети, компактизация контекста, "

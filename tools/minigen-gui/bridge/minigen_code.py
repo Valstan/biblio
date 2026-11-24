@@ -46,17 +46,27 @@ def repo_root() -> Path:
     Порядок поиска:
 
     1. `MINIGEN_CODE_REPO` — явное указание;
-    2. настройка `codeRepo` (её пишет установщик): программа может стоять
+    2. **клон копии** (`<Programs>\\МиниГен\\clone`) — если он есть, то это
+       рабочее дерево копии: заказ владельца (24.11) — каждая копия правит
+       программу в **своём** клоне, а не в чужом дереве;
+    3. настройка `codeRepo` (её пишет установщик): программа может стоять
        в своём месте (`%LOCALAPPDATA%\\Programs\\МиниГен`), а исходники —
        в репозитории; правки и PR делаются по исходникам;
-    3. вверх по дереву до каталога с `.git` — когда программа запущена из
+    4. вверх по дереву до каталога с `.git` — когда программа запущена из
        самого репозитория (разработка);
-    4. иначе — каталог программы (правки работать не смогут, и команда
+    5. иначе — каталог программы (правки работать не смогут, и команда
        это скажет).
     """
     env = os.environ.get("MINIGEN_CODE_REPO")
     if env:
         return Path(env).resolve()
+    try:
+        import minigen_clone
+        clone = minigen_clone.CLONE_DIR
+        if (clone / ".git").is_dir():
+            return clone.resolve()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import json
         settings = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) \
@@ -75,7 +85,26 @@ def repo_root() -> Path:
 
 
 REPO = repo_root()
-WORKTREES = REPO / ".claude" / "worktrees"
+
+
+def _worktrees_dir() -> Path:
+    """Каталог worktree'ов.
+
+    Если репозиторий — клон копии, worktree'и лежат **вне** клона: иначе
+    клон виделся бы «грязным» (untracked-каталог) и правки в нём путались бы
+    с чужими.
+    """
+    try:
+        import minigen_clone
+        if REPO == minigen_clone.CLONE_DIR.resolve():
+            return (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                    / "minigen-gui" / "worktrees")
+    except Exception:  # noqa: BLE001
+        pass
+    return REPO / ".claude" / "worktrees"
+
+
+WORKTREES = _worktrees_dir()
 STATE_FILE = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "minigen-gui" / "fix-worktree.json"
 
 MAX_READ = 60_000
@@ -465,8 +494,33 @@ def commit(message: str) -> dict[str, Any]:
 
 
 
+def _remote_url(name: str, cwd: Path) -> str:
+    res = git(["remote", "get-url", name], cwd)
+    return res.get("out") or ""
+
+
+def _repo_slug(url: str) -> str:
+    """`https://github.com/Valstan/biblio.git` → `Valstan/biblio`."""
+    match = re.search(r"github\.com[:/]+([^/]+)/([^/\s]+?)(?:\.git)?\s*$", url or "")
+    return "%s/%s" % (match.group(1), match.group(2)) if match else ""
+
+
+def upstream_slug(cwd: Path) -> str:
+    """Куда идёт PR: репозиторий программы (`upstream`), иначе `origin`."""
+    for name in ("upstream", "origin"):
+        slug = _repo_slug(_remote_url(name, cwd))
+        if slug:
+            return slug
+    return ""
+
+
 def open_pr(title: str, body: str = "") -> dict[str, Any]:
-    """Отправить ветку и открыть PR (по правилам репозитория)."""
+    """Отправить ветку и открыть PR (по правилам репозитория).
+
+    Ветка уходит в **свой** репозиторий копии (`origin`), а PR открывается в
+    репозиторий программы (`upstream`) — так это и работает с форком: PR из
+    форка в основной репозиторий.
+    """
     worktree = current_worktree()
     if worktree is None:
         return {"error": "нет worktree под правку — сначала code.branch"}
@@ -483,10 +537,19 @@ def open_pr(title: str, body: str = "") -> dict[str, Any]:
     if not body_text:
         body_text = ("Правка предложена встроенной нейросетью «МиниГена».\n\n"
                      "Проверки запускались в worktree правки; решение — за владельцем.")
+    target = upstream_slug(worktree)
+    owner = _repo_slug(_remote_url("origin", worktree)).split("/")[0]
+    args = ["gh", "pr", "create", "--base", "master"]
+    if target:
+        args += ["--repo", target]
+    if owner and target and not target.startswith(owner + "/"):
+        args += ["--head", "%s:%s" % (owner, branch)]
+    else:
+        args += ["--head", branch]
+    args += ["--title", title, "--body", body_text]
     try:
         proc = subprocess.run(
-            ["gh", "pr", "create", "--base", "master", "--head", branch,
-             "--title", title, "--body", body_text],
+            args,
             cwd=str(worktree), capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=300,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
@@ -496,7 +559,8 @@ def open_pr(title: str, body: str = "") -> dict[str, Any]:
         return {"error": "gh не ответил за 300 с"}
     if proc.returncode != 0:
         return {"error": "PR не открыт: %s" % ((proc.stderr or proc.stdout or "")[-400:])}
-    return {"ok": True, "branch": branch, "pr": (proc.stdout or "").strip()}
+    return {"ok": True, "branch": branch, "repo": target,
+            "pr": (proc.stdout or "").strip()}
 
 
 def discard_worktree() -> dict[str, Any]:
