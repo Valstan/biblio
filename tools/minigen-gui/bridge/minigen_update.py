@@ -195,6 +195,34 @@ def _cached_available() -> dict[str, Any]:
     return value
 
 
+def _steps_from_log(limit: int = 40) -> list[dict[str, Any]]:
+    """Шаги из журнала на диске — окно после перезапуска видит историю.
+
+    ⚠️ Живой случай 24.11: владелец обновил программу, окно перезапустил, а
+    во вкладке было «Обновление ещё не запускали — журнал пуст»: шаги лежали
+    только в памяти процесса, который перезапустили. На диске они есть — их
+    и читаем.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        if not LOG_FILE.is_file():
+            return out
+        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except OSError:
+        return out
+    for line in lines:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            record = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("step"):
+            out.append(record)
+    return out
+
+
 # ──────────────────────────────────────────────────────────────── статусы
 
 def status() -> dict[str, Any]:
@@ -203,6 +231,8 @@ def status() -> dict[str, Any]:
         steps = list(_steps)
         running = _running
         last = dict(_last)
+    if not steps:
+        steps = _steps_from_log()
     return {"running": running, "steps": steps, "installed": installed(),
             "available": _cached_available(), "last": last,
             "repo": str(repo_dir())}
@@ -270,6 +300,18 @@ def _run() -> None:
         if out.strip():
             _fail("repo", "в исходниках есть незакоммиченные правки — обновление "
                           "чужую работу не трогает; разберись с ними и повтори")
+            return
+        # ⚠️ Ветка (живой случай 24.11): обновление собирает окно и ставит его
+        # на место — а сборка метку берёт из того, что в дереве. Если в дереве
+        # была **ветка разработки**, на место попадала сборка из неё, и окно
+        # потом вечно спорило с «версией на месте». Поэтому обновление идёт
+        # только из master — и говорит об этом прямо.
+        code, out, err = _git(["rev-parse", "--abbrev-ref", "HEAD"], repo)
+        branch = out.strip() if code == 0 else ""
+        if branch and branch not in ("master", "main"):
+            _fail("repo", "исходники на ветке «%s» — обновление собирает окно из "
+                          "master. Переключитесь на master (git checkout master) "
+                          "и повторите" % branch)
             return
         gui = repo.joinpath(*GUI_REL)
         if not (gui / "node_modules").is_dir():

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { describeUpdate } from '../src/renderer/src/tabs/update-view'
+import { describeUpdate, formatInstalledAt } from '../src/renderer/src/tabs/update-view'
 import type { ProgramVersion, UpdateState } from '../src/shared/types'
 
 /**
@@ -68,5 +68,26 @@ describe('состояние обновления', () => {
   it('неизвестная версия — это плохо, а не «всё хорошо»', () => {
     const verdict = describeUpdate(null, '', state())
     expect(verdict.tone).toBe('bad')
+  })
+})
+
+describe('время установки', () => {
+  it('секунды показываются как дата, а не как 1970 год', () => {
+    // живой случай 24.11: installed_at приходит в секундах, а Date ждёт
+    // миллисекунды ⇒ на экране было «21.01.1970, 21:45:10»
+    const text = formatInstalledAt(1_700_000_000)
+    expect(text).not.toContain('1970')
+    expect(text).not.toContain('Invalid')
+    expect(text).toContain('2023')
+  })
+
+  it('миллисекунды тоже понимаются', () => {
+    const text = formatInstalledAt(1_700_000_000_000)
+    expect(text).toContain('2023')
+  })
+
+  it('пусто — пустая строка, а не «Invalid Date»', () => {
+    expect(formatInstalledAt(0)).toBe('')
+    expect(formatInstalledAt(undefined)).toBe('')
   })
 })

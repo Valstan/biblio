@@ -9,6 +9,22 @@ export interface UpdateVerdict {
 }
 
 /**
+ * Время установки программы — для строки «Установлено на месте».
+ *
+ * ⚠️ `installed_at` приходит в **секундах** (так пишет раскатка: `int(time.time())`),
+ * а `new Date(...)` ждёт миллисекунды ⇒ без поправки на экране было
+ * «21.01.1970, 21:45:10» (живой случай 24.11). Значения меньше 1e12 считаем
+ * секундами, большие — миллисекундами (на всякий случай).
+ */
+export function formatInstalledAt(seconds: number | null | undefined): string {
+  if (!seconds) return ''
+  const ms = seconds < 1e12 ? seconds * 1000 : seconds
+  const date = new Date(ms)
+  if (Number.isNaN(date.getTime())) return ''
+  return date.toLocaleString('ru-RU')
+}
+
+/**
  * Главный вопрос про обновление: «у меня новая версия или нет?»
  *
  * ⚠️ Раскатка меняет файлы **на диске**, а уже запущенное окно продолжает

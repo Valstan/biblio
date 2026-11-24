@@ -133,6 +133,8 @@ class UpdateTest(unittest.TestCase):
         def fake_git(args, cwd, timeout=120):
             if args and args[0] == "status":
                 return 0, "", ""
+            if args[:3] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return 0, "master", ""
             if args and args[0] == "remote":
                 return 0, "origin", ""
             return 0, "aaaaaaa", ""
@@ -143,6 +145,31 @@ class UpdateTest(unittest.TestCase):
             last = dict(update._last)
         self.assertFalse(last.get("ok"))
         self.assertIn("node_modules", last.get("why", ""))
+
+    def test_update_stops_on_a_branch(self) -> None:
+        """Исходники на ветке ⇒ обновление не идёт: окно собирается из master.
+
+        Живой случай 24.11: в дереве была ветка правки, сборка взяла метку из
+        неё, и окно потом вечно спорило с «версией на месте» — перезапуск не
+        помогал, потому что перезапускался тот же бандл.
+        """
+        def fake_git(args, cwd, timeout=120):
+            if args and args[0] == "status":
+                return 0, "", ""
+            if args[:3] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return 0, "agent/minigen-fix", ""
+            if args and args[0] == "remote":
+                return 0, "origin", ""
+            return 0, "aaaaaaa", ""
+        update._git = fake_git
+        update._stream = lambda args, cwd, step: 0
+        update._run()
+        with update._lock:
+            last = dict(update._last)
+        self.assertFalse(last.get("ok"))
+        why = last.get("why", "")
+        self.assertIn("ветке", why)
+        self.assertIn("master", why)
 
     # ── журнал и статус ────────────────────────────────────────────────
     def test_log_records_steps(self) -> None:
@@ -161,6 +188,20 @@ class UpdateTest(unittest.TestCase):
         for key in ("running", "steps", "installed", "available", "repo"):
             self.assertIn(key, result)
         self.assertFalse(result["running"])
+
+    def test_steps_survive_a_window_restart(self) -> None:
+        """После перезапуска окна шаги берутся из журнала на диске.
+
+        Живой случай 24.11: окно перезапустили, а во вкладке было «обновление
+        ещё не запускали — журнал пуст», хотя обновление шло и журнал лежал.
+        """
+        update._log("build", "собираю окно")
+        update._log("build", "окно собрано", "ok")
+        with update._lock:
+            update._steps.clear()
+        result = update.status()
+        texts = [step.get("text") for step in result["steps"]]
+        self.assertIn("окно собрано", texts)
 
     def test_npm_command_goes_through_cmd_on_windows(self) -> None:
         """npm на Windows — это .cmd: его надо звать через cmd.exe."""
