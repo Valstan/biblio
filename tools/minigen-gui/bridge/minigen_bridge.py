@@ -49,9 +49,26 @@ import minigen_daemons as daemons      # noqa: E402
 import minigen_lock as minigen_lock    # noqa: E402
 import minigen_lineage as lineage      # noqa: E402
 import minigen_provider as provider_mod  # noqa: E402
+import minigen_agents as agents_mod    # noqa: E402
+import minigen_ingest as ingest        # noqa: E402
+import minigen_karman as karman_mod    # noqa: E402
+import minigen_repos as repos_mod      # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
+
+
+def _title_from(text: str) -> str:
+    """Заголовок заявки из зачитки: первая строка, обрезанная до 90 знаков.
+
+    Зачитка — голос, и первая фраза обычно и есть суть. Обрезаем, чтобы
+    заголовок не уехал в простыню.
+    """
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:90].rstrip()
+    return "Без названия"
 
 # «Ящик отчётов»: пометка «до какого отчёта нейросеть уже в курсе».
 REPORTS_SEEN = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
@@ -210,6 +227,18 @@ class Bridge:
             "update.status": self.cmd_update_status,
             "update.check": self.cmd_update_check,
             "update.start": self.cmd_update_start,
+            # агенты «МиниГена»: реестр, создание, восстановление (24.11)
+            "agents.list": self.cmd_agents_list,
+            "agents.state": self.cmd_agents_state,
+            "agents.create": self.cmd_agents_create,
+            "agents.apply": self.cmd_agents_apply,
+            # заявки: зачитка владельца → заявка для другой нейросети (24.11)
+            "ingest.draft": self.cmd_ingest_draft,
+            "ingest.save": self.cmd_ingest_save,
+            # чужие репозитории — только чтение (24.11)
+            "repos.list": self.cmd_repos_list,
+            "repos.read": self.cmd_repos_read,
+            "repos.profile": self.cmd_repos_profile,
         }
 
     # Команды, чей вызов **не** отчитывается в «ящик отчётов»: иначе
@@ -831,6 +860,261 @@ class Bridge:
 
     def cmd_code_discard(self, args: dict[str, Any]) -> dict[str, Any]:
         return code.discard_worktree()
+
+    # ──────────────────────────────────── агенты, заявки и чужие репозитории
+    def cmd_agents_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Агенты реестра: манифесты, репозитории, области, их заявки."""
+        snapshot = agents_mod.agent_state()
+        snapshot["digest"] = agents_mod.agents_digest()
+        for agent in snapshot.get("agents") or []:
+            slug = str(agent.get("slug") or "")
+            agent["requests"] = agents_mod.list_requests(slug)
+        return snapshot
+
+    def cmd_agents_state(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Состояние реестра агентов (что заведено, где лежит, что есть)."""
+        return agents_mod.agent_state()
+
+    def cmd_agents_create(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Создать агента: репозиторий, конституция, скиллы, область.
+
+        ⚠️ Меняет внешний мир (создаёт репозиторий на GitHub, пишет в
+        реестр, заводит область) — поэтому инструмент помечен опасным и
+        спрашивает подтверждения.
+        """
+        slug = str(args.get("slug") or "").strip().lower()
+        title = str(args.get("title") or "").strip()
+        role = str(args.get("role") or "").strip()
+        repo = str(args.get("repo") or "").strip()
+        template = str(args.get("template") or "").strip()
+        area_slug = str(args.get("area") or slug).strip().lower()
+        make_area = not bool(args.get("no_area"))
+        model = str(args.get("model") or "").strip()
+
+        created = agents_mod.create_agent(slug, title, role, repo_slug=repo,
+                                          template=template, area=area_slug,
+                                          model=model)
+        if created.get("error"):
+            return created
+        result = dict(created)
+        if make_area:
+            area_dir = state.AREAS_ROOT / ("p-" + area_slug)
+            if area_dir.exists():
+                result["area_note"] = "область %s уже была" % area_slug
+            else:
+                area = self.cmd_create({
+                    "slug": area_slug,
+                    "title": title or area_slug,
+                    "folder": str(created.get("repo_path") or ""),
+                    "karman": slug,
+                })
+                if area.get("error"):
+                    result["area_note"] = "область не заведена: %s" % area.get("error")
+                else:
+                    result["area_dir"] = area.get("dir")
+            installed = agents_mod.install_skills(area_slug, Path(created["repo_path"]))
+            result["skills_installed"] = installed.get("installed") or []
+            if installed.get("error"):
+                result["area_note"] = ((result.get("area_note") or "") + "; " +
+                                       installed["error"]).strip("; ")
+        return result
+
+    def cmd_agents_apply(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Восстановить агента на этой машине (из реестра на GitHub)."""
+        slug = str(args.get("slug") or "").strip().lower()
+        if not slug:
+            return {"error": "нужен slug агента"}
+        area = str(args.get("area") or "").strip()
+        applied = agents_mod.apply_agent(slug, area)
+        if applied.get("error"):
+            return applied
+        result = dict(applied)
+        area_slug = str(result.get("area") or "")
+        area_dir = state.AREAS_ROOT / ("p-" + area_slug)
+        if area_slug and not area_dir.exists():
+            created = self.cmd_create({
+                "slug": area_slug,
+                "title": slug,
+                "folder": str(result.get("repo_path") or ""),
+                "karman": slug,
+            })
+            if created.get("error"):
+                result["area_note"] = "область не заведена: %s" % created.get("error")
+            else:
+                result["area_dir"] = created.get("dir")
+                again = agents_mod.install_skills(area_slug, Path(result["repo_path"]))
+                result["skills_installed"] = again.get("installed") or []
+        return result
+
+    # ──────────────────────────────────────────────────────────── заявки
+    def _known_projects(self) -> list[dict[str, Any]]:
+        """Проекты, которые зачитка может относиться к.
+
+        Три источника: области «МиниГена», локальные репозитории и разделы
+        КАРМАНА. Порядок не важен — важно, что список полный: по нему
+        решается, «подходит существующий проект или нужен новый».
+        """
+        projects: list[dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(slug: str, title: str, keywords: Any = ()) -> None:
+            name = (slug or "").strip()
+            if not name or name.lower() in seen:
+                return
+            seen.add(name.lower())
+            words = [str(word) for word in (keywords or []) if str(word).strip()]
+            projects.append({"slug": name, "title": (title or name).strip(),
+                             "keywords": words})
+
+        try:
+            for item in state.read_projects().get("projects") or []:
+                add(str(item.get("slug") or ""), str(item.get("title") or ""),
+                    [str(item.get("karman") or ""), str(item.get("folder") or "")])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            for repo in repos_mod.list_repos(detail=False):
+                add(repo["name"], repo["name"])
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            code, sections = karman_mod.list_sections()
+            if code == 200:
+                for name in sections:
+                    add(name, name)
+        except Exception:  # noqa: BLE001
+            pass
+        return projects
+
+    def cmd_ingest_draft(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Черновик заявки по зачитке: проект, разделы, чего не хватает.
+
+        Саму зачитку превращает в текст нейросеть — мост даёт ей каркас
+        (разделы канона) и подсказку, в каком проекте это, вероятно, живёт.
+        """
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return {"error": "пустая зачитка"}
+        projects = self._known_projects()
+        guess = ingest.guess_project(text, projects)
+        title = str(args.get("title") or "").strip() or _title_from(text)
+        wanted = str(args.get("project") or "").strip()
+        if wanted:
+            known = next((p for p in projects
+                          if p["slug"].lower() == wanted.lower()), None)
+            guess = {"slug": wanted, "title": known["title"] if known else wanted,
+                     "confidence": 1.0, "known": known is not None,
+                     "evidence": ["задан владельцем"]}
+        skeleton = ingest.render_request({
+            "title": title,
+            "project": guess["slug"],
+            "summary": "<одна фраза: что должно измениться>",
+            "Что сделать": "<пронумерованные пункты: что именно сделать — проверяемыми действиями>",
+            "Контекст": "<что уже есть в проекте (файлы, модули); чего не хватает>",
+            "План": "<3–7 шагов, у каждого — проверяемый результат>",
+            "Критерии приёмки": "<- [ ] проверяемый пункт (тест, команда, сценарий)>",
+            "Риски и открытые вопросы": "<что может помешать; что не сказано; чьё решение нужно>",
+            "Источник": "<зачитка владельца, дата>",
+        })
+        return {
+            "ok": True,
+            "title": title,
+            "project": guess,
+            "projects": [{"slug": p["slug"], "title": p["title"]} for p in projects],
+            "sections": list(ingest.SECTIONS),
+            "skeleton": skeleton,
+            "missing": ingest.missing_sections({
+                "Что сделать": "<пункт>", "План": "<шаг>",
+                "Критерии приёмки": "<пункт>"}),
+            "hint": ("Заполни разделы и сохрани через ingest.save. Проект: %s%s. "
+                     "Если ни один проект не подошёл — придумай новый (латиница, "
+                     "коротко) и напиши его в поле project."
+                     % (guess["slug"] or "<новый>",
+                        " (уверенность %.2f)" % guess["confidence"]
+                        if guess["confidence"] else "")),
+        }
+
+    def cmd_ingest_save(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Сохранить заявку: в репозиторий агента и в раздел КАРМАНА."""
+        agent = str(args.get("agent") or "ideas").strip() or "ideas"
+        body = str(args.get("body") or "")
+        title = str(args.get("title") or "").strip()
+        project = str(args.get("project") or "").strip()
+        summary = str(args.get("summary") or "").strip()
+
+        parsed = ingest.parse_request(body) if body else {}
+        draft: dict[str, Any] = {
+            "title": title or str(parsed.get("title") or ""),
+            "project": project or str(parsed.get("проект") or ""),
+            "summary": summary or str(parsed.get("суть") or ""),
+        }
+        sections = parsed.get("sections") or {}
+        given = args.get("sections")
+        if isinstance(given, dict):
+            sections = {**sections, **{str(k): str(v) for k, v in given.items()}}
+        for name in ingest.SECTIONS:
+            value = str(given.get(name) if isinstance(given, dict) and name in given
+                        else sections.get(name) or "").strip()
+            if value:
+                draft[name] = value
+        if not draft.get("Что сделать"):
+            return {"error": "заявка без раздела «Что сделать» — нечего сохранять"}
+        missing = ingest.missing_sections(draft)
+        text = ingest.render_request(draft)
+        folder = (draft.get("project") or "без-проекта").strip()
+        filename = ingest.request_filename(draft, time.strftime("%Y-%m-%d"))
+        saved = agents_mod.save_request(agent, folder, filename, text)
+        if saved.get("error"):
+            return saved
+        published = self._publish_to_karman(draft.get("project") or folder,
+                                            draft.get("title") or "", text)
+        return {
+            "ok": True,
+            "agent": agent,
+            "project": draft.get("project") or "",
+            "path": saved.get("path"),
+            "repo": saved.get("repo"),
+            "committed": saved.get("committed"),
+            "missing": missing,
+            "karman": published,
+            "text": text,
+        }
+
+    def _publish_to_karman(self, project: str, title: str, text: str) -> dict[str, Any]:
+        """Положить заявку в раздел КАРМАНА (раздел заводится, если его нет)."""
+        name = (project or "").strip()
+        if not name:
+            return {"published": False, "reason": "проект не указан — раздел неизвестен"}
+        status = karman_mod.status()
+        if not status.get("has_secret"):
+            return {"published": False,
+                    "reason": status.get("reason") or "канал КАРМАНА не настроен"}
+        code, payload = karman_mod.ensure_project(name)
+        if code != 200:
+            return {"published": False, "http": code, "project": name,
+                    "reason": "раздел не заведён: %s" % karman_mod.explain(code)}
+        code, payload = karman_mod.publish(name, title, text)
+        if code not in (200, 201):
+            return {"published": False, "http": code, "project": name,
+                    "reason": "промт не записан: %s" % karman_mod.explain(code)}
+        return {"published": True, "http": code, "project": name,
+                "id": payload.get("id"), "added": payload.get("added")}
+
+    # ────────────────────────────────────────────── чужие репозитории (чтение)
+    def cmd_repos_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Репозитории рабочего пространства — читать можно, менять нельзя."""
+        return {"repos": repos_mod.list_repos()}
+
+    def cmd_repos_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Прочитать файл чужого репозитория (секреты закрыты)."""
+        return repos_mod.read_file(str(args.get("repo") or ""),
+                                   str(args.get("path") or ""),
+                                   int(args.get("start_line") or 0),
+                                   int(args.get("end_line") or 0))
+
+    def cmd_repos_profile(self, args: dict[str, Any]) -> dict[str, Any]:
+        """«Почерк» проекта: README, конституция, языки — чтобы попасть в стиль."""
+        return repos_mod.profile(str(args.get("repo") or ""))
 
     # ──────────────────────────────────────────────────────────── демоны
     def cmd_program_version(self, args: dict[str, Any]) -> dict[str, Any]:
