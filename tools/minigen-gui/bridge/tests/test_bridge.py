@@ -215,6 +215,42 @@ class MskStampTest(unittest.TestCase):
             "%Y-%m-%d %H:%M:%S"))
 
 
+class SnapshotPointsTest(unittest.TestCase):
+    """В снимке должны быть очки — иначе столбец «Очки» пуст.
+
+    ⚠️ Живой случай 24.11: очки лежали в кэше моста, но в снимок не
+    попадали ⇒ в окне столбец «Очки» всегда был «—», и сортировать по
+    нему было нечего.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        journal = root / "journal.log"
+        journal.write_text("", encoding="utf-8")
+        core = FakeCore(journal, areas=[
+            {"slug": "p-brain", "title": "Мозг", "dir": Path("p-brain")},
+        ])
+        core.CONFIG.write_text(json.dumps({"projects": []}), encoding="utf-8")
+        import minigen_bridge as bridge_mod
+        self.bridge = bridge_mod.Bridge.__new__(bridge_mod.Bridge)
+        self.bridge.mods = {"core": core}
+        self.bridge._points = {"p-brain": {"points_today": 7}}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_snapshot_carries_the_points(self) -> None:
+        snap = self.bridge.cmd_snapshot({})
+        self.assertEqual(len(snap["areas"]), 1)
+        self.assertEqual(snap["areas"][0]["points"]["points_today"], 7)
+
+    def test_area_without_points_has_none(self) -> None:
+        self.bridge._points = {}
+        snap = self.bridge.cmd_snapshot({})
+        self.assertIsNone(snap["areas"][0]["points"])
+
+
 class DaemonDirTest(unittest.TestCase):
     """Где мост ищет ядро — и что делает, если живой копии нет.
 

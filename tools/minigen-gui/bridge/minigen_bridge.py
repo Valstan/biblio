@@ -283,8 +283,14 @@ class Bridge:
             return ""
 
     def cmd_snapshot(self, args: dict[str, Any]) -> dict[str, Any]:
-        return state.snapshot(self.mods,
+        snap = state.snapshot(self.mods,
                               include_sessions=bool(args.get("sessions", True)))
+        # Очки — из кэша моста (его наполняет кнопка «Обновить очки»).
+        # ⚠️ 24.11: без этого столбец «Очки» в окне всегда был «—», и
+        # сортировать по нему было нечего.
+        for area in snap.get("areas") or []:
+            area["points"] = self._points.get(area["slug"])
+        return snap
 
     def cmd_areas_list(self, args: dict[str, Any]) -> dict[str, Any]:
         areas = state.areas_state(self.mods,
