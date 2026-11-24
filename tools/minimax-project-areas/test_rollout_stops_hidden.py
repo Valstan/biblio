@@ -104,6 +104,25 @@ def live_check(failures: list[str], rollout) -> None:
     else:
         print("   ок: надзиратель pid %d" % pid)
 
+    print("4) демоны находятся по родителю (их видно даже без командных строк)")
+    # родитель, у которого есть ребёнок
+    parent = subprocess.Popen(
+        [sys.executable, "-c",
+         "import subprocess, sys, time; "
+         "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)']); "
+         "time.sleep(30)"],
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    time.sleep(3)
+    try:
+        children = rollout.daemon_children_of(parent.pid)
+        if not children:
+            failures.append("дети процесса не нашлись — поиск по родителю не работает")
+            print("   FAIL: дети процесса не нашлись — поиск по родителю не работает")
+        else:
+            print("   ок: дети найдены: %s" % children)
+    finally:
+        parent.kill()
+
 
 def main() -> int:
     failures: list[str] = []

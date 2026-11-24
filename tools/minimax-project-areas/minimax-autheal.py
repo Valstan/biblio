@@ -187,6 +187,25 @@ def _core():
     return _core_mod or None
 
 
+def _model_flags(area_dir: Path) -> list:
+    """Флаги модели области — через ядро, но **мягко**.
+
+    ⚠️ Живой случай 24.11: ядро подгружается лениво (`_core()`), а в двух
+    местах имя `core` не было определено вовсе ⇒ `NameError: name 'core' is
+    not defined` ⇒ «Продолжай» **не уходил** в область: аккаунт у КАРМАНА
+    брался, а лечение сорвалось на последнем шаге. Ядро here — мягкая
+    зависимость (лечащий намеренно живёт без ядра): нет ядра — нет флагов,
+    а ход всё равно уходит.
+    """
+    core = _core()
+    if core is None:
+        return []
+    try:
+        return list(core.model_flags(area_dir) or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def log(msg: str) -> None:
     line = "[%s] %s" % (mtime.fmt_now(), msg)
     print(line, flush=True)
@@ -1047,7 +1066,7 @@ def _continue_once(area_dir: Path, folder: str, logfile):
     env["MAVIS_DATA_DIR"] = str(area_dir)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     cmd = ([str(MCODE), "exec", "--continue", "--cwd", folder]
-           + core.model_flags(area_dir) + [continue_prompt(area_dir)])
+           + _model_flags(area_dir) + [continue_prompt(area_dir)])
     try:
         proc = subprocess.Popen(cmd, env=env, stdout=logfile, stderr=logfile,
                                 stdin=subprocess.DEVNULL, creationflags=flags)
@@ -1390,7 +1409,7 @@ def say_continue(area: dict) -> str:
         env["MAVIS_DATA_DIR"] = str(area_dir)
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         cmd = ([str(MCODE), "exec", "--cwd", folder]
-               + core.model_flags(area_dir) + [continue_prompt(area_dir)])
+               + _model_flags(area_dir) + [continue_prompt(area_dir)])
         proc = subprocess.Popen(cmd,
                                 env=env, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
                                 creationflags=flags)
