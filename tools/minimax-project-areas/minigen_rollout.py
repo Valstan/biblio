@@ -417,6 +417,20 @@ def stop_managers() -> int:
         time.sleep(1)
     else:
         print("   ⚠️ менеджеры не ушли за 30 с — новый может не поднять API")
+
+    # ⚠️ Живой случай 24.11: **процесс ушёл — порт ещё отвечает.** Убитый
+    # менеджер отдаёт API ещё секунду, и новый менеджер, увидев живой ответ,
+    # честно уходит («фоновый режим уже работает — выхожу») ⇒ после раскатки
+    # программа остаётся **без API**: ни окно, ни демоны его не поднимут.
+    # Поэтому ждём не только ухода процессов, но и освобождения порта.
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if not api_status():
+            break
+        time.sleep(1)
+    else:
+        print("   ⚠️ API ещё отвечает — порт не освободился, новый менеджер "
+              "может выйти, не подняв API")
     return stopped
 
 
@@ -474,18 +488,25 @@ def start_installed_manager() -> bool:
     if not autostart.is_file():
         print("   ⚠️ нет %s — фоновый режим не поднят" % autostart)
         return False
-    subprocess.run(["cmd", "/c", str(autostart)], stdin=subprocess.DEVNULL,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                   timeout=60,
-                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-    data = wait_api(timeout=60)
-    if not data:
-        # одна попытка ещё раз: порт мог быть занят к моменту старта
+    # ⚠️ Попыток несколько (живой случай 24.11): новый менеджер увидел ответ
+    # умирающего старого и ушёл («фоновый режим уже работает — выхожу») ⇒ API
+    # не поднялся вовсе. Повтор после освобождения порта — дешёвое лечение.
+    data = {}
+    for attempt in (1, 2, 3):
+        subprocess.run(["cmd", "/c", str(autostart)], stdin=subprocess.DEVNULL,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                       timeout=60,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        data = wait_api(timeout=60)
+        if data:
+            break
+        print("   API не поднялся (попытка %d) — ждём порт и пробуем снова" % attempt)
         time.sleep(10)
-        data = wait_api(timeout=40)
     if not data:
         print("   ⚠️ API программы не отвечает — надзиратель не поднялся")
         print("      (смотри журнал: «локальный API не поднялся — выхожу»)")
+        print("      порт мог держать умирающий менеджер: закройте окно "
+              "«МиниГен» и повторите раскатку")
         return False
     supervisor = data.get("supervisor") or {}
     print("   надзиратель: pid %s, демонов %s/%s" % (
