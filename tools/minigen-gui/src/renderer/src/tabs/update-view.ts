@@ -1,4 +1,5 @@
 import type { ProgramVersion, UpdateState } from '@shared/types'
+import { formatDateTime } from '../time'
 
 /** Что окно может сказать владельцу про обновление. */
 export interface UpdateVerdict {
@@ -15,13 +16,11 @@ export interface UpdateVerdict {
  * а `new Date(...)` ждёт миллисекунды ⇒ без поправки на экране было
  * «21.01.1970, 21:45:10» (живой случай 24.11). Значения меньше 1e12 считаем
  * секундами, большие — миллисекундами (на всякий случай).
+ *
+ * Формат — по Москве (заказ владельца 24.11): `formatDateTime` знает зону.
  */
 export function formatInstalledAt(seconds: number | null | undefined): string {
-  if (!seconds) return ''
-  const ms = seconds < 1e12 ? seconds * 1000 : seconds
-  const date = new Date(ms)
-  if (Number.isNaN(date.getTime())) return ''
-  return date.toLocaleString('ru-RU')
+  return formatDateTime(seconds)
 }
 
 /**

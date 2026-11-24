@@ -22,10 +22,14 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 BRIDGE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BRIDGE_DIR))
+
+# Журнал пишется по Москве (заказ владельца 24.11) — и подставной тоже.
+MSK = timezone(timedelta(hours=3), "MSK")
 
 import minigen_agent as agent          # noqa: E402
 import minigen_state as state          # noqa: E402
@@ -44,6 +48,10 @@ class FakeCore:
 
     def running_areas(self) -> set:
         return {"p-brain"}
+
+    def fmt_ms(self, ms: int, fmt: str = "%d.%m %H:%M:%S") -> str:
+        """Время — по Москве, как в настоящем ядре (заказ владельца 24.11)."""
+        return datetime.fromtimestamp(int(ms or 0) / 1000, MSK).strftime(fmt)
 
 
 class JournalTest(unittest.TestCase):
@@ -99,7 +107,10 @@ class StatsTest(unittest.TestCase):
         now = time.time()
 
         def stamp(offset: float) -> str:
-            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - offset))
+            # Журнал живёт в московском времени (заказ владельца 24.11), и
+            # окно статистики фильтрует по той же зоне — иначе на машине с
+            # другой зоной записи выпадали бы из окна.
+            return datetime.fromtimestamp(now - offset, MSK).strftime("%Y-%m-%d %H:%M:%S")
 
         self.journal.write_text(
             "\n".join([

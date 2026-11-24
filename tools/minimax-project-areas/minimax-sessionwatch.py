@@ -290,7 +290,7 @@ def compacted_sessions(area_dir: Path, window_ms: int = COMPACT_WINDOW_MS) -> di
                 try:
                     import datetime as _dt
                     hh, mm, ss = (int(x) for x in ts.groups())
-                    now = _dt.datetime.now()
+                    now = core.now()
                     at = int(now.replace(hour=hh, minute=mm, second=ss,
                                          microsecond=0).timestamp() * 1000)
                 except Exception:  # noqa: BLE001

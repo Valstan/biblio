@@ -695,8 +695,9 @@ class Bridge:
             pass
         lines = []
         for item in reversed(items):       # от старых к новым — как в журнале
-            stamp = time.strftime("%d.%m %H:%M:%S",
-                                  time.localtime(int(item.get("ts") or 0) / 1000))
+            # Время — по Москве (заказ владельца 24.11): одна зона на всю
+            # программу, а не зона машины.
+            stamp = self.core.fmt_ms(int(item.get("ts") or 0))
             kind = str(item.get("kind") or "log")
             level = str(item.get("level") or "info")
             lines.append("[%s] %s/%s: %s" % (stamp, kind, level,
