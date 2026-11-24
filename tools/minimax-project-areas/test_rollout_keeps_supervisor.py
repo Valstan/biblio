@@ -27,6 +27,7 @@ import json
 import pathlib
 import re
 import sys
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -75,20 +76,35 @@ def main() -> int:
     check(callable(getattr(rollout, "wait_api", None)),
           "в раскатке есть ожидание ответа API")
 
-    # закрытый порт ⇒ пусто
-    closed = rollout.api_status(port=9)      # 9 — discard, там никто не слушает
-    check(closed == {}, "на закрытом порту ответ пустой (получили %r)" % (closed,))
-
-    # живой сервер ⇒ ответ
-    server = HTTPServer(("127.0.0.1", 0), _Handler)
-    port = server.server_address[1]
-    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # токен: без него запрос не делается (API без токена не ответит)
+    tmp_token = pathlib.Path(tempfile.gettempdir()) / "mg-test-token.txt"
+    tmp_token.write_text("test-token", encoding="utf-8")
     try:
-        data = rollout.api_status(port=port)
+        # закрытый порт ⇒ пусто
+        closed = rollout.api_status(port=9, token_file=tmp_token)
+        check(closed == {}, "на закрытом порту ответ пустой (получили %r)" % (closed,))
+
+        # живой сервер ⇒ ответ
+        server = HTTPServer(("127.0.0.1", 0), _Handler)
+        port = server.server_address[1]
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            data = rollout.api_status(port=port, token_file=tmp_token)
+        finally:
+            server.shutdown()
+        check(bool(data), "живой API отвечает")
+        check((data or {}).get("alive_count") == 3, "в ответе есть счётчик демонов")
+
+        # без токена запрос не делается — это тоже по умолчанию
+        check(rollout.api_status(port=port,
+                                 token_file=pathlib.Path(tempfile.gettempdir())
+                                 / "mg-no-such-token.txt") == {},
+              "без токена ответ пустой (запрос не делается)")
     finally:
-        server.shutdown()
-    check(bool(data), "живой API отвечает")
-    check((data or {}).get("alive_count") == 3, "в ответе есть счётчик демонов")
+        try:
+            tmp_token.unlink()
+        except OSError:
+            pass
 
     print("2) остановка менеджеров ждёт их ухода")
     stop_src = re.search(r"def stop_managers\(.*?(?=\ndef )", source, re.S)

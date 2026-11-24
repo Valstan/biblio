@@ -382,12 +382,16 @@ def stop_managers() -> int:
     return stopped
 
 
-def api_status(port: int = API_PORT) -> dict:
-    """Ответ локального API программы (пусто — не отвечает)."""
-    token_file = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
-                  / "minigen-gui" / "bridge-token.txt")
+def api_status(port: int = API_PORT, token_file: Path | None = None) -> dict:
+    """Ответ локального API программы (пусто — не отвечает).
+
+    `token_file` — файл с токеном (по умолчанию токен программы). Если токена
+    нет, запрос не делаем: API без токена всё равно не ответит.
+    """
+    path = token_file or (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                          / "minigen-gui" / "bridge-token.txt")
     try:
-        token = token_file.read_text(encoding="utf-8").strip()
+        token = path.read_text(encoding="utf-8").strip()
     except OSError:
         return {}
     if not token:
