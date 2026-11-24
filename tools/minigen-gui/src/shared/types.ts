@@ -175,6 +175,36 @@ export interface ProgramVersion {
   running_from: string
 }
 
+/** Шаг обновления программы — одна строка журнала. */
+export interface UpdateStep {
+  ts: number
+  step: string
+  status: 'info' | 'ok' | 'error'
+  text: string
+}
+
+/** Что есть в репозитории (по последней проверке). */
+export interface UpdateAvailable {
+  commit: string
+  behind: number
+  repo: string
+  remote: string
+  ok?: boolean
+  why?: string
+  up_to_date?: boolean
+  installed?: ProgramVersion
+}
+
+/** Состояние обновления — окно спрашивает его раз в секунду. */
+export interface UpdateState {
+  running: boolean
+  steps: UpdateStep[]
+  installed: ProgramVersion
+  available: UpdateAvailable
+  last: { ok?: boolean; why?: string; at?: number; installed?: ProgramVersion }
+  repo: string
+}
+
 /** Модель — с её **родными** настройками (как объявляет платформа). */
 export interface ModelEntry {
   id: string

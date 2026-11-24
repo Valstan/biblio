@@ -8,8 +8,9 @@ import NetworkTab from './tabs/NetworkTab'
 import ChatTab from './tabs/ChatTab'
 import JournalTab from './tabs/JournalTab'
 import SettingsTab from './tabs/SettingsTab'
+import UpdateTab from './tabs/UpdateTab'
 
-type Tab = 'areas' | 'stats' | 'network' | 'chat' | 'journal' | 'settings'
+type Tab = 'areas' | 'stats' | 'network' | 'chat' | 'journal' | 'update' | 'settings'
 
 const TABS: { id: Tab; label: string }[] = [
   { id: 'areas', label: 'Области' },
@@ -17,6 +18,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'network', label: 'Сеть' },
   { id: 'chat', label: 'Управляющий' },
   { id: 'journal', label: 'Журнал' },
+  { id: 'update', label: 'Обновление' },
   { id: 'settings', label: 'Настройки' }
 ]
 
@@ -158,6 +160,7 @@ export default function App() {
         {tab === 'network' && <NetworkTab snapshot={snapshot} run={run} busy={busy} />}
         {tab === 'chat' && <ChatTab />}
         {tab === 'journal' && <JournalTab snapshot={snapshot} />}
+        {tab === 'update' && <UpdateTab />}
         {tab === 'settings' && (
           <SettingsTab settings={settings} snapshot={snapshot} onSaved={setSettings} />
         )}

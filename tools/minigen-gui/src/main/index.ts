@@ -87,6 +87,21 @@ app.whenReady().then(() => {
     return true
   })
 
+  // Перезапуск окна: раскатка меняет файлы на диске, а запущенное окно
+  // продолжает работать на старом коде. Поэтому перезапуск — отдельное
+  // действие, его видно владельцу (вкладка «Обновление»).
+  ipcMain.handle('minigen:relaunch', async () => {
+    app.relaunch()
+    app.quit()
+    return true
+  })
+
+  // Метка сборки: коммит, вшитый в окно при сборке. По ней видно, что окно
+  // запущено из старой сборки, а на диске уже новая.
+  ipcMain.handle('minigen:build-info', async () => ({
+    commit: process.env.MINIGEN_COMMIT || ''
+  }))
+
   ipcMain.handle('minigen:save-text', async (_event, name: string, content: string) => {
     const result = await dialog.showSaveDialog({
       defaultPath: name,

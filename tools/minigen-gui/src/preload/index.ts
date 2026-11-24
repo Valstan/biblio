@@ -22,6 +22,14 @@ const api = {
   smoke: {
     csv: process.env.MINIGEN_SMOKE_CSV || ''
   },
+  /** Перезапустить окно (после обновления программы). */
+  relaunch(): Promise<boolean> {
+    return ipcRenderer.invoke('minigen:relaunch')
+  },
+  /** Из какой сборки запущено окно (коммит, вшитый при сборке). */
+  buildInfo(): Promise<{ commit: string }> {
+    return ipcRenderer.invoke('minigen:build-info')
+  },
   /** События моста: он упал / поднялся. */
   onEvent(handler: (event: BridgeEvent) => void): () => void {
     const listener = (_event: unknown, payload: BridgeEvent) => handler(payload)
