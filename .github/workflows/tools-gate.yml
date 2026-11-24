@@ -49,3 +49,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_time_is_moscow.py
       - name: Приёмка окна глазами (окно умеет снимать свои вкладки)
         run: python3 tools/minimax-project-areas/test_window_smoke_ui.py
+      - name: Приёмка остановки непрозрачного (повышенные процессы не видны WMI)
+        run: python3 tools/minimax-project-areas/test_rollout_stops_hidden.py
