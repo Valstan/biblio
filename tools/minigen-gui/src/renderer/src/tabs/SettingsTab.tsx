@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
-import type { DaemonStatus, ProgramVersion, Settings, Snapshot } from '@shared/types'
+import type { DaemonStatus, LineageInfo, ProgramVersion, Settings, Snapshot } from '@shared/types'
 import { api } from '../api'
 import { TZ_LABEL, formatDateTime } from '../time'
+import { lineageRows as lineageRowsOf } from './lineage-view'
 
 interface Props {
   settings: Settings | null
@@ -14,6 +15,7 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   const [note, setNote] = useState('')
   const [daemons, setDaemons] = useState<DaemonStatus | null>(null)
   const [version, setVersion] = useState<ProgramVersion | null>(null)
+  const [lineage, setLineage] = useState<LineageInfo | null>(null)
 
   useEffect(() => {
     if (settings && !form) setForm(settings)
@@ -23,9 +25,12 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
     const load = () => api.daemonsStatus().then(setDaemons).catch(() => undefined)
     void load()
     void api.programVersion().then(setVersion).catch(() => undefined)
+    void api.lineageShow().then((data) => setLineage(data?.lineage ?? null)).catch(() => undefined)
     const timer = window.setInterval(() => void load(), 5000)
     return () => window.clearInterval(timer)
   }, [])
+
+  const lineageRows = lineageRowsOf(lineage)
 
   if (!form) return <section><p className="muted">Загружаю настройки…</p></section>
 
@@ -90,6 +95,29 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
           <strong>{TZ_LABEL}</strong>: журнал, статистика, шаги обновления,
           «установлено» — всё в нём, независимо от зоны машины, на которой
           программа стоит.
+        </p>
+      </div>
+
+      <div className="card">
+        <h3>Родословная копии</h3>
+        {lineageRows.length === 0 ? (
+          <p className="muted small">Родословная не прочитана.</p>
+        ) : (
+          <table className="grid compact">
+            <tbody>
+              {lineageRows.map((row) => (
+                <tr key={row.label}>
+                  <td className="muted">{row.label}</td>
+                  <td>{row.value}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <p className="muted small">
+          Это кто эта программа в общей паутине копий: от какой версии форк, кто
+          родитель по гену, сколько генов принято. Вся паутина — во вкладке
+          «Гены».
         </p>
       </div>
 
