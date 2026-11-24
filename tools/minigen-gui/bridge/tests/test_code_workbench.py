@@ -209,5 +209,56 @@ class PatchFlowTest(unittest.TestCase):
         self.assertFalse(code.current_worktree())
 
 
+class BranchNameTest(unittest.TestCase):
+    """Имя ветки и worktree: название правки нейросеть пишет по-русски.
+
+    ⚠️ Живой случай 24.11: `[^a-zA-Z0-9]` выбрасывал кириллицу целиком ⇒
+    slug пустовал ⇒ **все** ветки назывались `agent/minigen-fix-fix`, а
+    worktree'ы — `fix`. Вторая правка упиралась в «worktree уже есть»: то
+    есть встроенная нейросеть не могла работать с программой, для которой и
+    написана.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name) / "repo"
+        make_repo(self.repo)
+        self._old_repo = code.REPO
+        self._old_worktrees = code.WORKTREES
+        self._old_state = code.STATE_FILE
+        code.REPO = self.repo
+        code.WORKTREES = self.repo / ".claude" / "worktrees"
+        code.STATE_FILE = Path(self.tmp.name) / "fix-state.json"
+
+    def tearDown(self) -> None:
+        code.REPO = self._old_repo
+        code.WORKTREES = self._old_worktrees
+        code.STATE_FILE = self._old_state
+        self.tmp.cleanup()
+
+    def test_russian_title_gives_latin_slug(self) -> None:
+        slug = code.slugify("Раскатка чистит старые бандли окна")
+        self.assertTrue(slug)
+        self.assertNotEqual(slug, "fix")
+        self.assertTrue(all(ord(char) < 128 for char in slug),
+                        "имя ветки должно быть латинским: %s" % slug)
+
+    def test_different_titles_give_different_slugs(self) -> None:
+        self.assertNotEqual(code.slugify("Правка"), code.slugify("Другая правка"))
+
+    def test_untranslatable_title_still_gets_name(self) -> None:
+        slug = code.slugify("★★★")
+        self.assertTrue(slug)
+        self.assertNotEqual(slug, "fix")
+
+    def test_same_title_twice_gives_two_worktrees(self) -> None:
+        first = code.create_worktree("Одна и та же правка")
+        second = code.create_worktree("Одна и та же правка")
+        self.assertTrue(first.get("ok"), first)
+        self.assertTrue(second.get("ok"), second)
+        self.assertNotEqual(first["worktree"], second["worktree"])
+        self.assertNotEqual(first["branch"], second["branch"])
+
+
 if __name__ == "__main__":
     unittest.main()

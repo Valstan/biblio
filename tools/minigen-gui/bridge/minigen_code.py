@@ -29,6 +29,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -178,9 +179,38 @@ def current_branch(cwd: Path) -> str:
     return res["out"] if res["ok"] else ""
 
 
+# Кириллица → латиница: название правки нейросеть пишет по-русски, а имя
+# ветки и папки worktree должно быть латинским (путь, PR, git на Windows).
+CYRILLIC = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e",
+    "ж": "zh", "з": "z", "и": "i", "й": "i", "к": "k", "л": "l", "м": "m",
+    "н": "n", "о": "o", "п": "p", "р": "r", "с": "s", "т": "t", "у": "u",
+    "ф": "f", "х": "h", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sch",
+    "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def translit(text: str) -> str:
+    """Кириллица → латиница (буква в букву)."""
+    return "".join(CYRILLIC.get(char, char) for char in (text or "").lower())
+
+
 def slugify(text: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").strip().lower()).strip("-")
-    return (slug or "fix")[:40]
+    """Короткое латинское имя из названия правки.
+
+    ⚠️ Живой случай 24.11: название правки нейросеть пишет по-русски, а
+    `[^a-zA-Z0-9]` выбрасывал кириллицу целиком ⇒ slug пустовал ⇒ **все** ветки
+    назывались `agent/minigen-fix-fix`, а worktree'ы — `fix`. Вторая правка
+    упиралась в «worktree уже есть» — встроенная нейросеть не могла работать
+    с программой, для которой и написана. Теперь кириллица транслитерируется,
+    а если после этого ничего не осталось — берём короткий хеш названия:
+    имя всегда есть и всегда разное.
+    """
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", translit(text)).strip("-")
+    if slug:
+        return slug[:40]
+    digest = hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()[:8]
+    return "fix-%s" % digest
 
 
 # ─────────────────────────────────────────────────────────── состояние
@@ -315,11 +345,20 @@ def create_worktree(title: str) -> dict[str, Any]:
     if not title:
         return {"error": "нужно название правки"}
     WORKTREES.mkdir(parents=True, exist_ok=True)
-    slug = slugify(title)
-    branch = "agent/minigen-fix-%s" % slug
+    base_slug = slugify(title)
+    slug = base_slug
     target = WORKTREES / slug
-    if target.exists():
-        return {"error": "worktree уже есть: %s" % target}
+    branch = "agent/minigen-fix-%s" % slug
+    # ⚠️ Живой случай 24.11: название правки может повториться (тот же дефект
+    # или та же задумка) — раньше вторая попытка падала «worktree уже есть» и
+    # правка вставала. Теперь к имени добавляется номер: правка не должна
+    # вставать из-за занятой папки.
+    attempt = 1
+    while target.exists() and attempt < 50:
+        attempt += 1
+        slug = "%s-%d" % (base_slug, attempt)
+        target = WORKTREES / slug
+        branch = "agent/minigen-fix-%s" % slug
     res = git(["worktree", "add", "-b", branch, str(target), "master"], REPO, timeout=180)
     if not res["ok"]:
         # ветка могла остаться от прошлой попытки — пробуем без -b
