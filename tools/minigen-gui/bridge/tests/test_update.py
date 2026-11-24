@@ -40,7 +40,12 @@ class UpdateTest(unittest.TestCase):
         self._old_git = update._git
         self._old_stream = update._stream
         self._old_cache = dict(update._cache)
+        self._old_log = update.LOG_FILE
         update.LOCAL = Path(self.tmp.name)
+        # ⚠️ Живой случай 24.11: `LOG_FILE` — константа модуля, и тесты писали
+        # в **настоящий** журнал программы: владелец видел в шагах обновления
+        # «исходники: C:\...\Temp\tmpXXXX\repo» и ошибки тестов. Свой файл.
+        update.LOG_FILE = Path(self.tmp.name) / "update.log"
         update._cache = {"at": 0.0, "value": {}}
         with update._lock:
             update._steps.clear()
@@ -54,6 +59,7 @@ class UpdateTest(unittest.TestCase):
         update._git = self._old_git
         update._stream = self._old_stream
         update._cache = self._old_cache
+        update.LOG_FILE = self._old_log
         self.tmp.cleanup()
 
     # ── исходники ──────────────────────────────────────────────────────
