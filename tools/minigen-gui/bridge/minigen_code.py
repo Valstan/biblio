@@ -561,12 +561,93 @@ def upstream_slug(cwd: Path) -> str:
     return ""
 
 
+def gh(args: list[str], cwd: Path | None = None, timeout: int = 300) -> dict[str, Any]:
+    """GitHub CLI без исключений (как `git` выше)."""
+    try:
+        proc = subprocess.run(["gh"] + args, cwd=str(cwd) if cwd else None,
+                              capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except FileNotFoundError:
+        return {"ok": False, "code": -1, "out": "", "err": "нет gh (GitHub CLI)"}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "code": -1, "out": "", "err": "gh не ответил за %d с" % timeout}
+    except OSError as exc:
+        return {"ok": False, "code": -1, "out": "", "err": str(exc)}
+    return {"ok": proc.returncode == 0, "code": proc.returncode,
+            "out": (proc.stdout or "").strip(), "err": (proc.stderr or "").strip()}
+
+
+def fork_parent(repo: str) -> str:
+    """Родительский репозиторий, если `repo` — форк; иначе пусто.
+
+    ⚠️ Живой случай 24.11: GitHub **не даёт** завести форк своего же
+    репозитория в своём же аккаунте («A single user account cannot own both a
+    parent and fork»), поэтому копия держит **свой** репозиторий, а не форк.
+    И вот тут GitHub не умеет PR из не-форка: «Head sha can't be blank …
+    Head ref must be a branch» — ветку он ищет только среди форков сети.
+    Поэтому копия знает, форк ли её репозиторий, и поступает соответственно.
+    """
+    if not repo:
+        return ""
+    res = gh(["api", "repos/%s" % repo])
+    if not res.get("ok"):
+        return ""
+    try:
+        data = json.loads(res.get("out") or "{}")
+    except ValueError:
+        return ""
+    parent = data.get("parent") or {}
+    return str(parent.get("full_name") or "")
+
+
+def upstream_branch(branch: str, instance_id: str = "") -> str:
+    """Имя ветки в репозитории программы: `agent/<копия>/<слаг>`.
+
+    ⚠️ Зачем идентификатор копии: ветки в репозитории программы общие, а
+    слаг строится из названия правки — две копии с одинаковым названием дали
+    бы одинаковую ветку, и вторая не смогла бы предложить свою правку (пуш
+    отклонялся бы: «non-fast-forward»). Идентификатор копии наружу разрешён
+    (D-038: только он и хеши коммитов).
+    """
+    slug = branch.split("/")[-1] if branch else "fix"
+    owner = (instance_id or "").strip()
+    return "agent/%s/%s" % (owner, slug) if owner else branch
+
+
+def pr_head(branch: str, head_repo: str, target: str,
+            instance_id: str = "") -> tuple[str, bool]:
+    """Голова PR и надо ли отправлять ветку ещё и в репозиторий программы.
+
+    ⚠️ Живой случай 24.11: GitHub не открывает PR из репозитория, который не
+    форк («Head ref must be a branch» — ветку он ищет только среди форков
+    сети). Ответы:
+
+    - **тот же репозиторий** → ``--head <ветка>``, ничего доотправлять не надо;
+    - **форк** → ``--head <владелец>:<ветка>``, доотправлять не надо;
+    - **не форк** → ``--head agent/<копия>/<слаг>``, и ветку надо отправить
+      ещё и в репозиторий программы — иначе GitHub её не увидит.
+    """
+    if not target or not head_repo or head_repo == target:
+        return branch, False
+    if fork_parent(head_repo) == target:
+        return "%s:%s" % (head_repo.split("/")[0], branch), False
+    return upstream_branch(branch, instance_id), True
+
+
 def open_pr(title: str, body: str = "") -> dict[str, Any]:
     """Отправить ветку и открыть PR (по правилам репозитория).
 
     Ветка уходит в **свой** репозиторий копии (`origin`), а PR открывается в
-    репозиторий программы (`upstream`) — так это и работает с форком: PR из
-    форка в основной репозиторий.
+    репозиторий программы (`upstream`).
+
+    ⚠️ Живой случай 24.11: PR из репозитория, который **не форк**, GitHub не
+    открывает («Head ref must be a branch» — ветку он ищет только среди форков
+    сети). Поэтому, если репозиторий копии не форк программного, ветка
+    отправляется ещё и в репозиторий программы (под именем
+    `agent/<копия>/<слаг>`), и PR открывается оттуда. Канон репозитория
+    программы при этом не нарушается: ветка → коммит → push → PR → зелёный
+    гейт → слияние; прямой пуш в master по-прежнему невозможен (хук машины).
     """
     worktree = current_worktree()
     if worktree is None:
@@ -585,14 +666,25 @@ def open_pr(title: str, body: str = "") -> dict[str, Any]:
         body_text = ("Правка предложена встроенной нейросетью «МиниГена».\n\n"
                      "Проверки запускались в worktree правки; решение — за владельцем.")
     target = upstream_slug(worktree)
-    owner = _repo_slug(_remote_url("origin", worktree)).split("/")[0]
+    head_repo = _repo_slug(_remote_url("origin", worktree))
     args = ["gh", "pr", "create", "--base", "master"]
     if target:
         args += ["--repo", target]
-    if owner and target and not target.startswith(owner + "/"):
-        args += ["--head", "%s:%s" % (owner, branch)]
-    else:
-        args += ["--head", branch]
+    try:
+        import minigen_lineage as lineage
+        instance = str(lineage.instance().get("instance_id") or "")
+    except Exception:  # noqa: BLE001
+        instance = ""
+    head, push_to_upstream = pr_head(branch, head_repo, target, instance)
+    if push_to_upstream:
+        # репозиторий копии — не форк ⇒ GitHub ветку в нём не увидит:
+        # отправляем её ещё и в репозиторий программы (под своим именем).
+        push_up = git(["push", "upstream",
+                       "%s:refs/heads/%s" % (branch, head)], worktree, timeout=300)
+        if not push_up["ok"]:
+            return {"error": "ветка не ушла в репозиторий программы: %s"
+                             % (push_up.get("err") or push_up.get("out"))}
+    args += ["--head", head]
     args += ["--title", title, "--body", body_text]
     try:
         proc = subprocess.run(

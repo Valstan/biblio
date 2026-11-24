@@ -260,5 +260,61 @@ class BranchNameTest(unittest.TestCase):
         self.assertNotEqual(first["branch"], second["branch"])
 
 
+class PullRequestHeadTest(unittest.TestCase):
+    """Как открывается PR, когда репозиторий копии — не форк.
+
+    ⚠️ Живой случай 24.11: GitHub **не даёт** форк своего же репозитория в
+    своём же аккаунте, поэтому копия держит свой репозиторий — и GitHub не
+    открывает PR из него: «Head sha can't be blank … Head ref must be a
+    branch» (ветку он ищет только среди форков сети). Значит, ветку надо
+    отправить ещё и в репозиторий программы — под именем с идентификатором
+    копии, иначе две копии с одинаковым названием правки столкнулись бы.
+    """
+
+    def setUp(self) -> None:
+        self._old_gh = code.gh
+        self._old_fork = code.fork_parent
+
+    def tearDown(self) -> None:
+        code.gh = self._old_gh
+        code.fork_parent = self._old_fork
+
+    def test_same_repository_keeps_branch(self) -> None:
+        head, extra = code.pr_head("agent/minigen-fix-x", "Valstan/biblio", "Valstan/biblio")
+        self.assertEqual(head, "agent/minigen-fix-x")
+        self.assertFalse(extra)
+
+    def test_fork_uses_owner_prefix(self) -> None:
+        code.fork_parent = lambda repo: "Valstan/biblio"
+        head, extra = code.pr_head("agent/minigen-fix-x", "Valstan/kopiya",
+                                   "Valstan/biblio")
+        self.assertEqual(head, "Valstan:agent/minigen-fix-x")
+        self.assertFalse(extra)
+
+    def test_not_a_fork_pushes_branch_to_program_repo(self) -> None:
+        code.fork_parent = lambda repo: ""
+        head, extra = code.pr_head("agent/minigen-fix-x", "Valstan/kopiya",
+                                   "Valstan/biblio", "mg-693f8fdd")
+        self.assertEqual(head, "agent/mg-693f8fdd/minigen-fix-x")
+        self.assertTrue(extra, "ветку надо отправить ещё и в репозиторий программы")
+
+    def test_two_copies_do_not_share_upstream_branch(self) -> None:
+        first = code.upstream_branch("agent/minigen-fix-x", "mg-11111111")
+        second = code.upstream_branch("agent/minigen-fix-x", "mg-22222222")
+        self.assertNotEqual(first, second)
+
+    def test_fork_parent_reads_github(self) -> None:
+        code.gh = lambda args, cwd=None, timeout=300: {
+            "ok": True, "code": 0, "out": '{"parent": {"full_name": "Valstan/biblio"}}',
+            "err": ""}
+        self.assertEqual(code.fork_parent("Valstan/kopiya"), "Valstan/biblio")
+        code.gh = lambda args, cwd=None, timeout=300: {
+            "ok": True, "code": 0, "out": '{"parent": null}', "err": ""}
+        self.assertEqual(code.fork_parent("Valstan/kopiya"), "")
+        code.gh = lambda args, cwd=None, timeout=300: {
+            "ok": False, "code": 1, "out": "", "err": "нет gh"}
+        self.assertEqual(code.fork_parent("Valstan/kopiya"), "")
+
+
 if __name__ == "__main__":
     unittest.main()
