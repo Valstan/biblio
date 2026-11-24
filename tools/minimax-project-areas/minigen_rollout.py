@@ -373,6 +373,100 @@ if (Test-Path $oldStartup) {
     return True
 
 
+# ─────────────────────────────────────────────── остановка процессов
+
+def terminate_pid(pid: int) -> bool:
+    """Остановить процесс по pid — **даже если он повышенный**.
+
+    ⚠️ Живой случай 24.11: программа, поднятая с повышенными правами, не
+    видна ни WMI (командной строки нет — `Win32_Process.CommandLine` пуст),
+    ни `taskkill` («доступ запрещён»). Право `PROCESS_TERMINATE` на такой
+    процесс у нас есть ⇒ останавливаем через него.
+
+    Проверено на этой машине: `OpenProcess(PROCESS_TERMINATE)` — открылся,
+    `OpenProcess(PROCESS_VM_READ)` — «доступ запрещён» (оттого и пустая
+    командная строка в WMI).
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(0x0001, False, int(pid))  # PROCESS_TERMINATE
+        if not handle:
+            return False
+        try:
+            return bool(kernel32.TerminateProcess(handle, 1))
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def supervisor_pid() -> int:
+    """Pid надзирателя — по файлу-подсказке блокировки (0 — неизвестно).
+
+    ⚠️ Живой случай 24.11: надзиратель, поднятый с повышенными правами,
+    WMI не показывает ⇒ раскатка его не видела и оставляла жить: старый
+    код держал порт `:8097`, новый выходил («фоновый режим уже работает»),
+    и программа жила на старом коде. А надзиратель известен — он записан
+    в файле блокировки.
+    """
+    info = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+            / "minigen-gui" / "supervisor.json")
+    try:
+        data = json.loads(info.read_text(encoding="utf-8"))
+        return int((data or {}).get("pid") or 0)
+    except (OSError, ValueError, TypeError):
+        return 0
+
+
+def daemon_pids_visible() -> list[int]:
+    """Pid'ы демонов, которых видит WMI (те, что с обычными правами)."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+          "Where-Object { $_.CommandLine -like '*minimax-netwatch.py' -or "
+          "$_.CommandLine -like '*minimax-sessionwatch.py' -or "
+          "$_.CommandLine -like '*minimax-autheal.py' } | "
+          "ForEach-Object { $_.ProcessId }")
+    res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=60,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    pids: list[int] = []
+    for token in (res.stdout or "").split():
+        if token.strip().isdigit():
+            pids.append(int(token.strip()))
+    return pids
+
+
+def stop_daemons() -> int:
+    """Остановить демонов — и тех, кого WMI не видит.
+
+    ⚠️ Живой случай 24.11: демоны, поднятые с повышенными правами, WMI не
+    показывает ⇒ обычная остановка их пропускала, а новый надзиратель (с
+    правами пониже) считал, что демонов нет, и поднимал **вторые** копии
+    (урок 22.11: два лечащих брали аккаунты дважды). Поэтому pid'ы берём у
+    надзирателя (API — он видит демонов своими правами) и останавливаем их
+    напрямую.
+    """
+    pids: list[int] = []
+    data = api_status()
+    for item in (data.get("daemons") or []):
+        for pid in item.get("pids") or []:
+            try:
+                pids.append(int(pid))
+            except (TypeError, ValueError):
+                continue
+    for pid in daemon_pids_visible():
+        if pid not in pids:
+            pids.append(pid)
+    stopped = 0
+    for pid in pids:
+        if terminate_pid(pid):
+            stopped += 1
+            print("   остановлен демон (pid %d)" % pid)
+    return stopped
+
+
 # ─────────────────────────────────────────────── менеджеры фонового режима
 
 def manager_processes() -> list[tuple[int, str]]:
@@ -440,6 +534,16 @@ def stop_managers() -> int:
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         print("   остановлен менеджер [%s] (pid %d): %s" % (kind, pid, cmd[:90]))
         stopped += 1
+    # ⚠️ Живой случай 24.11: менеджер, поднятый с повышенными правами, в
+    # списке WMI не виден (нет командной строки) — а он держит порт `:8097` и
+    # надзирает за демонами. Новый менеджер из-за него выходит («фоновый
+    # режим уже работает»), и программа живёт на старом коде. Его pid
+    # известен: он записан в файле блокировки.
+    owner = supervisor_pid()
+    if owner and all(pid != owner for pid, _ in manager_processes()):
+        if terminate_pid(owner):
+            print("   остановлен надзиратель (pid %d) — в WMI его не было" % owner)
+            stopped += 1
     # ждём ухода процессов: новый надзиратель без свободного порта выйдет
     deadline = time.time() + 30
     while time.time() < deadline:
@@ -562,23 +666,21 @@ def main() -> int:
         (BIN / name).write_bytes(data)
         print("   записан %-26s %d байт" % (name, len(data)))
 
+    print("--- остановка демонов (поднимет программа «МиниГен», дублей не будет) ---")
+    # ⚠️ Порядок важен: демонов останавливаем **до** менеджеров, пока
+    # надзиратель ещё отвечает — он видит их своими правами (живой случай
+    # 24.11: демоны с повышенными правами не видны ни WMI, ни окну).
+    stopped_daemons = stop_daemons()
+    if not stopped_daemons:
+        print("   демонов не было (или их не видно)")
+    time.sleep(6)
+
     print("--- фоновые менеджеры программы (старые и установленный) ---")
     # Раскатка ставит новую программу — старый её экземпляр (и копии из дерева
     # репозитория) должны уйти, иначе порт :8097 достанется старому коду.
     stopped = stop_managers()
     if not stopped:
         print("   менеджеров не было")
-
-    print("--- остановка демонов (поднимет программа «МиниГен», дублей не будет) ---")
-    subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-         "Where-Object { $_.CommandLine -like '*minimax-netwatch.py' -or "
-         "$_.CommandLine -like '*minimax-sessionwatch.py' -or "
-         "$_.CommandLine -like '*minimax-autheal.py' } | "
-         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
-        capture_output=True, text=True, timeout=60)
-    time.sleep(6)
 
     print("--- проверка ---")
     ok = True
