@@ -1,7 +1,8 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import type { Area, Snapshot } from '@shared/types'
 import { api } from '../api'
 import { verdictClass } from '../format'
+import { AREA_COLUMNS, DEFAULT_AREA_SORT, nextSort, sortAreas } from './areas-sort'
 
 interface Props {
   areas: Area[]
@@ -14,6 +15,10 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
   const [creating, setCreating] = useState(false)
   const [form, setForm] = useState({ slug: '', title: '', folder: '', karman: '' })
   const [message, setMessage] = useState('')
+  // Сортировка по клику на шапку столбца (заказ владельца 24.11).
+  // По умолчанию — по статусу «Работает», работающие сверху.
+  const [sort, setSort] = useState(DEFAULT_AREA_SORT)
+  const sorted = useMemo(() => sortAreas(areas, sort), [areas, sort])
 
   const submit = async () => {
     const res = await api.createArea(form)
@@ -92,17 +97,23 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
       <table className="grid">
         <thead>
           <tr>
-            <th>Область</th>
-            <th>Работает</th>
-            <th>Вход</th>
-            <th>Очки</th>
-            <th>Режим</th>
-            <th>Сессии</th>
+            {AREA_COLUMNS.map((column) => (
+              <th key={column.key}>
+                <button
+                  className={`sort${sort.key === column.key ? ' active' : ''}`}
+                  onClick={() => setSort((current) => nextSort(current, column.key))}
+                  title="Сортировать по этому столбцу"
+                >
+                  {column.label}
+                  {sort.key === column.key ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : ''}
+                </button>
+              </th>
+            ))}
             <th>Действия</th>
           </tr>
         </thead>
         <tbody>
-          {areas.map((area) => (
+          {sorted.map((area) => (
             <tr key={area.slug}>
               <td>
                 <div className="title">{area.title}</div>
