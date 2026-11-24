@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { GeneMap } from '../src/shared/types'
-import { describeEdge, layoutMap, selfSummary } from '../src/renderer/src/tabs/gene-map'
+import { describeEdge, layoutMap, selfSummary, NODE_SIZE } from '../src/renderer/src/tabs/gene-map'
 
 /**
  * Карта родословной (заказ владельца 24.11): вкладка «Гены» рисует паутину
@@ -141,5 +141,27 @@ describe('карта родословной', () => {
     expect(summary).toContain('создала генов: 0')
     expect(summary).toContain('взяла генов: 1')
     expect(summary).toContain('у неё взяли генов: 0')
+  })
+
+  // ── обрезка карты (живой случай 24.11) ─────────────────────────────────
+  it('правый край карты внутри полотна', () => {
+    const layout = layoutMap(map())
+    const right = Math.max(...layout.nodes.map((node) => node.x + NODE_SIZE.width))
+    const bottom = Math.max(...layout.nodes.map((node) => node.y + NODE_SIZE.height))
+    expect(right).toBeLessThanOrEqual(layout.width)
+    expect(bottom).toBeLessThanOrEqual(layout.height)
+  })
+
+  it('карта не обрезается, когда поколения идут не подряд', () => {
+    // ⚠️ Живой случай 24.11: копия **второго** поколения, а копий первого
+    // нет ⇒ колонка 1 пустая. Ширина, посчитанная по числу колонок, выходила
+    // на 240 пикселей меньше нужной, и правый край карты обрезался.
+    const lonely = map()
+    lonely.copies = lonely.copies.filter((item) => item.instance !== 'mg-a')
+    lonely.genes = []
+    lonely.edges = []
+    const layout = layoutMap(lonely)
+    const right = Math.max(...layout.nodes.map((node) => node.x + NODE_SIZE.width))
+    expect(right).toBeLessThanOrEqual(layout.width)
   })
 })
