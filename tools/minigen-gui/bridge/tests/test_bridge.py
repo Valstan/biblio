@@ -273,6 +273,18 @@ class ProgramVersionTest(unittest.TestCase):
         self.assertIn("commit", version)
         self.assertIn("running_from", version)
 
+    def test_version_in_development_shows_the_commit(self) -> None:
+        """Запуск из дерева (разработка): версия — коммит рабочего дерева.
+
+        ⚠️ Живой случай 24.11: в мосте не было константы `REPO`, и
+        `program_version()` падал с NameError (его ловили) ⇒ в окне
+        разработки было «Версия: неизвестна».
+        """
+        version = state.program_version()
+        self.assertTrue(version["commit"],
+                        "коммит рабочего дерева не прочитан: %s" % version)
+        self.assertIn("рабочее дерево", version["source"])
+
 
 class SettingsTest(unittest.TestCase):
     def setUp(self) -> None:

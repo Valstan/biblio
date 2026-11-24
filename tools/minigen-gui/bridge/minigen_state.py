@@ -37,6 +37,12 @@ HERE = Path(__file__).resolve().parent
 # Первая правка (три parent'а) увела на корень репозитория — мимо.
 # Теперь путь проверяется тестом, а не «на глаз».
 REPO_TOOLS = HERE.parent.parent / "minimax-project-areas"
+# Корень репозитория: `tools/minigen-gui/bridge` → `tools/minigen-gui` →
+# `tools` → корень. Нужен, чтобы окно, запущенное из дерева (разработка),
+# показывало коммит рабочего дерева, а не «неизвестна».
+# ⚠️ 24.11: этой константы не было, и `program_version()` падал с NameError
+# (его ловили) ⇒ в окне разработки «Версия: неизвестна».
+REPO = HERE.parent.parent.parent
 LIVE_BIN = Path(os.environ.get("MINIGEN_BIN", r"C:\Users\valstan\bin"))
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT",
                                   str(Path.home() / ".minimax-areas")))
