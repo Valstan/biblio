@@ -142,7 +142,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path != "/status":
             self._send(404, {"error": "not found"})
             return
-        self._send(200, daemons.status())
+        # `allow_api=False`: ответ API не должен звать API (иначе — вызов сам
+        # в себя: API → демоны → API → демоны → …).
+        self._send(200, daemons.status(allow_api=False))
 
     def do_POST(self) -> None:                              # noqa: N802
         parsed = urlparse(self.path)

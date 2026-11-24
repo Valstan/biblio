@@ -1,19 +1,21 @@
 import { useEffect, useState } from 'react'
-import type { DaemonStatus, LineageInfo, ProgramVersion, Settings, Snapshot } from '@shared/types'
+import type { LineageInfo, ProgramVersion, Settings, Snapshot } from '@shared/types'
 import { api } from '../api'
 import { TZ_LABEL, formatDateTime } from '../time'
+import { daemonHeader } from '../daemon-view'
 import { lineageRows as lineageRowsOf } from './lineage-view'
 
 interface Props {
   settings: Settings | null
   snapshot: Snapshot | null
   onSaved: (settings: Settings) => void
+  /** Перечитать снимок (после действия над демонами таблица должна сойтись с шапкой). */
+  onRefresh: () => Promise<void>
 }
 
-export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
+export default function SettingsTab({ settings, snapshot, onSaved, onRefresh }: Props) {
   const [form, setForm] = useState<Settings | null>(settings)
   const [note, setNote] = useState('')
-  const [daemons, setDaemons] = useState<DaemonStatus | null>(null)
   const [version, setVersion] = useState<ProgramVersion | null>(null)
   const [lineage, setLineage] = useState<LineageInfo | null>(null)
 
@@ -22,13 +24,14 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   }, [settings, form])
 
   useEffect(() => {
-    const load = () => api.daemonsStatus().then(setDaemons).catch(() => undefined)
-    void load()
     void api.programVersion().then(setVersion).catch(() => undefined)
     void api.lineageShow().then((data) => setLineage(data?.lineage ?? null)).catch(() => undefined)
-    const timer = window.setInterval(() => void load(), 5000)
-    return () => window.clearInterval(timer)
   }, [])
+
+  // Демоны — **из снимка**, как в шапке: один источник, и таблица не может
+  // разойтись с шапкой (живой случай 24.11: «демоны 0/0» против живых pid).
+  const daemons = snapshot?.daemons ?? null
+  const header = daemonHeader(snapshot)
 
   const lineageRows = lineageRowsOf(lineage)
 
@@ -45,7 +48,7 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
     if (action === 'start') await api.daemonsStart(name)
     if (action === 'stop') await api.daemonsStop(name)
     if (action === 'restart') await api.daemonsRestart(name)
-    setDaemons(await api.daemonsStatus())
+    await onRefresh()
     setNote(`${action}: готово`)
   }
 
@@ -129,16 +132,19 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
         </p>
         <p className="muted small">
           Надзиратель:{' '}
-          {daemons?.supervisor ? (
+          {daemons ? (
             <>
-              {daemons.supervisor.is_self ? 'это окно' : `pid ${daemons.supervisor.pid}`}
-              {daemons.supervisor.alive ? '' : ' (процесса нет)'}
-              {daemons.supervisor.path ? ` · ${daemons.supervisor.path}` : ''}
+              {daemons.supervisor?.is_self
+                ? 'это окно'
+                : `pid ${daemons.supervisor?.pid ?? '—'}`}
+              {daemons.supervisor && !daemons.supervisor.alive ? ' (процесса нет)' : ''}
+              {daemons.supervisor?.path ? ` · ${daemons.supervisor.path}` : ''}
             </>
           ) : (
-            'сейчас никто (демоны поднимают себя сами)'
+            header.supervisor.label
           )}
         </p>
+        {daemons?.error && <p className="muted small">Состояние демонов не прочитано: {daemons.error}</p>}
         <table className="grid compact">
           <thead>
             <tr>

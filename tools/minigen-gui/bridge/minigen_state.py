@@ -103,6 +103,14 @@ def load_daemons() -> dict[str, Any]:
     if str(base) not in sys.path:
         sys.path.insert(0, str(base))
     mods: dict[str, Any] = {"dir": base}
+    # Модуль времени — **до ядра**: ядро его импортирует, и мы берём ту же
+    # реализацию (`minigen_time.fmt_ms(value, fmt)`), а не ядровую обёртку
+    # `fmt_ms(ms)`. Иначе мост зависел бы от того, какой версией ядра
+    # заменена боевая папка (живой случай 24.11: снимок падал из-за
+    # несовпадения сигнатур).
+    time_path = base / "minigen_time.py"
+    if time_path.is_file():
+        mods["time"] = _load_module("minigen_time", time_path)
     core_path = base / "minigen_core.py"
     if not core_path.is_file():
         # Понятное сообщение вместо трассы FileNotFoundError: иначе ошибку
@@ -392,18 +400,31 @@ def program_version() -> dict[str, Any]:
     return out
 
 
+def time_module(mods: dict[str, Any]) -> Any:
+    """Модуль времени программы — одна реализация (`minigen_time`).
+
+    Живёт рядом с ядром (в боевой папке и в эталоне) и грузится вместе с ним.
+    """
+    module = mods.get("time") or sys.modules.get("minigen_time")
+    if module is None:
+        raise RuntimeError("нет модуля времени программы (minigen_time.py)")
+    return module
+
+
 def daemons_status(mods: dict[str, Any]) -> dict[str, Any]:
     """Кто из демонов жив.
 
-    С 23.11 (Ф6) старая панель и её супервизор архивированы — демонов держит
-    сама программа «МиниГен». Поэтому смотрим на процессы демонов, а не на
-    порт 8098.
+    ⚠️ Живой случай 24.11: сбой здесь молча превращался в «демонов 0/0» — окно
+    показывало «никого нет» вместо «не прочиталось». Отсутствие данных ≠
+    отсутствие демонов: поэтому ошибка едет к окну отдельным полем `error`.
     """
     try:
         import minigen_daemons as daemons
         return daemons.status()
-    except Exception:  # noqa: BLE001
-        return {"daemons": [], "alive_count": 0, "total": 0}
+    except Exception as exc:  # noqa: BLE001
+        return {"daemons": [], "alive_count": 0, "total": 0,
+                "checked_at": int(time.time() * 1000),
+                "error": "%s: %s" % (type(exc).__name__, exc)}
 
 
 # ────────────────────────────────────────────────────────────── журнал
@@ -542,7 +563,13 @@ def stats_summary(mods: dict[str, Any], days: int = 7) -> dict[str, Any]:
     # Граница окна — **по Москве** (заказ владельца 24.11): журнал пишется в
     # московском времени, значит и фильтр должен быть московским, а не
     # «локальным» (на другой машине окно статистики поехало бы на часы).
-    since_ts = mods["core"].fmt_ms(int(since * 1000), "%Y-%m-%d %H:%M:%S")
+    # Формат — **как в журнале** («%Y-%m-%d %H:%M:%S»): граница сравнивается
+    # с метками строк журнала строкой, и другой формат сдвинул бы окно.
+    # Форматирует **модуль времени** (`minigen_time`), а не ядро: ядро — одна
+    # реализация для демонов, и её сигнатура менялась (живой случай 24.11:
+    # `fmt_ms() takes 1 positional argument but 2 were given` — снимок падал
+    # целиком, и окно показывало пустые области).
+    since_ts = time_module(mods).fmt_ms(int(since * 1000), "%Y-%m-%d %H:%M:%S")
     lines = read_journal(mods, limit=20000, since=since_ts)
     slugs = [a["slug"] for a in mods["core"].areas()]
     per_area: dict[str, dict[str, Any]] = {}
@@ -610,17 +637,40 @@ def stats_summary(mods: dict[str, Any], days: int = 7) -> dict[str, Any]:
 # ──────────────────────────────────────────────────────────── снимок целиком
 
 def snapshot(mods: dict[str, Any], include_sessions: bool = True) -> dict[str, Any]:
-    """Снимок состояния «МиниГена» — то, что показывает окно."""
+    """Снимок состояния «МиниГена» — то, что показывает окно.
+
+    ⚠️ Живой случай 24.11: снимок падал **целиком** из-за одной части
+    (статистика звала `fmt_ms` по старой сигнатуре) — и окно показывало пустой
+    список областей и «демоны 0/0», будто демонов нет. Теперь каждая часть
+    собирается отдельно: сбой одной части не обнуляет остальные, а причина
+    едет к окну полем `error` — окно говорит, ЧТО не прочиталось, а не молчит.
+    """
     core = mods["core"]
-    projects = read_projects()
-    return {
+    problems: list[str] = []
+
+    def part(name: str, build, default: Any) -> Any:
+        """Часть снимка: сбой не роняет остальные, а попадает в `error`."""
+        try:
+            return build()
+        except Exception as exc:  # noqa: BLE001
+            problems.append("%s: %s" % (name, exc))
+            return default
+
+    projects = part("конфиг областей", read_projects, {"projects": [], "_error": ""})
+    out: dict[str, Any] = {
         "at": int(time.time() * 1000),
-        "areas": areas_state(mods, include_sessions=include_sessions),
-        "network": network_state(mods, probe=False),
-        "daemons": daemons_status(mods),
-        "stats": stats_summary(mods, days=1),
+        "areas": part("области",
+                      lambda: areas_state(mods, include_sessions=include_sessions), []),
+        "network": part("сеть", lambda: network_state(mods, probe=False), {}),
+        "daemons": part("демоны", lambda: daemons_status(mods), {}),
+        "stats": part("статистика", lambda: stats_summary(mods, days=1), {}),
         "config_error": projects.get("_error", ""),
         "journal_path": str(core.JOURNAL),
         "areas_root": str(AREAS_ROOT),
         "daemon_dir": str(mods.get("dir")),
     }
+    if problems:
+        # Поле есть только когда что-то правда не прочиталось: «ошибка» без
+        # ошибки — тоже враньё.
+        out["error"] = "; ".join(problems)
+    return out

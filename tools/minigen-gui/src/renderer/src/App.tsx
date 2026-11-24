@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { ProgramVersion, Settings, Snapshot } from '@shared/types'
 import { api } from './api'
 import { buildStatsCsv } from './format'
+import { daemonHeader } from './daemon-view'
 import AreasTab from './tabs/AreasTab'
 import StatsTab from './tabs/StatsTab'
 import NetworkTab from './tabs/NetworkTab'
@@ -99,19 +100,10 @@ export default function App() {
   // ── индикатор «жив ли МиниГен» (23.11, вопрос владельца) ──────────────
   // Показываем в шапке, на любой вкладке: сколько демонов живо, кто ими
   // надзирает (это окно или фоновый режим) и какая версия программы идёт.
-  const daemons = snapshot?.daemons
-  const aliveCount = daemons?.alive_count ?? 0
-  const totalCount = daemons?.total ?? 0
-  const daemonTone = totalCount > 0 && aliveCount === totalCount ? 'ok' : 'bad'
-  const supervisor = daemons?.supervisor ?? null
-  const supervisorLabel = !supervisor
-    ? 'надзирателя нет'
-    : supervisor.is_self
-      ? 'надзиратель: это окно'
-      : supervisor.alive
-        ? 'надзиратель: фоновый режим'
-        : 'надзиратель: его нет'
-  const supervisorTone = supervisor && supervisor.alive ? 'ok' : 'bad'
+  // ⚠️ 24.11: шапка и таблица в «Настройках» расходились («демоны 0/0» против
+  // живых демонов с pid) — шапка читала снимок, а он падал и превращался в
+  // нули. Теперь обе читают **один источник**, а при сбое видно причину.
+  const header = daemonHeader(snapshot)
   const versionLabel = version?.commit
     ? `${version.installed ? 'установленная копия' : 'рабочее дерево'} ${version.commit}`
     : ''
@@ -131,8 +123,13 @@ export default function App() {
           </div>
         </div>
         <div className="topbar-actions">
-          <span className={`chip ${daemonTone}`}>демоны {aliveCount}/{totalCount}</span>
-          <span className={`chip ${supervisorTone}`}>{supervisorLabel}</span>
+          <span className={`chip ${header.daemons.tone}`}>{header.daemons.label}</span>
+          <span className={`chip ${header.supervisor.tone}`}>{header.supervisor.label}</span>
+          {header.error && (
+            <span className="chip bad" title={header.error}>
+              {header.error}
+            </span>
+          )}
           <span className={`status ${bridge.alive ? 'ok' : 'bad'}`}>{bridge.message}</span>
           <button className="ghost" onClick={() => void refresh()} disabled={busy}>
             Обновить
@@ -165,7 +162,8 @@ export default function App() {
         {tab === 'genes' && <GenesTab />}
         {tab === 'update' && <UpdateTab />}
         {tab === 'settings' && (
-          <SettingsTab settings={settings} snapshot={snapshot} onSaved={setSettings} />
+          <SettingsTab settings={settings} snapshot={snapshot} onSaved={setSettings}
+            onRefresh={refresh} />
         )}
       </main>
     </div>

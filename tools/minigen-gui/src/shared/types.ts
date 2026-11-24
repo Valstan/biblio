@@ -139,6 +139,8 @@ export interface Snapshot {
   journal_path: string
   areas_root: string
   daemon_dir: string
+  /** Что не прочиталось (снимок собран не целиком). Нет поля — всё прочиталось. */
+  error?: string
 }
 
 export interface DaemonInfo {
@@ -165,6 +167,8 @@ export interface DaemonStatus {
   total: number
   checked_at: number
   supervisor?: SupervisorInfo | null
+  /** Состояние демонов не прочиталось (нет поля — читалось). */
+  error?: string
 }
 
 export interface ProgramVersion {

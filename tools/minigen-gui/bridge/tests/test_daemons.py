@@ -74,6 +74,52 @@ class DaemonMatchingTest(unittest.TestCase):
         self.assertIsNone(pattern.search(one_shot))
 
 
+class DaemonLookupTest(unittest.TestCase):
+    """Где мост ищет демонов (живой случай 24.11).
+
+    WMI не отдаёт командную строку процесса, который спрашивающий не может
+    открыть (программа запущена с повышенными правами). Тогда демон выглядит
+    мёртвым, а надзиратель поднимает **вторую** копию — лечащий брал аккаунты
+    у Кармана дважды (урок 22.11). Поэтому, если локально демона не видно,
+    мост спрашивает локальный API: его держит надзиратель, и он видит своих
+    демонов.
+    """
+
+    def test_api_used_when_local_view_is_empty(self) -> None:
+        original_wmi, original_api = daemons._wmi_pids, daemons._api_pids
+        daemons._wmi_pids = lambda spec: []
+        daemons._api_pids = lambda spec: [4242]
+        try:
+            pids = daemons.daemon_pids(daemons.DAEMONS[0])
+        finally:
+            daemons._wmi_pids, daemons._api_pids = original_wmi, original_api
+        self.assertEqual(pids, [4242])
+
+    def test_local_view_wins(self) -> None:
+        original_wmi, original_api = daemons._wmi_pids, daemons._api_pids
+        daemons._wmi_pids = lambda spec: [111]
+        daemons._api_pids = lambda spec: [222]
+        try:
+            pids = daemons.daemon_pids(daemons.DAEMONS[0])
+        finally:
+            daemons._wmi_pids, daemons._api_pids = original_wmi, original_api
+        self.assertEqual(pids, [111])
+
+    def test_api_answer_does_not_call_api(self) -> None:
+        """Внутри ответа API API не спрашивается (иначе вызов сам в себя)."""
+        original_wmi = daemons._wmi_pids
+        asked: list[str] = []
+        daemons._wmi_pids = lambda spec: []
+        original_api_pids = daemons._api_pids
+        daemons._api_pids = lambda spec: (asked.append("api"), [1])[1]
+        try:
+            daemons.status(allow_api=False)
+        finally:
+            daemons._wmi_pids = original_wmi
+            daemons._api_pids = original_api_pids
+        self.assertEqual(asked, [], "ответ API позвал сам себя")
+
+
 class ApiTest(unittest.TestCase):
     """Локальный API программы (его зовёт сетевой сторож)."""
 

@@ -24,6 +24,7 @@ import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 BRIDGE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BRIDGE_DIR))
@@ -34,6 +35,20 @@ MSK = timezone(timedelta(hours=3), "MSK")
 import minigen_agent as agent          # noqa: E402
 import minigen_state as state          # noqa: E402
 import minigen_tools as tools          # noqa: E402
+
+
+class FakeTime:
+    """Модуль времени программы — как настоящий `minigen_time`.
+
+    ⚠️ 24.11: подставное ядро умело `fmt_ms(ms, fmt)`, а боевой — только
+    `fmt_ms(ms)`. Из-за этого расхождения снимок в бою падал, а тесты проходили.
+    Теперь мост берёт **модуль времени** (одну реализацию), и подставной
+    модуль — отдельный, как в бою.
+    """
+
+    @staticmethod
+    def fmt_ms(ms: int, fmt: str = "%d.%m %H:%M:%S") -> str:
+        return datetime.fromtimestamp(int(ms or 0) / 1000, MSK).strftime(fmt)
 
 
 class FakeCore:
@@ -125,7 +140,7 @@ class StatsTest(unittest.TestCase):
             {"slug": "brain2", "title": "Управляющий", "dir": Path("p-brain2")},
             {"slug": "matricarmz", "title": "Матрица", "dir": Path("p-matricarmz")},
         ])
-        self.mods = {"core": core}
+        self.mods = {"core": core, "time": FakeTime}
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -146,6 +161,67 @@ class StatsTest(unittest.TestCase):
         lines = state.read_journal(self.mods, limit=50, contains="ротирую")
         self.assertEqual(len(lines), 1)
         self.assertIn("ротирую", lines[0]["text"])
+
+
+class SnapshotTest(unittest.TestCase):
+    """Снимок не должен врать и не должен молчать о сбоях (24.11).
+
+    Живой случай: снимок падал **целиком** из-за одной части (статистика
+    звала `fmt_ms` по старой сигнатуре) — и окно показывало пустой список
+    областей и «демоны 0/0», будто демонов нет. Теперь сбой одной части не
+    обнуляет остальные, а причина едет к окну полем `error`.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.journal = Path(self.tmp.name) / "journal.log"
+        self.journal.write_text("", encoding="utf-8")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _mods(self, broken: bool = False) -> dict:
+        core = FakeCore(self.journal, areas=[
+            {"slug": "brain2", "title": "Управляющий", "dir": Path("p-brain2")},
+        ])
+        core.CONFIG = Path(self.tmp.name) / "areas.json"
+        core.NET_STATE = Path(self.tmp.name) / "net.json"
+        core.read_state = lambda path: {}          # noqa: E731
+        core.net_config = lambda: {}               # noqa: E731
+
+        class BrokenTime:
+            @staticmethod
+            def fmt_ms(ms: int, fmt: str = "%d.%m %H:%M:%S") -> str:
+                raise TypeError("fmt_ms() takes 1 positional argument but 2 were given")
+
+        return {"core": core, "time": BrokenTime if broken else FakeTime}
+
+    def test_broken_part_does_not_hide_areas(self) -> None:
+        mods = self._mods(broken=True)
+        with mock.patch.object(state, "daemons_status",
+                               return_value={"daemons": [], "alive_count": 3,
+                                             "total": 3, "supervisor": None}):
+            snap = state.snapshot(mods)
+        self.assertTrue(snap["areas"], "сбой одной части обнулил области")
+        self.assertIn("статистика", snap.get("error", ""))
+        self.assertIn("fmt_ms", snap.get("error", ""))
+
+    def test_healthy_snapshot_has_no_error(self) -> None:
+        mods = self._mods()
+        with mock.patch.object(state, "daemons_status",
+                               return_value={"daemons": [], "alive_count": 3,
+                                             "total": 3, "supervisor": None}):
+            snap = state.snapshot(mods)
+        self.assertNotIn("error", snap)
+        self.assertEqual(snap["daemons"]["alive_count"], 3)
+
+    def test_daemons_error_is_not_silent_zeros(self) -> None:
+        """Мост не отдаёт «пустые нули» вместо ошибки (заказ владельца 24.11)."""
+        with mock.patch("minigen_daemons.status",
+                        side_effect=RuntimeError("процессы не прочитались")):
+            status = state.daemons_status({"core": FakeCore(self.journal)})
+        self.assertIn("error", status)
+        self.assertIn("процессы не прочитались", status["error"])
 
 
 class DaemonDirTest(unittest.TestCase):

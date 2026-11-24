@@ -52,6 +52,21 @@ RESPAWN_EVERY = 60          # как часто проверять, что де�
 GRACE = 20                  # пауза перед подъёмом: демон мог подняться сам
 START_TIMEOUT = 20          # сколько ждём появления процесса
 
+# Локальный API программы (его держит надзиратель демонов).
+API_TIMEOUT = 3.0           # сколько ждём ответа API
+API_TTL = 5.0               # как часто спрашиваем API (снимок идёт раз в 5 с)
+
+# Внутри ответа API повторно API не спрашиваем — иначе вызов пошёл бы сам в
+# себя (API → демоны → API → демоны → …). Флаг — **по потоку**: в процессе
+# моста их несколько (снимок и надзиратель), и общий флаг путался бы.
+_local = threading.local()
+_api_cache: dict[str, Any] = {"at": 0.0, "data": None}
+
+
+def _api_allowed() -> bool:
+    """Можно ли сейчас спрашивать локальный API."""
+    return getattr(_local, "allow_api", True)
+
 
 def _bin() -> Path:
     return Path(os.environ.get("MINIGEN_BIN", r"C:\Users\valstan\bin"))
@@ -79,7 +94,22 @@ def daemon_pids(spec: dict[str, str]) -> list[int]:
     запускается без аргументов, а разовые вызовы (`--send`, `--list`) идут
     с аргументами и не должны считаться «живым демоном» — иначе «демон жив»
     окажется правдой, пока самого демона нет.
+
+    ⚠️ Живой случай 24.11: WMI **не отдаёт командную строку** процесса,
+    который спрашивающий не может открыть (программа запущена с повышенными
+    правами). Тогда демон выглядит мёртвым, а надзиратель поднимает **вторую**
+    копию — лечащий брал аккаунты у Кармана дважды (урок 22.11). Поэтому,
+    если локально демона не видно, спрашиваем локальный API: его держит
+    надзиратель, и он своих демонов видит.
     """
+    pids = _wmi_pids(spec)
+    if pids or not _api_allowed():
+        return pids
+    return _api_pids(spec) or pids
+
+
+def _wmi_pids(spec: dict[str, str]) -> list[int]:
+    """PID'ы демона по командной строке (WMI)."""
     out = _ps(
         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
         "Where-Object { $_.CommandLine -like '*%s' } | ForEach-Object { $_.ProcessId }"
@@ -89,6 +119,43 @@ def daemon_pids(spec: dict[str, str]) -> list[int]:
         if token.strip().isdigit():
             pids.append(int(token.strip()))
     return pids
+
+
+def _api_status(timeout: float = API_TIMEOUT) -> dict[str, Any] | None:
+    """Состояние демонов по локальному API (`/status`).
+
+    Ответ API — это тот же `status()`, только из процесса надзирателя: он
+    запущен с теми же правами, что и демоны, и видит их всех.
+    """
+    now = time.time()
+    cached = _api_cache.get("data")
+    if cached is not None and now - float(_api_cache.get("at") or 0) < API_TTL:
+        return cached
+    data: dict[str, Any] | None = None
+    try:
+        import minigen_api
+        answer = minigen_api.call("/status", timeout=timeout)
+        if isinstance(answer, dict) and not answer.get("error"):
+            data = answer
+    except Exception:  # noqa: BLE001
+        data = None
+    _api_cache["at"] = now
+    _api_cache["data"] = data
+    return data
+
+
+def _api_pids(spec: dict[str, str]) -> list[int]:
+    """PID'ы демона по данным API (по имени скрипта)."""
+    data = _api_status()
+    if not data:
+        return []
+    name = str(spec.get("script") or "")
+    for item in data.get("daemons") or []:
+        script = str(item.get("script") or "").replace("\\", "/").split("/")[-1]
+        if script and script == name:
+            return [int(pid) for pid in (item.get("pids") or [])
+                    if str(pid).isdigit()]
+    return []
 
 
 def _supervisor_info() -> dict[str, Any] | None:
@@ -105,28 +172,37 @@ def _supervisor_info() -> dict[str, Any] | None:
     return owner
 
 
-def status() -> dict[str, Any]:
-    """Состояние демонов: кто жив, чем занят, где лежит скрипт."""
-    out: list[dict[str, Any]] = []
-    for spec in DAEMONS:
-        pids = daemon_pids(spec)
-        path = script_path(spec)
-        out.append({
-            "name": spec["name"],
-            "role": spec["role"],
-            "script": str(path),
-            "exists": path.is_file(),
-            "alive": bool(pids),
-            "pids": pids,
-        })
-    return {
-        "daemons": out,
-        "alive_count": len([d for d in out if d["alive"]]),
-        "total": len(out),
-        "checked_at": int(time.time() * 1000),
-        # кто надзирает (по блокировке) — чтобы видеть дубль, а не гадать
-        "supervisor": _supervisor_info(),
-    }
+def status(allow_api: bool = True) -> dict[str, Any]:
+    """Состояние демонов: кто жив, чем занят, где лежит скрипт.
+
+    `allow_api=False` — внутри ответа API: тогда демонов ищем только локально
+    (иначе API позвал бы сам себя).
+    """
+    previous = getattr(_local, "allow_api", True)
+    _local.allow_api = allow_api
+    try:
+        out: list[dict[str, Any]] = []
+        for spec in DAEMONS:
+            pids = daemon_pids(spec)
+            path = script_path(spec)
+            out.append({
+                "name": spec["name"],
+                "role": spec["role"],
+                "script": str(path),
+                "exists": path.is_file(),
+                "alive": bool(pids),
+                "pids": pids,
+            })
+        return {
+            "daemons": out,
+            "alive_count": len([d for d in out if d["alive"]]),
+            "total": len(out),
+            "checked_at": int(time.time() * 1000),
+            # кто надзирает (по блокировке) — чтобы видеть дубль, а не гадать
+            "supervisor": _supervisor_info(),
+        }
+    finally:
+        _local.allow_api = previous
 
 
 def _child_env() -> dict[str, str]:
