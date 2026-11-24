@@ -43,6 +43,7 @@ import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
 import minigen_lock as minigen_lock    # noqa: E402
+import minigen_lineage as lineage      # noqa: E402
 import minigen_provider as provider_mod  # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
@@ -174,6 +175,8 @@ class Bridge:
             # «ящик отчётов»: сторожи и инструменты отчитываются туда,
             # нейросеть читает (заказ владельца 24.11)
             "reports.list": self.cmd_reports_list,
+            # родословная копии: кто эта копия и от какой версии форк
+            "lineage.show": self.cmd_lineage_show,
         }
 
     # Команды, чей вызов **не** отчитывается в «ящик отчётов»: иначе
@@ -573,6 +576,10 @@ class Bridge:
                                                   days=int(args.get("days") or 7)))
 
     # ──────────────────────────────────────────────────────── ящик отчётов
+    def cmd_lineage_show(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Родословная этой копии: кто она, от какой версии форк, что приняла."""
+        return {"lineage": lineage.genealogy()}
+
     def cmd_reports_list(self, args: dict[str, Any]) -> dict[str, Any]:
         """Отчёты сторожей и инструментов: что сделали и где ошиблись."""
         items = self._reports(
