@@ -262,6 +262,13 @@ def unarchive(prompt_id: int) -> tuple[int, dict]:
 
 # ────────────────────────────────────────────────────────── CLI
 
+def _explain(code: int) -> str:
+    """Человеческое объяснение кода ответа — для CLI и отчётов."""
+    if code == 0:
+        return status()["reason"]
+    return REASONS.get(code, "HTTP %s" % code)
+
+
 def _print_prompt(item: dict) -> None:
     print("#%s | %s | %s | %s"
           % (item.get("id"), item.get("kind"), item.get("created_at") or "—",
@@ -296,7 +303,7 @@ def main(argv: list | None = None) -> int:
                              ensure_ascii=False, indent=2))
             return 0 if code == 200 else 1
         if code != 200:
-            print("не получилось: %s" % REASONS.get(code, "HTTP %s" % code),
+            print("не получилось: %s" % _explain(code),
                   file=sys.stderr)
             return 1
         if not items:
@@ -317,7 +324,7 @@ def main(argv: list | None = None) -> int:
                              ensure_ascii=False, indent=2))
             return 0 if code == 200 else 1
         if code != 200:
-            print("не получилось: %s" % REASONS.get(code, "HTTP %s" % code),
+            print("не получилось: %s" % _explain(code),
                   file=sys.stderr)
             return 1
         _print_prompt(item)
@@ -341,7 +348,7 @@ def main(argv: list | None = None) -> int:
             print("не получилось: %s" % payload.get("error"), file=sys.stderr)
             return 1
         if code != 200:
-            print("не получилось: %s" % REASONS.get(code, "HTTP %s" % code),
+            print("не получилось: %s" % _explain(code),
                   file=sys.stderr)
             return 1
         print("Промт #%s: archived=%s"

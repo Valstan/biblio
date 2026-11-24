@@ -174,6 +174,15 @@ def main() -> int:
         check(status["http"] == 0, "код не 0: %s" % status["http"])
         check("токен" in status["reason"], "причина не про токен: %s" % status["reason"])
         check(not Handler.calls, "запрос ушёл наружу без токена: %s" % Handler.calls)
+        printed = io.StringIO()
+        with contextlib.redirect_stderr(printed):
+            client.main(["list"])
+        check("токен" in printed.getvalue(),
+              "команда list без токена не сказала, чего не хватает: %s"
+              % printed.getvalue().strip())
+        check("HTTP 0" not in printed.getvalue(),
+              "команда list без токена выдала код вместо причины: %s"
+              % printed.getvalue().strip())
         os.environ["BIBLIO_KEYS_DIR"] = str(keys)
 
         print("4) план отличается от промта")
