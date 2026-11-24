@@ -687,6 +687,8 @@ def reset_session(area: dict, sess: dict, brief: str = "") -> dict:
         core.log("СЕССИИ: сброс запрещён — проба %s" % sess["session_id"][:12])
         return report
     core.log("СЕССИИ: сброс на месте %s (%s)" % (sess["session_id"][:12], sess["title"][:50]))
+    core.report("info", "session", "сброс сессии %s на месте: %s"
+                % (sess["session_id"][:12], sess["title"][:50]))
     # 0) опускаем порог компактизации: рантайм сожмёт контекст сам, внутри
     #    этой сессии (новая сессия не понадобится)
     trig = core.set_compaction_trigger(area["dir"], COMPACTION_TRIGGER)
@@ -728,6 +730,8 @@ def rotate_session(area: dict, sess: dict, brief: str = "") -> dict:
         core.log("СЕССИИ: ротация запрещена — проба %s" % sess["session_id"][:12])
         return report
     core.log("СЕССИИ: ротация %s (%s)" % (sess["session_id"][:12], sess["title"][:50]))
+    core.report("warn", "session", "ротация сессии %s: %s"
+                % (sess["session_id"][:12], sess["title"][:50]))
     res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
     report["steps"].append({"close_command": res})
     if not res.get("ok"):

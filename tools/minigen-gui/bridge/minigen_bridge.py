@@ -48,6 +48,10 @@ from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
 
+# «Ящик отчётов»: пометка «до какого отчёта нейросеть уже в курсе».
+REPORTS_SEEN = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                / "minigen-gui" / "reports-seen.json")
+
 
 def _run(cmd: list[str], timeout: int = 180) -> dict[str, Any]:
     """Запустить внешнюю команду и вернуть её вывод.
@@ -167,16 +171,46 @@ class Bridge:
             "model.apply": self.cmd_model_apply,
             # сброс сессии на месте (заказ владельца 24.11)
             "sessions.reset": self.cmd_sessions_reset,
+            # «ящик отчётов»: сторожи и инструменты отчитываются туда,
+            # нейросеть читает (заказ владельца 24.11)
+            "reports.list": self.cmd_reports_list,
         }
+
+    # Команды, чей вызов **не** отчитывается в «ящик отчётов»: иначе
+    # нейросеть получала бы отчёты о собственных вопросах и о чтении
+    # отчётов (шум вместо пользы).
+    NO_REPORT_CMDS = ("chat.", "reports.")
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         handler = self.handlers.get(cmd)
         if handler is None:
             return {"error": "неизвестная команда: %s" % cmd}
         try:
-            return handler(args or {})
+            result = handler(args or {})
         except Exception as exc:  # noqa: BLE001
-            return {"error": "%s: %s" % (type(exc).__name__, exc)}
+            result = {"error": "%s: %s" % (type(exc).__name__, exc)}
+        self._report_call(cmd, result)
+        return result
+
+    def _report_call(self, cmd: str, result: dict[str, Any]) -> None:
+        """Отчёт о работе инструмента — в «ящик отчётов» (заказ 24.11).
+
+        Инструменты сами рассказывают нейросети, что сделали и где ошиблись.
+        """
+        if cmd.startswith(self.NO_REPORT_CMDS):
+            return
+        try:
+            error = str((result or {}).get("error") or "")
+            if error:
+                text = "%s: %s" % (cmd, error)
+                level = "error"
+            else:
+                ok = (result or {}).get("ok")
+                text = "%s: %s" % (cmd, "ок" if ok is not False else "сделано")
+                level = "info"
+            self.core.report(level, "tool", text)
+        except Exception:  # noqa: BLE001
+            pass        # отчёт — дополнительный канал, его поломка не важна
 
     # ────────────────────────────────────────────────────────────── состояние
     def _area_token(self, slug: str) -> str:
@@ -538,6 +572,60 @@ class Bridge:
         return state.jsonable(state.stats_summary(self.mods,
                                                   days=int(args.get("days") or 7)))
 
+    # ──────────────────────────────────────────────────────── ящик отчётов
+    def cmd_reports_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Отчёты сторожей и инструментов: что сделали и где ошиблись."""
+        items = self._reports(
+            limit=int(args.get("limit") or 50),
+            level=str(args.get("level") or ""),
+            since_ms=int(args.get("since") or 0))
+        path = str(getattr(self.core, "REPORTS", ""))
+        return {"reports": items, "path": path}
+
+    def _reports(self, limit: int = 50, level: str = "",
+                 since_ms: int = 0) -> list[dict[str, Any]]:
+        """Прочитать отчёты (ядро на машине может быть старее программы)."""
+        reader = getattr(self.core, "reports", None)
+        if reader is None:
+            return []
+        try:
+            return list(reader(limit=limit, level=level, since_ms=since_ms) or [])
+        except Exception:  # noqa: BLE001
+            return []
+
+    def _unread_reports(self, limit: int = 25) -> str:
+        """Свежие отчёты — подклас в чат (заказ владельца 24.11).
+
+        Нейросеть «Управляющий» сама узнаёт, что сторож и инструменты
+        сделали, пока её не спрашивали.
+        """
+        seen = 0
+        try:
+            if REPORTS_SEEN.is_file():
+                seen = int(json.loads(REPORTS_SEEN.read_text(encoding="utf-8"))
+                           .get("ts") or 0)
+        except (OSError, ValueError, AttributeError):
+            seen = 0
+        items = self._reports(limit=limit, since_ms=seen)
+        if not items:
+            return ""
+        newest = max(int(i.get("ts") or 0) for i in items)
+        try:
+            REPORTS_SEEN.parent.mkdir(parents=True, exist_ok=True)
+            REPORTS_SEEN.write_text(json.dumps({"ts": newest}), encoding="utf-8")
+        except OSError:
+            pass
+        lines = []
+        for item in reversed(items):       # от старых к новым — как в журнале
+            stamp = time.strftime("%d.%m %H:%M:%S",
+                                  time.localtime(int(item.get("ts") or 0) / 1000))
+            kind = str(item.get("kind") or "log")
+            level = str(item.get("level") or "info")
+            lines.append("[%s] %s/%s: %s" % (stamp, kind, level,
+                                             str(item.get("text") or "")))
+        return ("Отчёты программы с прошлого раза (сторож и инструменты):\n"
+                + "\n".join(lines))
+
     # ─────────────────────────────────────────────────────────── настройки
     def cmd_settings_get(self, args: dict[str, Any]) -> dict[str, Any]:
         return state.read_settings()
@@ -559,8 +647,15 @@ class Bridge:
         # Прокси-переменные живут в реестре, а процесс мог устареть ⇒ перечитываем
         # их перед запросом (иначе модель «недоступна» при живом интернете).
         self.core.refresh_env()
+        # Свежие отчёты программы — в контекст хода (заказ владельца 24.11):
+        # нейросеть знает, что сторож и инструменты сделали, пока её не
+        # спрашивали.
+        history = list(self.chat_history)
+        feed = self._unread_reports()
+        if feed:
+            history.append({"role": "user", "content": feed})
         try:
-            result = self.agent.ask(self.chat_history, text, area_slug, model)
+            result = self.agent.ask(history, text, area_slug, model)
         except ModelUnavailable as exc:
             return {"status": "unavailable", "error": str(exc),
                     "text": "", "calls": []}
