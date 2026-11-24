@@ -105,9 +105,67 @@ def _supervisor_info() -> dict[str, Any] | None:
     return owner
 
 
+def supervisor_view() -> dict[str, Any] | None:
+    """Демоны глазами надзирателя (фоновый режим) — или `None`, если его нет.
+
+    ⚠️ Живой случай 24.11: окно запущено обычным пользователем, а демоны
+    подняты с повышенными правами ⇒ WMI не отдаёт их командные строки ⇒
+    окно показывало «демоны 0/3», хотя демоны живы (надзиратель их видел).
+    Надзиратель смотрит их своими правами — спрашиваем его.
+
+    Ничего не спрашиваем, если порт держим **мы** (мы и есть надзиратель).
+    """
+    try:
+        import minigen_api
+        if getattr(minigen_api, "SERVING", False):
+            return None
+        data = minigen_api.status()
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict) or "daemons" not in data:
+        return None
+    return data
+
+
+def _ask_supervisor(path: str, timeout: int = 90) -> dict[str, Any] | None:
+    """Попросить надзирателя сделать что-то с демонами (None — не смог)."""
+    try:
+        import minigen_api
+        if getattr(minigen_api, "SERVING", False):
+            return None
+        data = minigen_api.call_or_none(path, timeout=timeout)
+    except Exception:  # noqa: BLE001
+        return None
+    if not data:
+        return None
+    if data.get("error"):
+        return {"ok": False, "error": str(data["error"])}
+    return data
+
+
 def status() -> dict[str, Any]:
-    """Состояние демонов: кто жив, чем занят, где лежит скрипт."""
-    out: list[dict[str, Any]] = []
+    """Состояние демонов: кто жив, чем занят, где лежит скрипт.
+
+    С 23.11 (Ф6) старая панель и её супервизор архивированы — демонов держит
+    сама программа «МиниГен». Поэтому смотрим на процессы демонов, а не на
+    порт 8098.
+
+    ⚠️ Сначала спрашиваем надзирателя (фоновый режим): он смотрит демонов
+    своими правами. Окно, запущенное обычным пользователем, командные строки
+    демонов, поднятых с повышенными правами, не читает (WMI отдаёт пустоту)
+    ⇒ окно показывало «демоны 0/3» при живых демонах (живой случай 24.11).
+    """
+    remote = supervisor_view()
+    if remote:
+        out = dict(remote)
+        supervisor = out.get("supervisor")
+        if isinstance(supervisor, dict):
+            supervisor = dict(supervisor)
+            # «это окно» — по своему pid: ответ надзирателя говорил «это я».
+            supervisor["is_self"] = int(supervisor.get("pid") or 0) == os.getpid()
+            out["supervisor"] = supervisor
+        return out
+    out = []
     for spec in DAEMONS:
         pids = daemon_pids(spec)
         path = script_path(spec)
@@ -143,6 +201,14 @@ def _child_env() -> dict[str, str]:
     return env
 
 
+def _supervisor_path(path: str, name: str = "") -> str:
+    """Путь для надзирателя (имя демона — в адресе, экранируем)."""
+    import urllib.parse
+    if not name:
+        return path
+    return "%s?name=%s" % (path, urllib.parse.quote(name))
+
+
 def start(spec: dict[str, str], grace: float = 0.0) -> dict[str, Any]:
     """Поднять демона, если он не жив. Отсоединённо — переживёт окно.
 
@@ -150,9 +216,17 @@ def start(spec: dict[str, str], grace: float = 0.0) -> dict[str, Any]:
     он умеет поднимать себя сам (при изменении файла), и без паузы программа
     подняла бы вторую копию (урок 22.11: две копии лечащего брали аккаунты
     у Кармана дважды).
+
+    ⚠️ Живой случай 24.11: демоны, поднятые с повышенными правами, окно
+    не видит (WMI не отдаёт их командные строки) ⇒ «не нашёл» ≠ «не
+    работает» ⇒ поднялся бы второй экземпляр. Поэтому сначала спрашиваем
+    надзирателя — он смотрит демонов своими правами.
     """
     if grace:
         time.sleep(grace)
+    remote = _ask_supervisor(_supervisor_path("/start", spec.get("script") or ""))
+    if remote is not None:
+        return remote
     existing = daemon_pids(spec)
     if existing:
         return {"ok": True, "already": True, "pids": existing,
@@ -185,7 +259,14 @@ def start(spec: dict[str, str], grace: float = 0.0) -> dict[str, Any]:
 
 
 def stop(spec: dict[str, str]) -> dict[str, Any]:
-    """Остановить демона (вместе с деревом процессов)."""
+    """Остановить демона (вместе с деревом процессов).
+
+    ⚠️ Как и в `start`: не видимый окном демон (повышенные права) мы
+    останавливаем через надзирателя — иначе он бы и не остановился.
+    """
+    remote = _ask_supervisor(_supervisor_path("/stop", spec.get("script") or ""))
+    if remote is not None:
+        return remote
     pids = daemon_pids(spec)
     if not pids:
         return {"ok": True, "note": "не работал"}
@@ -202,6 +283,15 @@ def stop(spec: dict[str, str]) -> dict[str, Any]:
 
 
 def restart(spec: dict[str, str]) -> dict[str, Any]:
+    """Перезапустить демона — целиком через надзирателя, если он есть.
+
+    ⚠️ Остановка и запуск по отдельности проходят через надзирателя (см.
+    `start` и `stop`), поэтому и перезапуск — через него: демоны с
+    повышенными правами окно не видит и не смогло бы перезапустить.
+    """
+    remote = _ask_supervisor(_supervisor_path("/restart", spec.get("script") or ""))
+    if remote is not None:
+        return remote
     stopped = stop(spec)
     time.sleep(2)
     started = start(spec)
@@ -217,14 +307,26 @@ def by_name(name: str) -> dict[str, str]:
 
 
 def start_all() -> dict[str, Any]:
+    """Поднять всех — через надзирателя, если он есть (см. `start`)."""
+    remote = _ask_supervisor("/start-all")
+    if remote is not None:
+        return remote
     return {"results": [dict(start(spec), name=spec["name"]) for spec in DAEMONS]}
 
 
 def stop_all() -> dict[str, Any]:
+    """Остановить всех — через надзирателя, если он есть (см. `stop`)."""
+    remote = _ask_supervisor("/stop-all")
+    if remote is not None:
+        return remote
     return {"results": [dict(stop(spec), name=spec["name"]) for spec in DAEMONS]}
 
 
 def restart_all() -> dict[str, Any]:
+    """Перезапустить всех — через надзирателя, если он есть (см. `restart`)."""
+    remote = _ask_supervisor("/restart-all")
+    if remote is not None:
+        return remote
     return {"results": [dict(restart(spec), name=spec["name"]) for spec in DAEMONS]}
 
 

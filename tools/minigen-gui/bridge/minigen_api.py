@@ -15,6 +15,15 @@
 | `GET /status` | состояние демонов |
 | `POST /restart-contour` | перезапуск лечащего и сторожа сессий (сетевого сторожа — нет: он в этот момент работает) |
 | `POST /restart?name=<демон>` | перезапуск конкретного демона |
+| `POST /start?name=<демон>` / `POST /stop?name=<демон>` | запуск и остановка конкретного демона |
+| `POST /start-all` / `POST /stop-all` / `POST /restart-all` | то же для всех демонов |
+
+⚠️ Зачем окну ходить в API (живой случай 24.11): демоны, поднятые с
+повышенными правами, окно не видит — WMI не отдаёт их командные строки, а
+`OpenProcess` возвращает «доступ запрещён». Надзиратель (фоновый режим) их
+видит всегда. Поэтому окно спрашивает демонов **у него** — иначе врало «демоны
+0/3» при живых демонах, а «запустить» означало бы «поднять вторую копию»
+(урок 22.11: два лечащих брали аккаунты дважды).
 
 Токен лежит в `%LOCALAPPDATA%\\minigen-gui\\bridge-token.txt` и создаётся при
 первом запуске. Он нужен, чтобы случайная веб-страница не могла
@@ -37,6 +46,11 @@ import minigen_daemons as daemons
 PORT = 8097
 LOCAL = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "minigen-gui"
 TOKEN_FILE = LOCAL / "bridge-token.txt"
+
+# Порт держит **один** экземпляр программы — обычно фоновый режим
+# (надзиратель демонов). Флаг «порт держим мы» нужен, чтобы окно знало,
+# кому говорить, а сам надзиратель не звал бы себя по сети.
+SERVING = False
 
 
 def token() -> str:
@@ -161,6 +175,31 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(200, daemons.restart(spec))
             return
+        if parsed.path == "/start":
+            name = (query.get("name") or [""])[0]
+            spec = daemons.by_name(name)
+            if not spec:
+                self._send(404, {"error": "нет такого демона: %s" % name})
+                return
+            self._send(200, daemons.start(spec))
+            return
+        if parsed.path == "/stop":
+            name = (query.get("name") or [""])[0]
+            spec = daemons.by_name(name)
+            if not spec:
+                self._send(404, {"error": "нет такого демона: %s" % name})
+                return
+            self._send(200, daemons.stop(spec))
+            return
+        if parsed.path == "/restart-all":
+            self._send(200, daemons.restart_all())
+            return
+        if parsed.path == "/start-all":
+            self._send(200, daemons.start_all())
+            return
+        if parsed.path == "/stop-all":
+            self._send(200, daemons.stop_all())
+            return
         self._send(404, {"error": "not found"})
 
 
@@ -181,6 +220,8 @@ def serve(port: int = PORT) -> None:
     server = ApiServer(("127.0.0.1", port), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
+    global SERVING
+    SERVING = True
     return None
 
 
@@ -206,6 +247,43 @@ def another_instance_running(port: int = PORT, timeout: int = 5) -> bool:
             return resp.status == 200
     except Exception:  # noqa: BLE001
         return False
+
+
+def status(port: int = PORT, timeout: int = 10) -> dict[str, Any]:
+    """Ответ API о демонах (пусто — API не отвечает).
+
+    ⚠️ Именно так окно спрашивает про демонов: надзиратель (фоновый режим)
+    смотрит их **своими** правами. Окно, запущенное обычным пользователем,
+    не читает командные строки демонов, поднятых с повышенными правами
+    (WMI отдаёт пустоту) ⇒ окно врало «демоны 0/3» (живой случай 24.11).
+    """
+    import urllib.request
+    try:
+        req = urllib.request.Request(
+            base_url(port) + "/status",
+            headers={"X-MiniGen-Token": token()})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def call_or_none(path: str, port: int = PORT, timeout: int = 60) -> dict[str, Any] | None:
+    """Дёрнуть свой API; `None` — API не отвечает (а не «ошибка ответа»).
+
+    Разница важна: «API не отвечает» ⇒ делаем сами, «API ответил ошибкой» ⇒
+    ошибку и показываем.
+    """
+    import urllib.request
+    url = "%s%s?token=%s" % (base_url(port), path, token())
+    req = urllib.request.Request(url, method="POST" if path != "/status" else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        return data if isinstance(data, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def call(path: str, port: int = PORT, timeout: int = 60) -> dict[str, Any]:

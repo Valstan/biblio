@@ -52,10 +52,13 @@ class DaemonMatchingTest(unittest.TestCase):
     def test_status_shape(self) -> None:
         original = daemons.daemon_pids
         daemons.daemon_pids = lambda s: [1]
+        original_view = daemons.supervisor_view
+        daemons.supervisor_view = lambda: None      # надзирателя нет — смотрим сами
         try:
             result = daemons.status()
         finally:
             daemons.daemon_pids = original
+            daemons.supervisor_view = original_view
         self.assertEqual(result["total"], 3)
         self.assertEqual(result["alive_count"], 3)
         for item in result["daemons"]:
@@ -72,6 +75,73 @@ class DaemonMatchingTest(unittest.TestCase):
                     '--send brain mvs_123 "текст"')
         self.assertTrue(pattern.search(daemon_line))
         self.assertIsNone(pattern.search(one_shot))
+
+
+class SupervisorViewTest(unittest.TestCase):
+    """Демонов спрашивает надзиратель — он смотрит их своими правами.
+
+    ⚠️ Живой случай 24.11: демоны подняты с повышенными правами, окно — нет.
+    WMI не отдаёт их командные строки ⇒ окно показывало «демоны 0/3» при живых
+    демонах, а «запустить» грозило второй копией (урок 22.11).
+    """
+
+    def setUp(self) -> None:
+        self._view = daemons.supervisor_view
+        self._ask = daemons._ask_supervisor
+        self._pids = daemons.daemon_pids
+        daemons.daemon_pids = lambda spec: []        # окно демонов не видит
+
+    def tearDown(self) -> None:
+        daemons.supervisor_view = self._view
+        daemons._ask_supervisor = self._ask
+        daemons.daemon_pids = self._pids
+
+    def test_status_takes_the_supervisor_view(self) -> None:
+        daemons.supervisor_view = lambda: {
+            "daemons": [{"name": "лечащий", "alive": True, "pids": [111]}],
+            "alive_count": 3, "total": 3,
+            "supervisor": {"pid": 999, "alive": True, "is_self": True},
+        }
+        result = daemons.status()
+        self.assertEqual(result["alive_count"], 3)
+        self.assertEqual(result["daemons"][0]["pids"], [111])
+
+    def test_supervisor_is_not_us_unless_it_is_us(self) -> None:
+        """Ответ надзирателя говорит «это я» — но «я» здесь — окно."""
+        daemons.supervisor_view = lambda: {
+            "daemons": [], "alive_count": 0, "total": 3,
+            "supervisor": {"pid": 4242, "alive": True, "is_self": True},
+        }
+        result = daemons.status()
+        self.assertFalse(result["supervisor"]["is_self"],
+                         "надзиратель — не этот процесс ⇒ это не окно")
+
+    def test_start_goes_through_the_supervisor(self) -> None:
+        """Демона, которого окно не видит, поднимает надзиратель."""
+        asked = []
+
+        def ask(path, timeout=90):
+            asked.append(path)
+            return {"ok": True, "already": True, "pids": [222]}
+
+        daemons._ask_supervisor = ask
+        result = daemons.start(daemons.DAEMONS[0])
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["pids"], [222])
+        self.assertTrue(asked, "надзирателя не спросили")
+
+    def test_stop_and_restart_go_through_the_supervisor(self) -> None:
+        asked = []
+
+        def ask(path, timeout=90):
+            asked.append(path)
+            return {"ok": True}
+
+        daemons._ask_supervisor = ask
+        self.assertTrue(daemons.stop(daemons.DAEMONS[0])["ok"])
+        self.assertTrue(daemons.restart(daemons.DAEMONS[0])["ok"])
+        self.assertTrue(daemons.restart_all()["ok"])
+        self.assertEqual(len(asked), 3)
 
 
 class ApiTest(unittest.TestCase):
@@ -131,6 +201,43 @@ class ApiTest(unittest.TestCase):
         # свободный порт, на котором никто не слушает
         self.assertFalse(minigen_api.another_instance_running(port=8099,
                                                               timeout=2))
+
+    def test_daemon_routes_exist(self) -> None:
+        """Окно ходит в API за демонами — значит, маршруты должны быть.
+
+        ⚠️ Проверяем только «не такого демона» (404): настоящий запуск
+        демона в тесте поднял бы второй экземпляр.
+        """
+        import urllib.error
+        import urllib.request
+
+        import minigen_api
+        old_token_file = minigen_api.TOKEN_FILE
+        old_local = minigen_api.LOCAL
+        with tempfile.TemporaryDirectory() as tmp:
+            minigen_api.LOCAL = Path(tmp)
+            minigen_api.TOKEN_FILE = Path(tmp) / "bridge-token.txt"
+            try:
+                server = minigen_api.HTTPServer(("127.0.0.1", 0),
+                                               minigen_api.Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                port = server.server_address[1]
+                token = minigen_api.token()
+                try:
+                    for path in ("/start?name=nope", "/stop?name=nope",
+                                 "/restart?name=nope"):
+                        with self.assertRaises(urllib.error.HTTPError) as ctx:
+                            urllib.request.urlopen(
+                                "http://127.0.0.1:%d%s&token=%s"
+                                % (port, path, token), timeout=5)
+                        self.assertEqual(ctx.exception.code, 404)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+            finally:
+                minigen_api.TOKEN_FILE = old_token_file
+                minigen_api.LOCAL = old_local
 
 
 class ConfigWriteRaceTest(unittest.TestCase):
