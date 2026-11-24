@@ -3,6 +3,7 @@ import { writeFileSync } from 'fs'
 import { join } from 'path'
 import { Bridge } from './bridge'
 import { sendToWindow } from './window-events'
+import { clickTabScript, mapGeometryScript, parseSmokeTabs, shotName } from './smoke'
 
 /**
  * «МиниГен» — одно окно вместо браузера и набора скриптов.
@@ -24,6 +25,11 @@ if (daemonMode) {
   // Отдельный профиль: иначе включится блокировка одного экземпляра и
   // окно владельца не откроется (или откроется вместо фонового режима).
   app.setPath('userData', join(app.getPath('appData'), 'minigen-gui-daemon'))
+} else if (process.env.MINIGEN_SMOKE) {
+  // Дымовая приёмка окна — тоже отдельный профиль: проверка идёт вторым
+  // экземпляром, пока окно владельца живо, а профиль держит блокировку
+  // одного экземпляра (Chromium). Без этого проверка не запустилась бы.
+  app.setPath('userData', join(app.getPath('appData'), 'minigen-gui-smoke'))
 }
 
 let mainWindow: BrowserWindow | null = null
@@ -81,6 +87,9 @@ app.whenReady().then(() => {
     if (!bridge) throw new Error('мост не запущен')
     return bridge.call(cmd, args ?? {})
   })
+
+  ipcMain.handle('minigen:bridge-status', async () =>
+    bridge?.status() ?? { alive: false, message: 'мост не запущен' })
 
   ipcMain.handle('minigen:open-external', async (_event, path: string) => {
     shell.openPath(path)
@@ -140,6 +149,44 @@ app.whenReady().then(() => {
               console.log('SMOKE CSV: записан', csvPath, csv.length, 'символов')
             } else {
               console.log('SMOKE CSV: окно не собрало CSV')
+            }
+          }
+          // ── снимки вкладок: видимый текст и скриншот ───────────────────
+          // «Приёмка окна глазами» (24.11): окно само показывает, что на
+          // вкладке есть — приёмка читает это и проверяет маркеры.
+          const labels = parseSmokeTabs(process.env.MINIGEN_SMOKE_TABS)
+          if (labels.length && mainWindow && !mainWindow.isDestroyed()) {
+            const textPath = process.env.MINIGEN_SMOKE_TEXT
+            const shotsDir = process.env.MINIGEN_SMOKE_SHOTS
+            const texts: Record<string, { text: string; map: Record<string, unknown> | null }> = {}
+            for (const [index, label] of labels.entries()) {
+              const clicked = (await mainWindow.webContents.executeJavaScript(
+                clickTabScript(label))) as string
+              if (!String(clicked).startsWith('ок')) {
+                console.log('SMOKE TAB: вкладка не открылась —', label, '—', clicked)
+                continue
+              }
+              // вкладка тянет свои данные с моста — дать им прийти
+              await new Promise((resolve) => setTimeout(resolve, 1500))
+              const text = (await mainWindow.webContents.executeJavaScript(
+                'document.body.innerText')) as string
+              const geometry = (await mainWindow.webContents.executeJavaScript(
+                mapGeometryScript())) as Record<string, unknown> | null
+              texts[label] = { text: String(text || ''), map: geometry }
+              if (geometry) {
+                console.log('SMOKE MAP:', label, 'обрезана:', geometry.ok ? 'нет' : 'ДА',
+                  JSON.stringify(geometry))
+              }
+              if (shotsDir) {
+                const image = await mainWindow.webContents.capturePage()
+                const file = join(shotsDir, shotName(label, index))
+                writeFileSync(file, image.toPNG())
+                console.log('SMOKE SHOT:', file)
+              }
+            }
+            if (textPath) {
+              writeFileSync(textPath, JSON.stringify(texts, null, 2), 'utf8')
+              console.log('SMOKE TEXT: записан', textPath, 'вкладок:', Object.keys(texts).length)
             }
           }
         } catch (err) {

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { GeneMap } from '@shared/types'
 import { api } from '../api'
 import { formatDateTime } from '../time'
-import { describeEdge, layoutMap, selfSummary } from './gene-map'
+import { describeEdge, layoutMap, selfSummary, NODE_SIZE } from './gene-map'
 
 /**
  * Вкладка «Гены» — **карта родословной**: паутина копий «МиниГена» и генов
@@ -95,10 +95,10 @@ export default function GenesTab() {
                 return (
                   <g key={`${link.from}-${link.to}-${index}`}>
                     <line
-                      x1={from.x + 90}
-                      y1={from.y + 24}
-                      x2={to.x + 90}
-                      y2={to.y + 24}
+                      x1={from.x + NODE_SIZE.width / 2}
+                      y1={from.y + NODE_SIZE.height / 2}
+                      x2={to.x + NODE_SIZE.width / 2}
+                      y2={to.y + NODE_SIZE.height / 2}
                       stroke={link.kind === 'took' ? '#7aa2f7' : '#4b5563'}
                       strokeWidth={link.kind === 'born' ? 2 : 1}
                       strokeDasharray={link.kind === 'replaced' ? '4 3' : undefined}
@@ -113,8 +113,8 @@ export default function GenesTab() {
                   <rect
                     x={node.x}
                     y={node.y}
-                    width={180}
-                    height={48}
+                    width={NODE_SIZE.width}
+                    height={NODE_SIZE.height}
                     rx={node.kind === 'copy' ? 12 : 4}
                     fill={
                       node.kind === 'copy'

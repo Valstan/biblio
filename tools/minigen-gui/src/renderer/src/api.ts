@@ -23,6 +23,7 @@ declare global {
       saveText(name: string, content: string): Promise<{ ok: boolean; path: string; error?: string }>
       relaunch(): Promise<boolean>
       buildInfo(): Promise<{ commit: string }>
+      bridgeStatus(): Promise<{ alive: boolean; message: string }>
       smoke: { csv: string }
       onEvent(handler: (event: { kind: string; message: string; alive: boolean }) => void): () => void
     }
@@ -80,8 +81,9 @@ export const api = {
   openFolder: (path: string) => call<{ ok: boolean; error?: string }>('app.open_folder', { path })
 }
 
-/** Действия окна (не моста): перезапуск и метка сборки. */
+/** Действия окна (не моста): перезапуск, метка сборки, состояние моста. */
 export const desktop = {
   buildInfo: () => window.minigen.buildInfo(),
-  relaunch: () => window.minigen.relaunch()
+  relaunch: () => window.minigen.relaunch(),
+  bridgeStatus: () => window.minigen.bridgeStatus()
 }

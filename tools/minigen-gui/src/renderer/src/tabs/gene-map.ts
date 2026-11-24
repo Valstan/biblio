@@ -172,12 +172,18 @@ export function layoutMap(map: GeneMap): MapLayout {
     })
   }
 
-  const columns = columnRows.size
   const rows = Math.max(1, ...Array.from(columnRows.values()))
+  // ⚠️ Ширина — по **последней занятой колонке**, а не по числу колонок.
+  // Живой случай 24.11: копия второго поколения, а копий первого нет ⇒
+  // колонка 1 пустая, колонок «две», а узлы стоят в колонке 2 ⇒ по числу
+  // колонок ширина выходила на 240 пикселей меньше нужного, и правый край
+  // карты **обрезался** (видно на снимке окна). Тестовые данные этого не
+  // показывали: там колонки шли подряд.
+  const lastColumn = Math.max(0, ...Array.from(columnRows.keys()))
   return {
     nodes,
     links,
-    width: 40 + columns * COLUMN_WIDTH,
+    width: 40 + (lastColumn + 1) * COLUMN_WIDTH,
     height: 40 + rows * ROW_HEIGHT
   }
 }

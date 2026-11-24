@@ -47,3 +47,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_rollout_version_from_build.py
       - name: Приёмка московского времени (время везде по Москве, Россия)
         run: python3 tools/minimax-project-areas/test_time_is_moscow.py
+      - name: Приёмка окна глазами (окно умеет снимать свои вкладки)
+        run: python3 tools/minimax-project-areas/test_window_smoke_ui.py

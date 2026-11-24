@@ -37,11 +37,20 @@ import minigen_tools as tools          # noqa: E402
 
 
 class FakeCore:
-    """Мини-ядро: свои области, свой журнал, свой каталог."""
+    """Мини-ядро: свои области, свой журнал, свой каталог.
+
+    ⚠️ Подпись `fmt_ms` — **как в боевом ядре**: ОДИН аргумент (формат зашит
+    в модуль времени). Раньше подставное ядро принимало два аргумента и
+    прятало расхождение: мост звал `fmt_ms(ms, формат)`, боевое ядро — нет,
+    и `state.snapshot` падал в бою, а в тестах проходил (живой случай
+    24.11: окно показывало «0 областей», «демоны 0/0»).
+    """
 
     def __init__(self, journal: Path, areas: list | None = None) -> None:
         self.JOURNAL = journal
         self._areas = areas or []
+        self.CONFIG = journal.parent / "config.json"
+        self.NET_STATE = journal.parent / "net-state.json"
 
     def areas(self) -> list:
         return self._areas
@@ -49,9 +58,15 @@ class FakeCore:
     def running_areas(self) -> set:
         return {"p-brain"}
 
-    def fmt_ms(self, ms: int, fmt: str = "%d.%m %H:%M:%S") -> str:
+    def fmt_ms(self, ms: int) -> str:
         """Время — по Москве, как в настоящем ядре (заказ владельца 24.11)."""
-        return datetime.fromtimestamp(int(ms or 0) / 1000, MSK).strftime(fmt)
+        return datetime.fromtimestamp(int(ms or 0) / 1000, MSK).strftime("%d.%m %H:%M:%S")
+
+    def read_state(self, path) -> dict:
+        return {}
+
+    def net_config(self) -> dict:
+        return {}
 
 
 class JournalTest(unittest.TestCase):
@@ -146,6 +161,58 @@ class StatsTest(unittest.TestCase):
         lines = state.read_journal(self.mods, limit=50, contains="ротирую")
         self.assertEqual(len(lines), 1)
         self.assertIn("ротирую", lines[0]["text"])
+
+
+class SnapshotTest(unittest.TestCase):
+    """Снимок — то, что показывает окно. Он обязан быть полным.
+
+    ⚠️ Живой случай 24.11: команда `state.snapshot` падала (TypeError в
+    `fmt_ms`), мост отдавал «успешный» пустой ответ — и окно показывало
+    «0 областей», «демоны 0/0», «надзирателя нет», не сказав ни слова о
+    поломке. Поэтому снимок проверяем целиком, на боевой подписи ядра.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.journal = root / "journal.log"
+        self.journal.write_text("[2026-11-24 10:00:00] СЕТЬ: путь живой\n",
+                                encoding="utf-8")
+        core = FakeCore(self.journal, areas=[
+            {"slug": "brain2", "title": "Управляющий", "dir": Path("p-brain2")},
+            {"slug": "matricarmz", "title": "Матрица", "dir": Path("p-matricarmz")},
+        ])
+        core.CONFIG.write_text(json.dumps({"projects": []}), encoding="utf-8")
+        self.mods = {"core": core}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_snapshot_has_areas_and_daemons(self) -> None:
+        snap = state.snapshot(self.mods, include_sessions=False)
+        self.assertEqual(len(snap["areas"]), 2)
+        self.assertIsInstance(snap["daemons"], dict)
+        self.assertIn("daemons", snap["daemons"])
+        self.assertIn("stats", snap)
+
+    def test_snapshot_survives_core_signature(self) -> None:
+        """Подпись ядра — как в бою: `fmt_ms(ms)`, без второго аргумента."""
+        with self.assertRaises(TypeError):
+            self.mods["core"].fmt_ms(int(time.time() * 1000), "%Y-%m-%d %H:%M:%S")
+        # …и снимок при этом собирается.
+        state.snapshot(self.mods, include_sessions=False)
+
+
+class MskStampTest(unittest.TestCase):
+    """Граница окна статистики — по Москве, в формате журнала."""
+
+    def test_stamp_matches_moscow(self) -> None:
+        ms = int(time.time() * 1000)
+        stamp = state.msk_stamp(ms)
+        self.assertRegex(stamp, r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+        # Москва — фиксированное смещение +3, независимо от зоны машины.
+        self.assertEqual(stamp, datetime.fromtimestamp(ms / 1000, MSK).strftime(
+            "%Y-%m-%d %H:%M:%S"))
 
 
 class DaemonDirTest(unittest.TestCase):

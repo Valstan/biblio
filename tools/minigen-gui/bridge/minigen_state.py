@@ -167,6 +167,33 @@ def write_settings(patch: dict[str, Any]) -> dict[str, Any]:
     return cur
 
 
+# ────────────────────────────────────────────────────────────────── время
+
+# Формат метки времени в боевом журнале: «[2026-11-24 16:29:01] ТЕГ: текст».
+JOURNAL_TS_FMT = "%Y-%m-%d %H:%M:%S"
+
+
+def msk_stamp(ms: int) -> str:
+    """Метка времени по Москве — в формате журнала.
+
+    ⚠️ У ядра `fmt_ms(ms)` — **один** аргумент: формат зашит в модуль
+    времени. Мост раньше звал `fmt_ms(ms, формат)` ⇒ `TypeError` ⇒ команда
+    `state.snapshot` падала, а мост отдавал «успешный» пустой ответ — и
+    окно показывало «0 областей», «демоны 0/0», «надзирателя нет», хотя
+    демоны живы (живой случай 24.11). Теперь формат задаём здесь, а время
+    берём из общего модуля времени — того же, что у ядра и демонов.
+    """
+    try:
+        import minigen_time as mtime
+        return mtime.fmt_ms(ms, JOURNAL_TS_FMT)
+    except Exception:  # noqa: BLE001
+        pass
+    # Запасной путь — та же Москва (UTC+3), но без модуля времени.
+    from datetime import datetime, timedelta, timezone
+    msk = timezone(timedelta(hours=3), "MSK")
+    return datetime.fromtimestamp(int(ms or 0) / 1000, msk).strftime(JOURNAL_TS_FMT)
+
+
 # ──────────────────────────────────────────────────────────────── области
 
 def read_projects() -> dict[str, Any]:
@@ -542,7 +569,8 @@ def stats_summary(mods: dict[str, Any], days: int = 7) -> dict[str, Any]:
     # Граница окна — **по Москве** (заказ владельца 24.11): журнал пишется в
     # московском времени, значит и фильтр должен быть московским, а не
     # «локальным» (на другой машине окно статистики поехало бы на часы).
-    since_ts = mods["core"].fmt_ms(int(since * 1000), "%Y-%m-%d %H:%M:%S")
+    # Формат задаёт мост (у ядра он зашит), время — общее модуль времени.
+    since_ts = msk_stamp(int(since * 1000))
     lines = read_journal(mods, limit=20000, since=since_ts)
     slugs = [a["slug"] for a in mods["core"].areas()]
     per_area: dict[str, dict[str, Any]] = {}

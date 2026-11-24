@@ -83,6 +83,20 @@ def _run(cmd: list[str], timeout: int = 180) -> dict[str, Any]:
     }
 
 
+def reply(req_id: Any, data: dict[str, Any]) -> dict[str, Any]:
+    """Ответ моста по протоколу JSON-lines.
+
+    ⚠️ Команда, которая **упала**, — это ошибка протокола (`ok: false`),
+    а не «успешный» ответ с пустым содержимым. Иначе окно получало вместо
+    снимка пустоту и молча показывало «0 областей», «демоны 0/0» — а что
+    сломалось, не говорило (живой случай 24.11).
+    """
+    if isinstance(data, dict) and data.pop("__failed__", False):
+        return {"id": req_id, "ok": False,
+                "error": str(data.get("error") or "команда не сработала")}
+    return {"id": req_id, "ok": True, "data": data}
+
+
 class Bridge:
     """Программа «МиниГен» без окна: команды, состояние, чат."""
 
@@ -208,11 +222,15 @@ class Bridge:
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         handler = self.handlers.get(cmd)
         if handler is None:
-            return {"error": "неизвестная команда: %s" % cmd}
+            return {"error": "неизвестная команда: %s" % cmd, "__failed__": True}
         try:
             result = handler(args or {})
         except Exception as exc:  # noqa: BLE001
-            result = {"error": "%s: %s" % (type(exc).__name__, exc)}
+            # Помечаем: команда УПАЛА. Протокол обязан сказать об этом
+            # честно (`ok: false`), а не отдать «успешный» пустой ответ —
+            # иначе окно показывает нули и молчит о поломке (живой случай
+            # 24.11: `fmt_ms()` — TypeError, а в шапке «0 областей»).
+            result = {"error": "%s: %s" % (type(exc).__name__, exc), "__failed__": True}
         self._report_call(cmd, result)
         return result
 
@@ -934,7 +952,7 @@ def main() -> int:
         cmd = str(req.get("cmd") or "")
         args = req.get("args") or {}
         data = bridge.dispatch(cmd, args)
-        out.write(json.dumps({"id": req_id, "ok": True, "data": data},
+        out.write(json.dumps(reply(req_id, data),
                              ensure_ascii=False, default=str) + "\n")
         out.flush()
     return 0

@@ -117,11 +117,17 @@ class FakeCore:
             out.append(item)
         return out[:max(int(limit or 1), 1)]
 
-    def fmt_ms(self, ms: int, fmt: str = "%d.%m %H:%M:%S") -> str:
-        """Время — по Москве, как в настоящем ядре (заказ владельца 24.11)."""
+    def fmt_ms(self, ms: int) -> str:
+        """Время — по Москве, как в настоящем ядре (заказ владельца 24.11).
+
+        ⚠️ Подпись — **один аргумент**, как в бою: формат зашит в модуль
+        времени. Подставное ядро с двумя аргументами прятало расхождение
+        с боевым (живой случай 24.11: `state.snapshot` падал в бою и
+        проходил в тестах).
+        """
         from datetime import datetime, timedelta, timezone
         msk = timezone(timedelta(hours=3), "MSK")
-        return datetime.fromtimestamp(int(ms or 0) / 1000, msk).strftime(fmt)
+        return datetime.fromtimestamp(int(ms or 0) / 1000, msk).strftime("%d.%m %H:%M:%S")
 
 
 def _bridge(core: FakeCore, handlers: dict | None = None) -> object:
