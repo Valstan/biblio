@@ -41,6 +41,7 @@ sys.path.insert(0, str(HERE))
 import minigen_state as state          # noqa: E402
 import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
+import minigen_clone as clone_mod      # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
 import minigen_lock as minigen_lock    # noqa: E402
 import minigen_lineage as lineage      # noqa: E402
@@ -177,6 +178,10 @@ class Bridge:
             "reports.list": self.cmd_reports_list,
             # родословная копии: кто эта копия и от какой версии форк
             "lineage.show": self.cmd_lineage_show,
+            # свой клон копии на GitHub (заказ владельца 24.11)
+            "clone.status": self.cmd_clone_status,
+            "clone.setup": self.cmd_clone_setup,
+            "clone.sync": self.cmd_clone_sync,
         }
 
     # Команды, чей вызов **не** отчитывается в «ящик отчётов»: иначе
@@ -576,6 +581,25 @@ class Bridge:
                                                   days=int(args.get("days") or 7)))
 
     # ──────────────────────────────────────────────────────── ящик отчётов
+    def cmd_clone_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Свой клон копии: где он, какие репозитории, что в родословной."""
+        return state.jsonable(clone_mod.status())
+
+    def cmd_clone_setup(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Завести репозиторий копии на GitHub и взять клон (+ пул генов).
+
+        Опасное действие: создаёт репозитории в аккаунте владельца — только
+        после подтверждения.
+        """
+        return state.jsonable(clone_mod.setup(
+            upstream=str(args.get("upstream") or clone_mod.DEFAULT_UPSTREAM),
+            pool=str(args.get("pool") or clone_mod.DEFAULT_POOL),
+            private=bool(args.get("private", True))))
+
+    def cmd_clone_sync(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Обновить клон и пул (fast-forward, локальные правки не трогаем)."""
+        return state.jsonable(clone_mod.sync())
+
     def cmd_lineage_show(self, args: dict[str, Any]) -> dict[str, Any]:
         """Родословная этой копии: кто она, от какой версии форк, что приняла."""
         return {"lineage": lineage.genealogy()}
