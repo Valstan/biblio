@@ -248,3 +248,67 @@ export interface BridgeEvent {
   message: string
   alive: boolean
 }
+
+/**
+ * Карта родословной: паутина копий «МиниГена» и генов между ними
+ * (заказ владельца 24.11). Собирается из пула наработок: каждая копия
+ * дописывает в пул свои связи (рождение, публикация гена, внедрение чужого).
+ */
+export interface GeneMapCopy {
+  instance: string
+  generation: number
+  born_at: number
+  fork_commit: string
+  parent: { instance?: string; gene?: string; commit?: string }
+  genes_made: string[]
+  genes_taken: string[]
+  taken_by: string[]
+  repo: string
+  upstream: string
+  is_self: boolean
+}
+
+export interface GeneMapGene {
+  id: string
+  author: string
+  title: string
+  summary: string
+  base_commit: string
+  created_at: number
+  state: 'published' | 'adopted' | 'retracted' | string
+  taken_by: string[]
+  replaced_by: string
+  why_retracted: string
+}
+
+export interface GeneMapEdge {
+  from: string
+  to: string
+  kind: 'made' | 'took' | 'born' | 'forked' | 'replaced' | string
+}
+
+export interface GeneMap {
+  self: {
+    instance: string
+    generation: number
+    born_at: number
+    fork_commit: string
+    parent: { instance?: string; gene?: string; commit?: string }
+    repo: string
+    upstream: string
+  }
+  copies: GeneMapCopy[]
+  genes: GeneMapGene[]
+  edges: GeneMapEdge[]
+  stats: {
+    copies: number
+    genes: number
+    links: number
+    events: number
+    made: number
+    took: number
+  }
+  pool: string
+  pool_ready: boolean
+  note: string
+}

@@ -43,6 +43,7 @@ import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
 import minigen_clone as clone_mod      # noqa: E402
 import minigen_genes as genes_mod      # noqa: E402
+import minigen_map as map_mod          # noqa: E402
 import minigen_update as update_mod    # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
 import minigen_lock as minigen_lock    # noqa: E402
@@ -180,6 +181,8 @@ class Bridge:
             "reports.list": self.cmd_reports_list,
             # родословная копии: кто эта копия и от какой версии форк
             "lineage.show": self.cmd_lineage_show,
+            # карта паутины копий и генов (заказ владельца 24.11)
+            "map.show": self.cmd_map_show,
             # свой клон копии на GitHub (заказ владельца 24.11)
             "clone.status": self.cmd_clone_status,
             "clone.setup": self.cmd_clone_setup,
@@ -637,6 +640,10 @@ class Bridge:
     def cmd_lineage_show(self, args: dict[str, Any]) -> dict[str, Any]:
         """Родословная этой копии: кто она, от какой версии форк, что приняла."""
         return {"lineage": lineage.genealogy()}
+
+    def cmd_map_show(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Карта паутины: копии, гены и связи между ними (из пула)."""
+        return state.jsonable(map_mod.build())
 
     # ─────────────────────────────────────────────────────── обновление
     def cmd_update_status(self, args: dict[str, Any]) -> dict[str, Any]:
