@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import type { DaemonStatus, ProgramVersion, Settings, Snapshot } from '@shared/types'
 import { api } from '../api'
+import { TZ_LABEL, formatDateTime } from '../time'
 
 interface Props {
   settings: Settings | null
@@ -62,9 +63,13 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
               <td className="muted">
                 {version?.commit ? `коммит ${version.commit}` : 'неизвестна'}
                 {version?.installed_at
-                  ? ` · установлено ${new Date(version.installed_at).toLocaleString('ru-RU')}`
+                  ? ` · установлено ${formatDateTime(version.installed_at)}`
                   : ''}
               </td>
+            </tr>
+            <tr>
+              <td>Время</td>
+              <td className="muted">{TZ_LABEL}</td>
             </tr>
             <tr>
               <td>Запущена из</td>
@@ -79,6 +84,12 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
         <p className="muted small">
           Программа стоит отдельно от репозитория — её версия не зависит от того,
           какая ветка checkout в исходниках.
+        </p>
+        <p className="muted small">
+          Время программа везде считает и показывает по часовому поясу{' '}
+          <strong>{TZ_LABEL}</strong>: журнал, статистика, шаги обновления,
+          «установлено» — всё в нём, независимо от зоны машины, на которой
+          программа стоит.
         </p>
       </div>
 

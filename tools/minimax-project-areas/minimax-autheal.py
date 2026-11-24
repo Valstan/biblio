@@ -56,6 +56,12 @@ import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Время программы — везде Москва, Россия (UTC+3) (заказ владельца 24.11).
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import minigen_time as mtime  # noqa: E402
+
 BIN = Path(r"C:\Users\valstan\bin")
 CONFIG = BIN / "mcode-project-areas.json"
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT", r"C:\Users\valstan\.minimax-areas"))
@@ -182,7 +188,7 @@ def _core():
 
 
 def log(msg: str) -> None:
-    line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    line = "[%s] %s" % (mtime.fmt_now(), msg)
     print(line, flush=True)
     try:
         JOURNAL.parent.mkdir(parents=True, exist_ok=True)
@@ -235,7 +241,7 @@ def config() -> dict:
 
 
 def _fmt(ms) -> str:
-    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m %H:%M:%S") if ms else "—"
+    return mtime.fmt_ms(ms)
 
 
 # ────────────────────────────────────────────────────────── области
@@ -643,7 +649,7 @@ def next_karman_reset() -> tuple:
 
     Возвращает (ближайший_сброс, полный_пул).
     """
-    now = datetime.now()
+    now = mtime.now()
     cands = []
     for hour in (0, 3):
         t = now.replace(hour=hour, minute=0, second=0, microsecond=0)
@@ -1805,7 +1811,7 @@ def show_status() -> int:
     areas = all_areas()
     switch = load_switch()
     running = switch.running_areas() or set()
-    print("МиниГен — авто-лечение: %s" % datetime.now().strftime("%d.%m.%Y %H:%M:%S"))
+    print("МиниГен — авто-лечение: %s" % mtime.fmt_now("%d.%m.%Y %H:%M:%S"))
     print("%-13s %-9s %-8s %-13s %-13s %s" % (
         "область", "присмотр", "аккаунт", "установлен", "последний отказ", "вердикт"))
     for area in areas:

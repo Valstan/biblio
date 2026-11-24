@@ -55,6 +55,12 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+# Время программы — везде Москва, Россия (UTC+3) (заказ владельца 24.11).
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import minigen_time as mtime  # noqa: E402
+
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT", r"C:\Users\valstan\.minimax-areas"))
 PROJECTS_JSON = Path(os.environ.get("MINIMAX_PROJECTS_JSON", r"C:\Users\valstan\bin\mcode-project-areas.json"))
 SECRETS_ENV = Path(os.environ.get("MINIMAX_SECRETS_ENV", str(Path.home() / ".brain_matrica" / "secrets.env")))
@@ -189,7 +195,7 @@ def write_meta(area: Path, email: str = "", karman_id=None) -> None:
     if karman_id is not None:
         data["karman_account_id"] = int(karman_id)
     data["project"] = area_project(area)
-    data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    data["updated_at"] = mtime.fmt_now("%Y-%m-%dT%H:%M:%S")
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -874,7 +880,7 @@ def meta_update(area: Path, extra: dict) -> None:
     except (OSError, ValueError):
         data = {}
     data.update(extra)
-    data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    data["updated_at"] = mtime.fmt_now("%Y-%m-%dT%H:%M:%S")
     p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -905,7 +911,7 @@ def cmd_report(args) -> int:
         if ok:
             meta_update(area, {"reported_activation": {
                 "day_no": day, "email": email, "points": points,
-                "at": time.strftime("%Y-%m-%dT%H:%M:%S")}})
+                "at": mtime.fmt_now("%Y-%m-%dT%H:%M:%S")}})
             print("  %s: клетка %s, %s очков → Карману: да" % (area.name, day, points))
             sent.append(area.name)
         elif "не выдавали" in why or "не найдена" in why:
@@ -916,7 +922,7 @@ def cmd_report(args) -> int:
             meta_update(area, {"reported_activation": {
                 "day_no": day, "email": email, "points": points,
                 "skipped": "карман не выдавал сегодня",
-                "at": time.strftime("%Y-%m-%dT%H:%M:%S")}})
+                "at": mtime.fmt_now("%Y-%m-%dT%H:%M:%S")}})
             print("  %s: клетка %s, %s очков → Карману: нечего докладывать "
                   "(аккаунт выдан не сегодня)" % (area.name, day, points))
             skipped.append(area.name)

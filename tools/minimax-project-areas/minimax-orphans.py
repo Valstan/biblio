@@ -34,11 +34,17 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# Время программы — везде Москва, Россия (UTC+3) (заказ владельца 24.11).
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+import minigen_time as mtime  # noqa: E402
+
 # Каталог областей: по умолчанию — машина владельца, но путь переопределяется
 # переменной окружения (как у minimax-autheal.py), чтобы копия работала и там,
 # где мини-менеджер лежит в другом месте.
 ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT", r"C:\Users\valstan\.minimax-areas"))
-f = lambda ms: datetime.fromtimestamp(ms / 1000).strftime("%d.%m %H:%M:%S") if ms else "—"
+f = lambda ms: mtime.fmt_ms(ms)
 
 
 def child_state(con, session_id):

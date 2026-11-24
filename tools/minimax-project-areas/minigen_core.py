@@ -35,9 +35,26 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import time
 from datetime import datetime
 from pathlib import Path
+
+# Каталог ядра — в путь импорта: ядро грузят и как скрипт, и по пути
+# (importlib в тестах и в мосте), а `minigen_time` лежит рядом.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+import minigen_time as mtime
+
+# Время программы — везде Москва, Россия (UTC+3) (заказ владельца 24.11).
+# Одна реализация на всех: ядро, демоны и мост берут её отсюда.
+MSK = mtime.MSK
+TZ_NAME = mtime.TZ_NAME
+TZ_LABEL = mtime.TZ_LABEL
+now = mtime.now
+now_ms = mtime.now_ms
 
 BIN = Path(r"C:\Users\valstan\bin")
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT", r"C:\Users\valstan\.minimax-areas"))
@@ -62,7 +79,7 @@ def log(msg: str) -> None:
     Заодно строка попадает в «ящик отчётов» — чтобы нейросеть видела работу
     сторожей, не выспрашивая журнал по частям.
     """
-    line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
+    line = "[%s] %s" % (mtime.fmt_now(), msg)
     print(line, flush=True)
     try:
         JOURNAL.parent.mkdir(parents=True, exist_ok=True)
@@ -456,9 +473,8 @@ def respawn_self() -> None:
 
 
 def fmt_ms(ms: int) -> str:
-    if not ms:
-        return "—"
-    return datetime.fromtimestamp(ms / 1000).strftime("%d.%m %H:%M:%S")
+    """Метка времени → по Москве (везде в программе одно правило)."""
+    return mtime.fmt_ms(ms)
 
 
 # ────────────────────────────────────────────────────────── прокси и окружение

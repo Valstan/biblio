@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import type { UpdateState } from '@shared/types'
 import { api, desktop } from '../api'
 import { describeUpdate, formatInstalledAt } from './update-view'
+import { formatTime } from '../time'
 
 /**
  * Вкладка «Обновление» — наглядный процесс обновления программы.
@@ -162,7 +163,7 @@ export default function UpdateTab() {
                 .map((step, index) => (
                   <tr key={`${step.ts}-${index}`}>
                     <td style={{ width: 90 }} className="muted small">
-                      {new Date(step.ts).toLocaleTimeString('ru-RU')}
+                      {formatTime(step.ts)}
                     </td>
                     <td style={{ width: 110 }} className="muted small">
                       {step.step}

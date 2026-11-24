@@ -117,6 +117,12 @@ class FakeCore:
             out.append(item)
         return out[:max(int(limit or 1), 1)]
 
+    def fmt_ms(self, ms: int, fmt: str = "%d.%m %H:%M:%S") -> str:
+        """Время — по Москве, как в настоящем ядре (заказ владельца 24.11)."""
+        from datetime import datetime, timedelta, timezone
+        msk = timezone(timedelta(hours=3), "MSK")
+        return datetime.fromtimestamp(int(ms or 0) / 1000, msk).strftime(fmt)
+
 
 def _bridge(core: FakeCore, handlers: dict | None = None) -> object:
     """Мост без тяжёлой инициализации: только то, что нужно для отчётов."""

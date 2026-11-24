@@ -539,7 +539,10 @@ def stats_summary(mods: dict[str, Any], days: int = 7) -> dict[str, Any]:
     записано, что сторож делал. Состояние сессий — из живой классификации.
     """
     since = time.time() - max(days, 1) * 86400
-    since_ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(since))
+    # Граница окна — **по Москве** (заказ владельца 24.11): журнал пишется в
+    # московском времени, значит и фильтр должен быть московским, а не
+    # «локальным» (на другой машине окно статистики поехало бы на часы).
+    since_ts = mods["core"].fmt_ms(int(since * 1000), "%Y-%m-%d %H:%M:%S")
     lines = read_journal(mods, limit=20000, since=since_ts)
     slugs = [a["slug"] for a in mods["core"].areas()]
     per_area: dict[str, dict[str, Any]] = {}
