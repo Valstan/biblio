@@ -15,7 +15,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'areas', label: 'Области' },
   { id: 'stats', label: 'Статистика' },
   { id: 'network', label: 'Сеть' },
-  { id: 'chat', label: 'Чат' },
+  { id: 'chat', label: 'Управляющий' },
   { id: 'journal', label: 'Журнал' },
   { id: 'settings', label: 'Настройки' }
 ]
