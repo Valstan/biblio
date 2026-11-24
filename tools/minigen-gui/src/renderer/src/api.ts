@@ -4,6 +4,7 @@ import type {
   DaemonStatus,
   GeneMap,
   JournalLine,
+  LineageInfo,
   ModelCatalog,
   NetworkState,
   ProgramVersion,
@@ -62,6 +63,7 @@ export const api = {
   chatReset: () => call<{ ok: boolean }>('chat.reset'),
   daemonsStatus: () => call<DaemonStatus>('daemons.status'),
   programVersion: () => call<ProgramVersion>('program.version'),
+  lineageShow: () => call<{ lineage: LineageInfo }>('lineage.show'),
   mapShow: () => call<GeneMap>('map.show'),
   modelCatalog: (area?: string) => call<ModelCatalog>('model.catalog', area ? { area } : {}),
   modelApply: (args: { model?: string; modelContext?: number; modelEffort?: string; areas?: string[] }) =>

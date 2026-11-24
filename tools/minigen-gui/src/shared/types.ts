@@ -250,6 +250,26 @@ export interface BridgeEvent {
 }
 
 /**
+ * Родословная копии (ответ моста `lineage.show`).
+ */
+export interface LineageInfo {
+  instance: {
+    instance_id?: string
+    family?: string
+    generation?: number
+    birth?: number
+    fork_of?: { commit?: string; installed_at?: number }
+    parent?: { instance?: string; gene?: string; commit?: string }
+    genes?: { gene?: string; from?: string; commit?: string; ts?: number }[]
+    copy_repo?: string
+    upstream?: string
+  }
+  history?: { ts?: number; event?: string; [key: string]: unknown }[]
+  instance_file?: string
+  ledger_file?: string
+}
+
+/**
  * Карта родословной: паутина копий «МиниГена» и генов между ними
  * (заказ владельца 24.11). Собирается из пула наработок: каждая копия
  * дописывает в пул свои связи (рождение, публикация гена, внедрение чужого).
