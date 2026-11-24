@@ -48,17 +48,98 @@ LOCAL = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web"
 JOURNAL = LOCAL / "journal.log"
 NET_STATE = LOCAL / "netwatch-state.json"
 SESSION_STATE = LOCAL / "sessionwatch-state.json"
+# «Ящик отчётов» (заказ владельца 24.11): сторожи и инструменты отчитываются
+# сюда, а встроенная нейросеть «Управляющий» читает эти отчёты.
+REPORTS = LOCAL / "reports.jsonl"
+REPORTS_MAX_BYTES = 512 * 1024      # больше — подрезаем хвост
+REPORTS_KEEP_LINES = 800
 
 # ────────────────────────────────────────────────────────── журнал и состояние
 
 def log(msg: str) -> None:
-    """Строка в общий журнал «МиниГена» (его же читает панель)."""
+    """Строка в общий журнал «МиниГена» (его же читает панель).
+
+    Заодно строка попадает в «ящик отчётов» — чтобы нейросеть видела работу
+    сторожей, не выспрашивая журнал по частям.
+    """
     line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
     print(line, flush=True)
     try:
         JOURNAL.parent.mkdir(parents=True, exist_ok=True)
         with JOURNAL.open("a", encoding="utf-8") as fh:
             fh.write(line + "\n")
+    except OSError:
+        pass
+    report("info", "log", msg)
+
+
+def report(level: str, kind: str, text: str, area: str = "") -> None:
+    """Отчёт о работе программы — в «ящик отчётов».
+
+    Отчёт — это **не** журнал: он короткий, с уровнем (info/warn/error) и
+    видом (log/tool/network/heal/session). Их читает встроенная нейросеть
+    (инструмент `reports.recent` и автоподача в чат).
+
+    Никогда не бросает: отчёт — дополнительный канал, его поломка не должна
+    ломать саму работу.
+    """
+    record = {"ts": now_ms(), "level": (level or "info")[:16],
+              "kind": (kind or "log")[:24], "area": (area or "")[:64],
+              "text": (text or "")[:900]}
+    try:
+        REPORTS.parent.mkdir(parents=True, exist_ok=True)
+        with REPORTS.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError:
+        return
+    _trim_reports()
+
+
+def reports(limit: int = 50, level: str = "", since_ms: int = 0) -> list:
+    """Последние отчёты, **новые — первыми** (как `tail`). Только чтение."""
+    try:
+        if not REPORTS.is_file():
+            return []
+        lines = REPORTS.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if level and str(rec.get("level") or "") != level:
+            continue
+        if since_ms and int(rec.get("ts") or 0) <= int(since_ms):
+            continue
+        out.append(rec)
+        if len(out) >= max(int(limit or 0), 1):
+            break
+    return out
+
+
+def _trim_reports() -> None:
+    """Не дать «ящику отчётов» расти бесконечно.
+
+    Дешёвая проверка — по размеру файла (чтение целиком на каждой записи
+    было бы лишней работой на каждый вызов `log`).
+    """
+    try:
+        if not REPORTS.is_file():
+            return
+        if REPORTS.stat().st_size < REPORTS_MAX_BYTES:
+            return
+        lines = REPORTS.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) <= REPORTS_KEEP_LINES:
+            return
+        keep = lines[-REPORTS_KEEP_LINES:]
+        tmp = REPORTS.with_suffix(".tmp")
+        tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+        os.replace(str(tmp), str(REPORTS))
     except OSError:
         pass
 

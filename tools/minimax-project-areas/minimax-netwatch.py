@@ -1036,8 +1036,12 @@ def cycle(cfg: dict, state: dict, dry_run: bool = False) -> dict:
                 alive = [p for p in probes if p.get("alive")]
                 report["probes"] = probes
                 core.log("СЕТЬ: прокси починен (%s) — связь возвращена" % rep.get("path"))
+                core.report("info", "network", "прокси починен (%s) — связь возвращена"
+                            % rep.get("path"))
             else:
                 core.log("СЕТЬ: прокси починить не удалось: %s" % rep.get("why"))
+                core.report("error", "network", "прокси починить не удалось: %s"
+                            % rep.get("why"))
         state["last_run"] = report
         core.write_state(core.NET_STATE, state)
         return report
@@ -1070,6 +1074,7 @@ def cycle(cfg: dict, state: dict, dry_run: bool = False) -> dict:
         else:
             report["action"] = "каскад восстановления"
             core.log("СЕТЬ: ни один путь не отвечает — начинаю восстановление")
+            core.report("error", "network", "ни один путь не отвечает — начинаю восстановление")
             state["last_recover"] = int(time.time())
             if not dry_run:
                 report["recovery"] = recover(cfg, state, dry_run=False)

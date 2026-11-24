@@ -161,6 +161,26 @@ def save_cooldowns() -> None:
         pass
 
 
+_core_mod = None
+
+
+def _core():
+    """Ядро «МиниГена» — для «ящика отчётов» (ленивая загрузка).
+
+    Лечащий намеренно живёт без ядра: ядро поднимает модули, а лечащий
+    работает, даже если ядро сломано. Поэтому ядро here — мягкая зависимость:
+    отчёт не получился — значит просто нет отчёта.
+    """
+    global _core_mod
+    if _core_mod is None:
+        try:
+            import minigen_core as core_mod
+            _core_mod = core_mod
+        except Exception:  # noqa: BLE001
+            _core_mod = False
+    return _core_mod or None
+
+
 def log(msg: str) -> None:
     line = "[%s] %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
     print(line, flush=True)
@@ -170,6 +190,13 @@ def log(msg: str) -> None:
             fh.write(line + "\n")
     except OSError:
         pass
+    # Отчёт о работе лечащего — в «ящик отчётов» (его читает нейросеть).
+    core = _core()
+    if core is not None:
+        try:
+            core.report("info", "heal", msg)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 _switch_cache = {}
@@ -1555,8 +1582,21 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
     rc, why = pull_account(switch, area)
     if rc != 0:
         log("%s: %s — ждём, повторов не гоним" % (area["title"], why))
+        core = _core()
+        if core is not None:
+            try:
+                core.report("warn", "heal", "%s: %s — ждём, повторов не гоним"
+                            % (area["title"], why))
+            except Exception:  # noqa: BLE001
+                pass
         return False, why
     log("%s: аккаунт получен (%s)" % (area["title"], why))
+    core = _core()
+    if core is not None:
+        try:
+            core.report("info", "heal", "%s: аккаунт получен (%s)" % (area["title"], why))
+        except Exception:  # noqa: BLE001
+            pass
     _state["pulls"].setdefault(slug, []).append(time.time())
     _state["pulls"][slug] = [t for t in _state["pulls"][slug] if time.time() - t < 86400]
     # Счётчик «активационной лавины»: 5+ аккаунтов на проект за 3 минуты ⇒
