@@ -112,6 +112,14 @@ def list_genes() -> list[dict[str, Any]]:
     return out
 
 
+def _read_patch_bytes(gene: str) -> bytes:
+    """Патч гена — байтами (как его записал git)."""
+    try:
+        return (_manifest(gene).parent / "patch.diff").read_bytes()
+    except OSError:
+        return b""
+
+
 def read_gene(gene: str) -> dict[str, Any]:
     """Ген целиком: манифест, заметка и diff (diff — с обрезкой)."""
     directory = _manifest(gene).parent
@@ -131,20 +139,32 @@ def read_gene(gene: str) -> dict[str, Any]:
     return result
 
 
-def _current_diff() -> tuple[str, list[str]]:
-    """Diff текущей правки копии (worktree правки или текущая ветка клона)."""
+def _current_diff() -> tuple[bytes, list[str]]:
+    """Diff текущей правки копии (worktree правки или текущая ветка клона).
+
+    ⚠️ Diff берётся **сырыми байтами**: текстовый режим срезает финальный
+    перевод строки, и git apply такой патч считает битым («corrupt patch»).
+    """
     import minigen_clone
     worktree = code.current_worktree()
     if worktree is not None:
-        res = _git(["diff", "master"], worktree, timeout=180)
-        files = code.changed_files(worktree)
-        return res.get("out") or "", files
+        return _git_bytes(["diff", "master"], worktree), code.changed_files(worktree)
     clone = minigen_clone.CLONE_DIR
     if (clone / ".git").is_dir():
-        res = _git(["diff", "HEAD"], clone, timeout=180)
-        files = code.changed_files(clone)
-        return res.get("out") or "", files
-    return "", []
+        return _git_bytes(["diff", "HEAD"], clone), code.changed_files(clone)
+    return b"", []
+
+
+def _git_bytes(args: list[str], cwd: Path, timeout: int = 180) -> bytes:
+    """Git без текстовой нормализации: байты вывода как есть."""
+    import subprocess
+    try:
+        proc = subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True,
+                              timeout=timeout,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.TimeoutExpired):
+        return b""
+    return proc.stdout or b""
 
 
 def publish(title: str, summary: str = "", notes: str = "",
@@ -185,7 +205,9 @@ def publish(title: str, summary: str = "", notes: str = "",
     }
     (directory / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    (directory / "patch.diff").write_text(diff, encoding="utf-8")
+    # патч — байтами: текстовая запись срезает/ломает переводы строк, и git
+    # apply такой патч считает битым («corrupt patch» — живой случай 24.11)
+    (directory / "patch.diff").write_bytes(diff)
     (directory / "notes.md").write_text(
         (notes or summary or title).strip()[:MAX_NOTES], encoding="utf-8")
     add = _git(["add", "-A", GENES_DIR], pool_dir())
@@ -229,7 +251,7 @@ def adopt(gene: str, title: str = "") -> dict[str, Any]:
     payload = read_gene(gene)
     if payload.get("error"):
         return {"error": payload["error"]}
-    patch = str(payload.get("patch") or "")
+    patch = _read_patch_bytes(gene)
     if not patch.strip():
         return {"error": "ген без diff: %s" % gene}
     manifest = payload.get("manifest") or {}
@@ -240,7 +262,7 @@ def adopt(gene: str, title: str = "") -> dict[str, Any]:
     worktree = Path(created["worktree"])
     # патч — файлом (в git apply из stdin мы не умеем подсовывать данные)
     patch_file = worktree / ".gene.patch"
-    patch_file.write_text(patch, encoding="utf-8")
+    patch_file.write_bytes(patch)
     applied = _git(["apply", "--3way", str(patch_file)], worktree, timeout=180)
     try:
         patch_file.unlink()
