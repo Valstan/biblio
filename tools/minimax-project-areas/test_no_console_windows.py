@@ -168,14 +168,19 @@ def main() -> int:
     without_flag = visible_console_window(0)
     if with_flag is None:
         print("   пропущено (проверка только для Windows)")
+    elif not without_flag:
+        # ⚠️ В окружении нет консоли (агентская сессия, служба, терминал без
+        # окна): окно появиться не может НИ с флагом, НИ без него ⇒ сравнивать
+        # нечего, и требование «без флага окно должно появиться» ложно красное
+        # (живой случай 24.11: приёмка падала сама в агентской сессии).
+        print("   пропущено (в окружении нет консоли — сравнивать нечего)")
     else:
         check(with_flag == 0,
               "с CREATE_NO_WINDOW окно должно быть скрыто, а GetConsoleWindow=%s"
               % with_flag)
-        if without_flag is not None:
-            check(without_flag != 0,
-                  "без флага окно должно появляться (иначе проверка бессмысленна), "
-                  "а GetConsoleWindow=%s" % without_flag)
+        check(without_flag != 0,
+              "без флага окно должно появляться (иначе проверка бессмысленна), "
+              "а GetConsoleWindow=%s" % without_flag)
 
     if failures:
         print("❌ окна консоли: FAIL (%d)" % len(failures))
