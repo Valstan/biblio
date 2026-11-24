@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { writeFileSync } from 'fs'
 import { join } from 'path'
 import { Bridge } from './bridge'
+import { sendToWindow } from './window-events'
 
 /**
  * «МиниГен» — одно окно вместо браузера и набора скриптов.
@@ -48,7 +49,12 @@ function createWindow(): void {
 
   mainWindow.on('ready-to-show', () => {
     // В режиме без окна (автозапуск при входе в Windows) окно невидимо.
-    if (!daemonMode) mainWindow?.show()
+    if (!daemonMode && mainWindow && !mainWindow.isDestroyed()) mainWindow.show()
+  })
+  // Окно закрыто — ссылка на него больше не годится: события моста нельзя
+  // слать в уничтоженное окно (главный процесс падал именно на этом).
+  mainWindow.on('closed', () => {
+    mainWindow = null
   })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
@@ -64,7 +70,10 @@ function createWindow(): void {
 
 app.whenReady().then(() => {
   bridge = new Bridge((kind, message, alive) => {
-    mainWindow?.webContents.send('minigen:event', { kind, message, alive })
+    // ⚠️ Не `mainWindow?.webContents.send(...)`: окно может быть уже
+    // уничтожено (закрытие окна ⇒ мост умирает ⇒ шлёт последнее событие),
+    // и тогда главный процесс падал с «Object has been destroyed».
+    sendToWindow(mainWindow, 'minigen:event', { kind, message, alive })
   })
   bridge.start()
 
