@@ -43,6 +43,7 @@ import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
 import minigen_clone as clone_mod      # noqa: E402
 import minigen_genes as genes_mod      # noqa: E402
+import minigen_update as update_mod    # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
 import minigen_lock as minigen_lock    # noqa: E402
 import minigen_lineage as lineage      # noqa: E402
@@ -188,12 +189,18 @@ class Bridge:
             "genes.read": self.cmd_genes_read,
             "genes.publish": self.cmd_genes_publish,
             "genes.adopt": self.cmd_genes_adopt,
+            # обновление программы из окна (заказ владельца 24.11)
+            "update.status": self.cmd_update_status,
+            "update.check": self.cmd_update_check,
+            "update.start": self.cmd_update_start,
         }
 
     # Команды, чей вызов **не** отчитывается в «ящик отчётов»: иначе
     # нейросеть получала бы отчёты о собственных вопросах и о чтении
     # отчётов (шум вместо пользы).
-    NO_REPORT_CMDS = ("chat.", "reports.")
+    # ⚠️ `update.status` тоже: окно опрашивает его раз в секунду — в ящике
+    # отчётов было бы тысячи одинаковых записей.
+    NO_REPORT_CMDS = ("chat.", "reports.", "update.status")
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         handler = self.handlers.get(cmd)
@@ -630,6 +637,19 @@ class Bridge:
     def cmd_lineage_show(self, args: dict[str, Any]) -> dict[str, Any]:
         """Родословная этой копии: кто она, от какой версии форк, что приняла."""
         return {"lineage": lineage.genealogy()}
+
+    # ─────────────────────────────────────────────────────── обновление
+    def cmd_update_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Состояние обновления: что установлено, что в репозитории, идёт ли."""
+        return state.jsonable(update_mod.status())
+
+    def cmd_update_check(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Проверить, есть ли новая версия (с походом на сервер)."""
+        return state.jsonable(update_mod.check())
+
+    def cmd_update_start(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Обновить программу: исходники → сборка → раскатка (в фоне)."""
+        return state.jsonable(update_mod.start())
 
     def cmd_reports_list(self, args: dict[str, Any]) -> dict[str, Any]:
         """Отчёты сторожей и инструментов: что сделали и где ошиблись."""

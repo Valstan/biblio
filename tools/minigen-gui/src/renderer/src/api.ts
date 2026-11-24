@@ -8,7 +8,9 @@ import type {
   ProgramVersion,
   Settings,
   Snapshot,
-  Stats
+  Stats,
+  UpdateAvailable,
+  UpdateState
 } from '@shared/types'
 
 declare global {
@@ -17,6 +19,8 @@ declare global {
       call(cmd: string, args?: Record<string, unknown>): Promise<unknown>
       openExternal(path: string): Promise<boolean>
       saveText(name: string, content: string): Promise<{ ok: boolean; path: string; error?: string }>
+      relaunch(): Promise<boolean>
+      buildInfo(): Promise<{ commit: string }>
       smoke: { csv: string }
       onEvent(handler: (event: { kind: string; message: string; alive: boolean }) => void): () => void
     }
@@ -66,5 +70,14 @@ export const api = {
   daemonsStart: (name?: string) => call<unknown>('daemons.start', name ? { name } : {}),
   daemonsStop: (name?: string) => call<unknown>('daemons.stop', name ? { name } : {}),
   daemonsRestart: (name?: string) => call<unknown>('daemons.restart', name ? { name } : {}),
+  updateStatus: () => call<UpdateState>('update.status'),
+  updateCheck: () => call<UpdateAvailable>('update.check'),
+  updateStart: () => call<{ ok: boolean; why?: string; error?: string }>('update.start'),
   openFolder: (path: string) => call<{ ok: boolean; error?: string }>('app.open_folder', { path })
+}
+
+/** Действия окна (не моста): перезапуск и метка сборки. */
+export const desktop = {
+  buildInfo: () => window.minigen.buildInfo(),
+  relaunch: () => window.minigen.relaunch()
 }

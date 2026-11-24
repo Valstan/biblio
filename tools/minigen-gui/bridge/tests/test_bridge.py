@@ -20,6 +20,7 @@ import json
 import re
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -90,12 +91,22 @@ class StatsTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.journal = Path(self.tmp.name) / "journal.log"
+        # ⚠️ Живой случай 24.11: метки времени в журнале считались от «вчера
+        # 10:00», а окно статистики — «последние сутки» (сейчас минус день).
+        # Ровно в 10:00 вчерашние записи выпадали из окна, и тест падал сам
+        # собой — в зависимости от часов, а не от правки. Поэтому метки
+        # времени считаются от «сейчас».
+        now = time.time()
+
+        def stamp(offset: float) -> str:
+            return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now - offset))
+
         self.journal.write_text(
             "\n".join([
-                "[2026-11-23 10:00:00] СЕССИИ: brain2 — сессия abc сжата рантаймом, ротирую",
-                "[2026-11-23 10:05:00] СЕССИИ: p-matricarmz — перезапускаю область: отказ 50110",
-                "[2026-11-23 10:06:00] СЕТЬ: страна выхода US вместо NL — путь живой",
-                "[2026-11-23 10:07:00] помидоры",
+                "[%s] СЕССИИ: brain2 — сессия abc сжата рантаймом, ротирую" % stamp(300),
+                "[%s] СЕССИИ: p-matricarmz — перезапускаю область: отказ 50110" % stamp(200),
+                "[%s] СЕТЬ: страна выхода US вместо NL — путь живой" % stamp(100),
+                "[%s] помидоры" % stamp(50),
             ]),
             encoding="utf-8",
         )
