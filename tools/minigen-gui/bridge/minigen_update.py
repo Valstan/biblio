@@ -195,6 +195,34 @@ def _cached_available() -> dict[str, Any]:
     return value
 
 
+def _steps_from_log(limit: int = 40) -> list[dict[str, Any]]:
+    """Шаги из журнала на диске — окно после перезапуска видит историю.
+
+    ⚠️ Живой случай 24.11: владелец обновил программу, окно перезапустил, а
+    во вкладке было «Обновление ещё не запускали — журнал пуст»: шаги лежали
+    только в памяти процесса, который перезапустили. На диске они есть — их
+    и читаем.
+    """
+    out: list[dict[str, Any]] = []
+    try:
+        if not LOG_FILE.is_file():
+            return out
+        lines = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    except OSError:
+        return out
+    for line in lines:
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            record = json.loads(text)
+        except ValueError:
+            continue
+        if isinstance(record, dict) and record.get("step"):
+            out.append(record)
+    return out
+
+
 # ──────────────────────────────────────────────────────────────── статусы
 
 def status() -> dict[str, Any]:
@@ -203,6 +231,8 @@ def status() -> dict[str, Any]:
         steps = list(_steps)
         running = _running
         last = dict(_last)
+    if not steps:
+        steps = _steps_from_log()
     return {"running": running, "steps": steps, "installed": installed(),
             "available": _cached_available(), "last": last,
             "repo": str(repo_dir())}

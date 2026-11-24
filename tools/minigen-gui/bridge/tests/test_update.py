@@ -189,6 +189,20 @@ class UpdateTest(unittest.TestCase):
             self.assertIn(key, result)
         self.assertFalse(result["running"])
 
+    def test_steps_survive_a_window_restart(self) -> None:
+        """После перезапуска окна шаги берутся из журнала на диске.
+
+        Живой случай 24.11: окно перезапустили, а во вкладке было «обновление
+        ещё не запускали — журнал пуст», хотя обновление шло и журнал лежал.
+        """
+        update._log("build", "собираю окно")
+        update._log("build", "окно собрано", "ok")
+        with update._lock:
+            update._steps.clear()
+        result = update.status()
+        texts = [step.get("text") for step in result["steps"]]
+        self.assertIn("окно собрано", texts)
+
     def test_npm_command_goes_through_cmd_on_windows(self) -> None:
         """npm на Windows — это .cmd: его надо звать через cmd.exe."""
         command = update._npm(["run", "build"])
