@@ -380,15 +380,23 @@ def run_tests(target: str = "all", worktree: Path | None = None) -> dict[str, An
                       "out": (res.stderr or res.stdout or "")[-1200:]})
 
     if target in ("all", "panel"):
-        res = subprocess.run(
-            [os.environ.get("PYTHON", "python"),
-             str(worktree / "tools" / "minimax-project-areas" / "check_panel.py"),
-             "--source-only"],
-            cwd=str(worktree), capture_output=True, text=True, encoding="utf-8",
-            errors="replace", timeout=300,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        steps.append({"name": "приёмка панели", "ok": res.returncode == 0,
-                      "out": (res.stdout or "")[-1200:]})
+        # ⚠️ 24.11: путь был `minimax-project-areas/check_panel.py`, но приёмка
+        # лежит в `archive/` (старая панель архивирована). Файла не было ⇒ шаг
+        # всегда красный ⇒ нейросеть не могла открыть PR (у нас правило:
+        # красные проверки — не PR). Живой случай: правка в копии прошла
+        # проверки моста и окна, а «приёмка панели» ругалась на путь.
+        panel = worktree / "tools" / "minimax-project-areas" / "archive" / "check_panel.py"
+        if not panel.is_file():
+            steps.append({"name": "приёмка панели", "ok": False,
+                          "out": "нет файла приёмки: %s" % panel})
+        else:
+            res = subprocess.run(
+                [os.environ.get("PYTHON", "python"), str(panel), "--source-only"],
+                cwd=str(worktree), capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=300,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            steps.append({"name": "приёмка панели", "ok": res.returncode == 0,
+                          "out": (res.stdout or "")[-1200:]})
 
     if target in ("all", "race"):
         res = subprocess.run(
