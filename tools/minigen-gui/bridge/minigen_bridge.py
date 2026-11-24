@@ -28,10 +28,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -112,6 +114,53 @@ def reply(req_id: Any, data: dict[str, Any]) -> dict[str, Any]:
         return {"id": req_id, "ok": False,
                 "error": str(data.get("error") or "команда не сработала")}
     return {"id": req_id, "ok": True, "data": data}
+
+
+def _copy_area_template(source: Path, target: Path) -> tuple[int, list[str]]:
+    """Скопировать шаблон области, пережив занятые файлы.
+
+    Шаблон авторизации — **живая область**: часть её файлов (Cookies
+    электрона и подобное) может быть занята процессом. Раньше это роняло
+    создание области целиком (`shutil.copytree` → `WinError 32`), а теперь мы
+    копируем всё, что читается, а занятое — пропускаем и называем в отчёте.
+
+    Возвращает (скопировано, пропущено).
+    """
+    copied = 0
+    skipped: list[str] = []
+    for root, _dirs, files in os.walk(str(source)):
+        rel = Path(root).relative_to(source)
+        (target / rel).mkdir(parents=True, exist_ok=True)
+        for name in files:
+            src = Path(root) / name
+            dst = target / rel / name
+            try:
+                shutil.copyfile(str(src), str(dst))
+                copied += 1
+            except OSError:
+                skipped.append(str(rel / name).replace("\\", "/"))
+    return copied, skipped
+
+
+def _published_prompt_id(project: str, title: str, text: str) -> Any:
+    """id уже опубликованной заявки в разделе (пусто — такой ещё нет).
+
+    Публикация должна быть **идемпотентной**: повторный заход той же
+    заявкой не должен плодить копии в разделе (владелец увидит их как
+    дубли и не поймёт, что делать).
+    """
+    code, payload = karman_mod.call("GET", "/api/prompts?project=%s"
+                                    % urllib.parse.quote(project))
+    if code != 200:
+        return ""
+    for item in payload.get("prompts") or []:
+        if not isinstance(item, dict):
+            continue
+        same_title = str(item.get("title") or "").strip() == str(title or "").strip()
+        same_body = str(item.get("body") or "").strip() == str(text or "").strip()
+        if same_title and same_body:
+            return item.get("id")
+    return ""
 
 
 class Bridge:
@@ -469,7 +518,13 @@ class Bridge:
         return {"ok": res["ok"], "out": res["out"], "err": res["err"]}
 
     def cmd_create(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Новая область: каталог данных + авторизация + запись в конфиг."""
+        """Новая область: каталог данных + авторизация + запись в конфиг.
+
+        `resume=True` — каталог области уже есть, но проект в конфиге не
+        заведён (область недоделана: копирование шаблона упало на занятом
+        файле). Тогда шаблон **доносится** в существующий каталог, а проект
+        регистрируется.
+        """
         slug = str(args.get("slug") or "").strip().lower()
         title = str(args.get("title") or slug).strip()
         folder = str(args.get("folder") or "").strip()
@@ -481,13 +536,14 @@ class Bridge:
         if any(p.get("slug") == slug for p in projects):
             return {"error": "область %s уже есть" % slug}
         area_dir = state.AREAS_ROOT / ("p-" + slug)
-        if area_dir.exists():
+        resume = bool(args.get("resume"))
+        if area_dir.exists() and not resume:
             return {"error": "каталог %s уже есть" % area_dir}
         template = str(cfg.get("authTemplate") or "")
         copied = ""
+        skipped: list[str] = []
         if template and Path(template).is_dir():
-            import shutil
-            shutil.copytree(template, area_dir)
+            count, skipped = _copy_area_template(Path(template), area_dir)
             copied = template
         else:
             area_dir.mkdir(parents=True, exist_ok=True)
@@ -517,7 +573,8 @@ class Bridge:
             slug, title, shortcut_note or "без ярлыков"))
         return {"ok": True, "slug": slug, "dir": str(area_dir),
                 "auth_from": copied, "folder": folder,
-                "shortcut": shortcut_note, "folder_note": folder_note}
+                "shortcut": shortcut_note, "folder_note": folder_note,
+                "skipped": skipped}
 
     # ────────────────────────────────────────────────────────────── сессии
     def _area(self, slug: str) -> dict[str, Any]:
@@ -1089,6 +1146,10 @@ class Bridge:
         if not status.get("has_secret"):
             return {"published": False,
                     "reason": status.get("reason") or "канал КАРМАНА не настроен"}
+        existing = _published_prompt_id(name, title, text)
+        if existing:
+            return {"published": True, "http": 200, "project": name,
+                    "id": existing, "duplicate": True}
         code, payload = karman_mod.ensure_project(name)
         if code != 200:
             return {"published": False, "http": code, "project": name,
