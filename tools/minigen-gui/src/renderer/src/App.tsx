@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type { ProgramVersion, Settings, Snapshot } from '@shared/types'
-import { api } from './api'
+import { api, desktop } from './api'
 import { buildStatsCsv } from './format'
+import { headerStatus } from './tabs/header-status'
 import AreasTab from './tabs/AreasTab'
 import StatsTab from './tabs/StatsTab'
 import NetworkTab from './tabs/NetworkTab'
@@ -32,14 +33,28 @@ export default function App() {
   const [bridge, setBridge] = useState({ alive: false, message: 'мост не запущен' })
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const failures = useRef(0)
+  const retryTimer = useRef<number | null>(null)
 
-  const refresh = useCallback(async () => {
+  const refresh = useCallback(async (): Promise<void> => {
     try {
       const snap = await api.snapshot()
       setSnapshot(snap)
       setError('')
+      failures.current = 0
     } catch (err) {
       setError(String((err as Error).message || err))
+      // ⚠️ Мост поднимается чуть позже окна: первый снимок может прийти на
+      // «мост не запущен» — и владелец видел пустую шапку («0 областей»,
+      // «демоны 0/0», «мост не запущен») до следующей штатной перезагрузки.
+      // Спрашиваем ещё раз — коротко и с повтором.
+      failures.current += 1
+      if (failures.current <= 5) {
+        if (retryTimer.current !== null) window.clearTimeout(retryTimer.current)
+        retryTimer.current = window.setTimeout(() => {
+          void refresh()
+        }, 700)
+      }
     }
     // версия меняется только при раскатке — но пусть и в шапке будет видна
     void api.programVersion().then(setVersion).catch(() => undefined)
@@ -48,6 +63,13 @@ export default function App() {
   useEffect(() => {
     void refresh()
     api.settings().then(setSettings).catch(() => undefined)
+    // Состояние моста спрашиваем сами: событие о старте моста могло прийти
+    // **до** подписки окна — и шапка долго показывала «мост не запущен»
+    // при живом мосте (живой случай 24.11, видно на снимке окна).
+    void desktop
+      .bridgeStatus()
+      .then((status) => setBridge(status))
+      .catch(() => undefined)
     return window.minigen.onEvent((event) => {
       setBridge({ alive: event.alive, message: event.message })
     })
@@ -94,27 +116,12 @@ export default function App() {
   )
 
   const areas = snapshot?.areas ?? []
-  const running = useMemo(() => areas.filter((area) => area.running).length, [areas])
 
   // ── индикатор «жив ли МиниГен» (23.11, вопрос владельца) ──────────────
   // Показываем в шапке, на любой вкладке: сколько демонов живо, кто ими
   // надзирает (это окно или фоновый режим) и какая версия программы идёт.
-  const daemons = snapshot?.daemons
-  const aliveCount = daemons?.alive_count ?? 0
-  const totalCount = daemons?.total ?? 0
-  const daemonTone = totalCount > 0 && aliveCount === totalCount ? 'ok' : 'bad'
-  const supervisor = daemons?.supervisor ?? null
-  const supervisorLabel = !supervisor
-    ? 'надзирателя нет'
-    : supervisor.is_self
-      ? 'надзиратель: это окно'
-      : supervisor.alive
-        ? 'надзиратель: фоновый режим'
-        : 'надзиратель: его нет'
-  const supervisorTone = supervisor && supervisor.alive ? 'ok' : 'bad'
-  const versionLabel = version?.commit
-    ? `${version.installed ? 'установленная копия' : 'рабочее дерево'} ${version.commit}`
-    : ''
+  // Считает чистый модуль — его проверяет тест (живой случай 24.11).
+  const head = headerStatus(snapshot, version, bridge)
 
   return (
     <div className="app">
@@ -124,16 +131,16 @@ export default function App() {
           <div>
             <h1>МиниГен</h1>
             <span className="sub">
-              {areas.length} областей · {running} запущено
-              {versionLabel ? ` · ${versionLabel}` : ''}
-              {snapshot?.config_error ? ' · конфиг не читается!' : ''}
+              {head.areasLabel}
+              {head.versionLabel ? ` · ${head.versionLabel}` : ''}
+              {head.configBroken ? ' · конфиг не читается!' : ''}
             </span>
           </div>
         </div>
         <div className="topbar-actions">
-          <span className={`chip ${daemonTone}`}>демоны {aliveCount}/{totalCount}</span>
-          <span className={`chip ${supervisorTone}`}>{supervisorLabel}</span>
-          <span className={`status ${bridge.alive ? 'ok' : 'bad'}`}>{bridge.message}</span>
+          <span className={`chip ${head.daemonTone}`}>{head.daemonLabel}</span>
+          <span className={`chip ${head.supervisorTone}`}>{head.supervisorLabel}</span>
+          <span className={`status ${head.bridgeTone}`}>{head.bridgeLabel}</span>
           <button className="ghost" onClick={() => void refresh()} disabled={busy}>
             Обновить
           </button>

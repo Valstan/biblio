@@ -86,8 +86,17 @@ def main() -> int:
         encoding="utf-8")
     check("time.localtime" not in state,
           "мост ещё считает границу окна по зоне машины")
-    check('fmt_ms(int(since * 1000)' in state,
+    check("msk_stamp" in state,
           "мост не считает границу окна по Москве")
+    # ⚠️ Живой случай 24.11: мост звал `fmt_ms(ms, формат)`, а у боевого
+    # ядра `fmt_ms(ms)` — один аргумент ⇒ `TypeError` ⇒ снимок не приходил,
+    # и окно показывало «0 областей», «демоны 0/0». Этот гейт раньше
+    # ЗАКРЕПЛЯЛ сломанный вызов — теперь он его запрещает.
+    check("fmt_ms(int(since * 1000)" not in state,
+          "мост зовёт fmt_ms с двумя аргументами — у ядра формат зашит, "
+          "и снимок падает")
+    check("minigen_time" in state,
+          "мост не берёт общее время программы")
 
     print("5) раскатка везёт модуль времени на боевое место")
     rollout = (HERE / "minigen_rollout.py").read_text(encoding="utf-8")

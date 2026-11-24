@@ -30,6 +30,10 @@ const api = {
   buildInfo(): Promise<{ commit: string }> {
     return ipcRenderer.invoke('minigen:build-info')
   },
+  /** Состояние моста прямо сейчас (событие могло прийти до подписки окна). */
+  bridgeStatus(): Promise<{ alive: boolean; message: string }> {
+    return ipcRenderer.invoke('minigen:bridge-status')
+  },
   /** События моста: он упал / поднялся. */
   onEvent(handler: (event: BridgeEvent) => void): () => void {
     const listener = (_event: unknown, payload: BridgeEvent) => handler(payload)

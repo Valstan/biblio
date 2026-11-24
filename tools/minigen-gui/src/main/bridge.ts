@@ -9,16 +9,37 @@ import { app } from 'electron'
  * Протокол — JSON-lines (одна строка JSON на запрос и на ответ). Мост
  * живёт всё время жизни окна: окно — оболочка, ядро — Python.
  */
+export interface BridgeStatus {
+  alive: boolean
+  message: string
+}
+
 export class Bridge {
   private proc: ChildProcessWithoutNullStreams | null = null
   private pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
   private counter = 0
   private buffer = ''
   private ready = false
+  private lastMessage = 'мост не запущен'
 
   constructor(
     private readonly onEvent: (kind: 'bridge-status' | 'bridge-error', message: string, alive: boolean) => void
-  ) {}
+  ) {
+    const report = this.onEvent
+    this.onEvent = (kind, message, alive) => {
+      // Последнее сообщение помним: окно спрашивает статус при открытии, а
+      // событие могло прийти **до** подписки окна (мост поднимается раньше
+      // окна) — и тогда владелец видел «мост не запущен» при живом мосте
+      // (живой случай 24.11, видно на снимке окна).
+      this.lastMessage = message
+      report(kind, message, alive)
+    }
+  }
+
+  /** Состояние моста прямо сейчас — для шапки окна. */
+  status(): BridgeStatus {
+    return { alive: this.ready, message: this.lastMessage }
+  }
 
   /** Папка с Python-мостом: в сборке — resources, при разработке — репозиторий. */
   static bridgeDir(): string {
