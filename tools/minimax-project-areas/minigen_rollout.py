@@ -51,7 +51,11 @@ REL = "tools/minimax-project-areas"
 FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
          "minimax-autheal.py", "minimax-switch.py", "minimax-orphans.py",
          "mcode-project-start.ps1", "mcode-project-stop.ps1",
-         "mcode-project-title.ps1", "make-mcode-project-shortcuts.ps1")
+         "mcode-project-title.ps1", "make-mcode-project-shortcuts.ps1",
+         # 24.11: клиент канала промтов раздела — та же история, что и у соседей:
+         # утилита проекта лежит рядом с остальными, чтобы её можно было звать
+         # отовсюду, а не только из дерева репозитория.
+         "karman_prompts.py")
 # ⚠️ 23.11: `minimax-autheal.py` в списке НЕ БЫЛ — раскатка выкладывала
 # сторожей, но не лечащего. Отсюда и расхождение «репозиторий ↔ машина»:
 # правки лечащего жили только на машине, а эталон (master) отставал, и

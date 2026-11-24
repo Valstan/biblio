@@ -308,6 +308,9 @@ python tools/minimax-project-areas/karman_prompts.py unarchive 12
 Значение токена в отчётах и письмах не печатается — только источник
 (`file`/`env`).
 
+После раскатки клиент лежит и в `C:\Users\valstan\bin\karman_prompts.py` —
+его можно звать отовсюду, не только из дерева репозитория.
+
 ## Грабли (см. также пул brain_matrica)
 
 - **PowerShell 5.1 читает `.ps1` без BOM как ANSI** — кириллица в скрипте ломает
