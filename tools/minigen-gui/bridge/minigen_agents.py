@@ -146,7 +146,11 @@ def ensure_registry(create: bool = True) -> dict[str, Any]:
     if not clone.get("ok"):
         return {"ok": False, "error": "реестр не склонирован: %s" % (clone.get("err") or "")}
     # Пустой репозиторий без единого коммита — клон есть, а ветки нет:
-    # без первого коммита `git push` не знает, что отправлять.
+    # без первого коммита `git push` не знает, что отправлять. И ветка
+    # обязана быть `master` (канон владельца): иначе клон придёт пустым.
+    head = _git(["rev-parse", "--verify", "HEAD"], target)
+    if not head.get("ok"):
+        _git(["symbolic-ref", "HEAD", "refs/heads/master"], target)
     readme = target / "README.md"
     if not readme.exists():
         readme.write_text(
@@ -219,6 +223,25 @@ def work_repo_path(repo_slug: str) -> Path:
     return workspace_home() / name
 
 
+def init_work_repo(path: Path, repo_slug: str) -> dict[str, Any]:
+    """Создать локальный репозиторий агента и привязать его к GitHub.
+
+    Ветка — **всегда `master`** (канон владельца). `git init` на части машин
+    даёт `main`, а удалённый репозиторий сделан нами с веткой `master`:
+    без явного `symbolic-ref` первый же клон окажется пустым, и агент
+    «потеряется» молча.
+    """
+    init = _git(["init", str(path)], path.parent)
+    if not init.get("ok"):
+        return {"ok": False, "error": "репозиторий не создан: %s" % (init.get("err") or "")}
+    _git(["symbolic-ref", "HEAD", "refs/heads/master"], path)
+    remote = _git(["remote", "add", "origin", "https://github.com/%s.git" % repo_slug],
+                  path)
+    if not remote.get("ok"):
+        return {"ok": False, "error": "remote не добавлен: %s" % (remote.get("err") or "")}
+    return {"ok": True, "branch": "master"}
+
+
 def ensure_work_repo(repo_slug: str, create: bool = True) -> dict[str, Any]:
     """Репозиторий агента: взять существующий или создать новый на GitHub.
 
@@ -244,13 +267,9 @@ def ensure_work_repo(repo_slug: str, create: bool = True) -> dict[str, Any]:
     if not made.get("ok"):
         return {"ok": False, "error": "репозиторий не создан: %s" % (made.get("err") or "")}
     gh(["repo", "edit", repo_slug, "--default-branch", "master"], timeout=120)
-    init = _git(["init", str(path)], path.parent)
-    if not init.get("ok"):
-        return {"ok": False, "error": "репозиторий не создан: %s" % (init.get("err") or "")}
-    remote = _git(["remote", "add", "origin", "https://github.com/%s.git" % repo_slug],
-                  path)
-    if not remote.get("ok"):
-        return {"ok": False, "error": "remote не добавлен: %s" % (remote.get("err") or "")}
+    started = init_work_repo(path, repo_slug)
+    if not started.get("ok"):
+        return {"ok": False, "error": started.get("error") or ""}
     return {"ok": True, "path": str(path), "repo": repo_slug, "created": True}
 
 

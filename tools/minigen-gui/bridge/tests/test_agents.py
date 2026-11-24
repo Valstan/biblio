@@ -126,6 +126,33 @@ class TemplateTest(unittest.TestCase):
         self.assertTrue((area / "ideas-ingest" / "SKILL.md").is_file())
 
 
+class WorkRepoTest(unittest.TestCase):
+    """Рабочий репозиторий агента: ветка `master` и remote."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "ideas"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_new_repo_is_on_master(self) -> None:
+        """`git init` может дать `main` — тогда клон придёт пустым."""
+        result = agents.init_work_repo(self.path, "Valstan/ideas")
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(result.get("branch"), "master")
+        # Коммита ещё нет (ветка «не родилась»), поэтому HEAD читаем
+        # как символическую ссылку, а не как ревизию.
+        branch = subprocess.run(["git", "symbolic-ref", "--short", "HEAD"],
+                                cwd=str(self.path), capture_output=True, text=True,
+                                encoding="utf-8", check=True).stdout.strip()
+        self.assertEqual(branch, "master")
+        remote = subprocess.run(["git", "remote", "get-url", "origin"],
+                                cwd=str(self.path), capture_output=True, text=True,
+                                encoding="utf-8", check=True).stdout.strip()
+        self.assertEqual(remote, "https://github.com/Valstan/ideas.git")
+
+
 class RequestTest(unittest.TestCase):
     """Заявки агента: лежат в репозитории и находятся после этого."""
 
