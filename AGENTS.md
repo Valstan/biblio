@@ -37,9 +37,18 @@ Internal reasoning, commit messages, идентификаторы — English.
 
 1. Синхронизируй **только этот** репозиторий (`git fetch`, безопасный fast-forward).
 2. Прочитай `docs/SESSION_HANDOFF.md`, проверь `git status` и последние коммиты.
-3. Если существует `../brain_matrica/mailboxes/biblio/from-brain/` — прочитай входящие
-   (read-only); если каталога нет — канал ещё не открыт, это норма.
-4. В конце значимой работы обнови `docs/SESSION_HANDOFF.md` и оставь репозиторий
+3. Прочитай входящие от Мозга — **read-only, без клона и без `fetch`/`pull`**:
+   - локально: `../brain_matrica/mailboxes/biblio/from-brain/` (`*.md` в корне;
+     `DRAFTS/` и `ARCHIVE/` не читать); каталога нет — канал ещё не открыт, это норма;
+   - GitHub `main` Мозга (важно: письмо может лежать **только там**, локальная копия
+     отстаёт — так в 23.11 ответ по D-190 ждал в этой папке, а пришёл в GitHub):
+     `gh api "repos/Valstan/brain_matrica/contents/mailboxes/biblio/from-brain?ref=main"`.
+4. Забери **живые промты своего раздела** в КАРМАНе:
+   `python tools/minimax-project-areas/karman_prompts.py list`
+   (канал может быть не настроен — это норма, тогда ждём хозяина; **архивируй
+   только то, что выполнил**). План из библиотеки — задание владельца: сверь со
+   своим кодом, уточни у себя, выполни.
+5. В конце значимой работы обнови `docs/SESSION_HANDOFF.md` и оставь репозиторий
    запушенным и чистым.
 
 Исполняемые памятки — `.claude/commands/start.md`, `close_session.md`; несмотря на
