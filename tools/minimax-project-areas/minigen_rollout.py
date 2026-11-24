@@ -28,6 +28,7 @@
  4. Останавливает демонов — поднимает их программа (дублей не будет).
  5. Проверяет: компиляция, живые демоны, вердикты сессий, состояние сети.
 """
+import json
 import os
 import subprocess
 import sys
@@ -114,6 +115,8 @@ def daemons_alive() -> list[str]:
 
 PROGRAM_SRC = REPO / "tools" / "minigen-gui"
 PROGRAM_ROOT = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Programs" / "МиниГен"
+# Локальный API программы: на нём и надзиратель демонов, и статус.
+API_PORT = 8097
 
 LAUNCHER_CMD = """@echo off
 rem MiniGen launcher (installed copy, ASCII only).
@@ -347,6 +350,12 @@ def stop_managers() -> int:
     `:8097` — новый экземпляр без порта сразу выйдет, и надзирателем снова
     окажется старый код).
 
+    ⚠️ Живой случай 24.11: раньше мы убивали менеджера и **сразу** поднимали
+    нового. Порт ещё держал умирающий процесс ⇒ новый мост не мог поднять
+    API и выходил («локальный API не поднялся — выхожу») ⇒ надзирателя не
+    было, а раскатка рапортовала «готово» (демоны поднимал лечащий). Теперь
+    ждём, пока менеджеры реально ушли.
+
     Страховка, если новый менеджер не поднимется: демоны умеют поднимать себя
     сами при изменении файла (`respawn_self`) — а файлы раскатка только что
     перезаписала.
@@ -361,7 +370,52 @@ def stop_managers() -> int:
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         print("   остановлен менеджер [%s] (pid %d): %s" % (kind, pid, cmd[:90]))
         stopped += 1
+    # ждём ухода процессов: новый надзиратель без свободного порта выйдет
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        alive = manager_processes()
+        if not alive:
+            break
+        time.sleep(1)
+    else:
+        print("   ⚠️ менеджеры не ушли за 30 с — новый может не поднять API")
     return stopped
+
+
+def api_status(port: int = API_PORT, token_file: Path | None = None) -> dict:
+    """Ответ локального API программы (пусто — не отвечает).
+
+    `token_file` — файл с токеном (по умолчанию токен программы). Если токена
+    нет, запрос не делаем: API без токена всё равно не ответит.
+    """
+    path = token_file or (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                          / "minigen-gui" / "bridge-token.txt")
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    if not token:
+        return {}
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/status?token=%s" % (port, token),
+                timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def wait_api(timeout: int = 60, port: int = API_PORT) -> dict:
+    """Дождаться, пока API программы начнёт отвечать."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        data = api_status(port=port)
+        if data:
+            return data
+        time.sleep(2)
+    return {}
 
 
 def start_installed_manager() -> bool:
@@ -373,6 +427,10 @@ def start_installed_manager() -> bool:
     всегда), ⇒ `subprocess.run` ждёт EOF **вечно** и раскатка зависает на
     последнем шаге. С DEVNULL дескриптор не наследуется по трубе — команда
     возвращается сразу.
+
+    ⚠️ И проверка: «запустили» ≠ «надзиратель жив» (живой случай 24.11 —
+    новый мост вышел, не сумев поднять API, а раскатка сказала «готово»).
+    Поэтому ждём ответа API и только потом считаем, что надзиратель есть.
     """
     autostart = PROGRAM_ROOT / "Автозапуск.cmd"
     if not autostart.is_file():
@@ -382,6 +440,18 @@ def start_installed_manager() -> bool:
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                    timeout=60,
                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    data = wait_api(timeout=60)
+    if not data:
+        # одна попытка ещё раз: порт мог быть занят к моменту старта
+        time.sleep(10)
+        data = wait_api(timeout=40)
+    if not data:
+        print("   ⚠️ API программы не отвечает — надзиратель не поднялся")
+        print("      (смотри журнал: «локальный API не поднялся — выхожу»)")
+        return False
+    supervisor = data.get("supervisor") or {}
+    print("   надзиратель: pid %s, демонов %s/%s" % (
+        supervisor.get("pid"), data.get("alive_count"), data.get("total")))
     return True
 
 
