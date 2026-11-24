@@ -228,6 +228,19 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
     data["fork_of"] = data.get("fork_of") or {"commit": "", "installed_at": 0}
     lineage._write_json(lineage.INSTANCE_FILE, data)
     lineage.record("clone", repo=repo_name, upstream=upstream, pool=pool)
+
+    # 6) копия появилась на карте: «в какой точке родилась» — это коммит форка.
+    #    Пишем в пул, чтобы карта была общей: каждая копия дописывает в неё
+    #    свои связи, а окно собирает карту из пула (заказ владельца 24.11).
+    try:
+        import minigen_genes as genes
+        born = genes.publish_birth(str((data.get("fork_of") or {}).get("commit") or ""),
+                                   repo=repo_name, upstream=upstream)
+        report["steps"].append({"born": "в пуле" if born.get("ok") else "не записано",
+                                "how": born.get("why") or born.get("error")})
+    except Exception as exc:  # noqa: BLE001
+        report["steps"].append({"born": "не записано", "how": str(exc)})
+
     report["ok"] = True
     report["why"] = "клон копии готов: %s (upstream %s)" % (repo_name, upstream)
     return report
