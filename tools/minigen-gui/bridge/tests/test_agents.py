@@ -165,6 +165,24 @@ class RequestTest(unittest.TestCase):
         _git(["init"], self.repo)
         _git(["config", "user.email", "test@example.com"], self.repo)
         _git(["config", "user.name", "Test"], self.repo)
+        # Локальный «origin»: ветка и пуш идут в него, сеть не нужна.
+        self.origin = root / "origin.git"
+        _git(["init", "--bare", str(self.origin)], root)
+        _git(["remote", "add", "origin", str(self.origin)], self.repo)
+        _git(["symbolic-ref", "HEAD", "refs/heads/master"], self.repo)
+        # ветка master должна существовать (как в настоящем репозитории агента)
+        _git(["commit", "--allow-empty", "-m", "начало"], self.repo)
+        # PR — к GitHub не ходим: имитируем слияние локально (как на GitHub —
+        # после слияния ветка сливается в master, и заявка живёт в master).
+        self._old_pr = agents.publish_pr
+
+        def fake_publish_pr(repo_slug: str, branch: str, title: str,
+                            body: str = "", **kwargs) -> dict:
+            _git(["checkout", "master"], self.repo)
+            _git(["merge", "--no-ff", "-m", "PR: заявка", branch], self.repo)
+            return {"ok": True, "pr": "1"}
+
+        agents.publish_pr = fake_publish_pr  # type: ignore[assignment]
         self.registry = root / "registry"
         self.registry.mkdir(parents=True, exist_ok=True)
         agents.write_manifest("ideas", {"slug": "ideas", "repo": "Valstan/ideas"})
@@ -174,6 +192,7 @@ class RequestTest(unittest.TestCase):
         agents.workspace_home = lambda: self.workspace  # type: ignore[assignment]
 
     def tearDown(self) -> None:
+        agents.publish_pr = self._old_pr   # type: ignore[assignment]
         agents.registry_dir = self._old_dir    # type: ignore[assignment]
         agents.workspace_home = self._old_home  # type: ignore[assignment]
         self.tmp.cleanup()
@@ -198,6 +217,14 @@ class RequestTest(unittest.TestCase):
         listed = agents.list_requests("ideas")
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["project"], "sarafan")
+
+    def test_request_reaches_master_through_pr(self) -> None:
+        """Заявка обязана попасть в `master` (иначе её не восстановить)."""
+        agents.save_request("ideas", "sarafan", "2026-11-24-sarafan.md", "# заявка")
+        master = subprocess.run(["git", "ls-tree", "-r", "--name-only", "master"],
+                                cwd=str(self.repo), capture_output=True, text=True,
+                                encoding="utf-8", check=True).stdout
+        self.assertIn("requests/sarafan/2026-11-24-sarafan.md", master)
 
     def test_request_branch_is_slug(self) -> None:
         self.assertEqual(agents.request_branch("Сарафан Мини"), "requests/sarafan-mini")

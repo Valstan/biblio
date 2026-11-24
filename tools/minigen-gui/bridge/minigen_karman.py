@@ -19,8 +19,13 @@
 
 - адрес сервиса — файл `%USERPROFILE%\\.biblio-keys\\vault-url`, затем
   переменная `KARMAN_URL`;
-- секрет канала — файл `%USERPROFILE%\\.biblio-keys\\prompts-ingest-secret`,
-  затем переменная `PROMPTS_INGEST_SECRET`.
+- секрет канала — **комната проекта в vault** (сервис выдал его грантом в
+  комнату `biblio`), читается токеном комнаты
+  (`%USERPROFILE%\\.biblio-keys\\room-token`); если файла нет — переменная
+  `PROMPTS_INGEST_SECRET` или файл `prompts-ingest-secret`.
+
+То есть секрет **не копируется руками**: он лежит в vault-комнате и приходит
+в программу сама, когда понадобится.
 
 **Fail-closed.** Если секрета нет — заявка **не теряется**: она лежит в
 репозитории агента (GitHub), а мост честно говорит «в КАРМАН не опубликовано:
@@ -35,7 +40,9 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -44,8 +51,16 @@ TIMEOUT = 20
 
 URL_FILE = "vault-url"
 SECRET_FILE = "prompts-ingest-secret"
+ROOM_TOKEN_FILE = "room-token"
 URL_ENV = "KARMAN_URL"
 SECRET_ENV = "PROMPTS_INGEST_SECRET"
+
+#: Ключ секрета канала в vault-комнате (так он называется и у сервиса).
+CHANNEL_KEY = "PROMPTS_INGEST_SECRET"
+
+#: Как долго держим секрет в памяти (секунды). Смысл тот же, что у сервиса:
+#: секрет в памяти, а не в файле, который владелец копирует руками.
+SECRET_TTL_S = 600
 
 #: Коды ответа — человеческим языком.
 REASONS = {
@@ -56,6 +71,9 @@ REASONS = {
     429: "сервис просит подождать (частые запросы)",
     503: "канал не настроен: секрет не задан на стороне сервиса",
 }
+
+#: Кэш секрета в памяти процесса: {"value", "source", "at"}.
+_secret_cache: dict[str, Any] = {"value": "", "source": "", "at": 0.0}
 
 
 def keys_dir() -> Path:
@@ -83,14 +101,77 @@ def read_base() -> tuple[str, str]:
 
 
 def read_secret() -> tuple[str, str]:
-    """(секрет канала, источник) — источник: ``file`` | ``env`` | ``''``."""
+    """(секрет канала, источник) — источник: ``file`` | ``env`` | ``vault`` | ``''``.
+
+    **Порядок источников** (первый рабочий и есть ответ):
+
+    1. **файл** `prompts-ingest-secret` — если владелец положил его руками;
+    2. **env** `PROMPTS_INGEST_SECRET`;
+    3. **vault** — комната проекта по токену комнаты (`room-token`): сервис
+       выдал секрет канала **грантом** в комнату `biblio`, и программа читает
+       его сам, каждый раз, когда понадобится.
+
+    Третий путь — тот, ради которого владелец просил «сделай автоматически,
+    чтобы я ничего руками не копировал»: секрет лежит в vault-комнате
+    (шифрованной) и в память программы, а не в файле, который надо копировать
+    руками, и не в env, который надо настраивать на каждой машине.
+
+    Значение кэшируется на `SECRET_TTL_S` секунд — чтобы не дёргать vault на
+    каждый запрос, но и не держать секрет в памяти вечно.
+    """
+    now = time.time()
+    cached = _secret_cache.get("value")
+    if cached and now - float(_secret_cache.get("at") or 0) < SECRET_TTL_S:
+        return str(cached), str(_secret_cache.get("source") or "")
     value = _read_file(keys_dir() / SECRET_FILE)
+    source = "file" if value else ""
+    if not value:
+        value = (os.environ.get(SECRET_ENV) or "").strip()
+        source = "env" if value else ""
+    if not value:
+        value, source = vault_secret(CHANNEL_KEY)
+    _secret_cache.update({"value": value, "source": source, "at": now})
+    return value, source
+
+
+def read_room_token() -> tuple[str, str]:
+    """(токен комнаты, источник) — источник: ``file`` | ``env`` | ``''``."""
+    value = _read_file(keys_dir() / ROOM_TOKEN_FILE)
     if value:
         return value, "file"
-    value = (os.environ.get(SECRET_ENV) or "").strip()
+    value = (os.environ.get("KARMAN_ROOM_TOKEN") or "").strip()
     if value:
         return value, "env"
     return "", ""
+
+
+def vault_secret(key: str) -> tuple[str, str]:
+    """Секрет из vault-комнаты проекта (по токену комнаты).
+
+    Возвращает (значение, источник). Пусто — комната недоступна, ключа нет
+    или токен не выдан. Ошибка тут **не** исключение: канал может быть
+    закрыт, и это не повод ронять программу.
+    """
+    token, _ = read_room_token()
+    base, _ = read_base()
+    if not token or not base:
+        return "", ""
+    url = base.rstrip("/") + "/api/secrets?key=" + urllib.parse.quote(key)
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Accept", "application/json")
+    try:
+        with _opener().open(req, timeout=TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, urllib.error.HTTPError):
+        return "", ""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return "", ""
+    secrets = payload.get("secrets") or {}
+    value = str(secrets.get(key) or "")
+    return (value, "vault") if value else ("", "")
 
 
 def _opener():
@@ -202,11 +283,13 @@ def status() -> dict[str, Any]:
     """Живой статус канала: читается ли он и что в нём есть."""
     secret, secret_src = read_secret()
     base, base_src = read_base()
+    room, room_src = read_room_token()
     out: dict[str, Any] = {
         "has_url": bool(base),
         "has_secret": bool(secret),
         "secret_source": secret_src,
         "url_source": base_src,
+        "room_token_source": room_src,
         "http": 0,
         "ok": False,
         "sections": [],
@@ -217,16 +300,18 @@ def status() -> dict[str, Any]:
                          % (URL_FILE, URL_ENV))
         return out
     if not secret:
-        out["reason"] = ("секрет канала не задан (файл %s или %s) — заявки "
-                         "сохраняются в репозитории агента, в КАРМАН не уходят"
-                         % (SECRET_FILE, SECRET_ENV))
+        out["reason"] = ("секрет канала не задан: нет гранта в комнату "
+                         "(файл %s, токен комнаты %s или переменная %s) — "
+                         "заявки сохраняются в репозитории агента, в КАРМАН "
+                         "не уходят" % (SECRET_FILE, ROOM_TOKEN_FILE, SECRET_ENV))
         return out
     code, sections = list_sections()
     out["http"] = code
     out["ok"] = code == 200
     out["sections"] = sections
     if code == 200:
-        out["reason"] = "канал живой, разделов: %d" % len(sections)
+        out["reason"] = "канал живой, разделов: %d (секрет из %s)" % (
+            len(sections), secret_src or "—")
     elif code == 0:
         out["reason"] = "сеть недоступна или нет секрета"
     else:

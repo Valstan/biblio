@@ -86,8 +86,15 @@ class Handler(BaseHTTPRequestHandler):
         if Handler.mode != 200:
             self._send(Handler.mode, {"error": "служебная ошибка"})
             return
+        if self.path.startswith("/api/secrets"):
+            # vault-комната: секрет канала приходит по токену комнаты
+            self._send(200, {"secrets": {"PROMPTS_INGEST_SECRET": "vault-secret"}})
+            return
         if self.path.startswith("/api/prompts/projects"):
             self._send(200, {"sections": ["sarafan", "karman"], "added": []})
+            return
+        if self.path.startswith("/api/prompts"):
+            self._send(200, {"prompts": []})
             return
         self._send(404, {"error": "нет такого пути"})
 
@@ -115,7 +122,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def make_repo(root: pathlib.Path, name: str) -> pathlib.Path:
-    """Пустой git-репозиторий (для заявок агента)."""
+    """Пустой git-репозиторий агента (с локальным «origin» — сеть не нужна)."""
     import subprocess
     repo = root / name
     repo.mkdir(parents=True, exist_ok=True)
@@ -123,6 +130,15 @@ def make_repo(root: pathlib.Path, name: str) -> pathlib.Path:
     subprocess.run(["git", "config", "user.email", "test@example.com"],
                    cwd=str(repo), check=True, capture_output=True)
     subprocess.run(["git", "config", "user.name", "Test"],
+                   cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "symbolic-ref", "HEAD", "refs/heads/master"],
+                   cwd=str(repo), check=True, capture_output=True)
+    subprocess.run(["git", "commit", "--allow-empty", "-m", "начало"],
+                   cwd=str(repo), check=True, capture_output=True)
+    origin = root / (name + "-origin.git")
+    subprocess.run(["git", "init", "--bare", str(origin)], cwd=str(root),
+                   check=True, capture_output=True)
+    subprocess.run(["git", "remote", "add", "origin", str(origin)],
                    cwd=str(repo), check=True, capture_output=True)
     return repo
 
@@ -194,7 +210,18 @@ def main() -> int:
     registry.mkdir(parents=True, exist_ok=True)
     workspace = tmp / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    make_repo(workspace, "ideas")
+    repo = make_repo(workspace, "ideas")
+    # PR — на GitHub не ходим: имитируем слияние локально.
+    def fake_publish_pr(repo_slug: str, branch: str, title: str,
+                        body: str = "", **kwargs) -> dict:
+        import subprocess
+        subprocess.run(["git", "checkout", "master"], cwd=str(repo),
+                       check=True, capture_output=True)
+        subprocess.run(["git", "merge", "--no-ff", "-m", "PR: заявка", branch],
+                       cwd=str(repo), check=True, capture_output=True)
+        return {"ok": True, "pr": "1"}
+
+    agents.publish_pr = fake_publish_pr  # type: ignore[assignment]
     agents.write_manifest("ideas", {"slug": "ideas", "title": "Идеи",
                                     "repo": "Valstan/ideas", "area": "p-ideas"})
     old_dir = agents.registry_dir
@@ -268,6 +295,8 @@ def main() -> int:
         empty.mkdir(parents=True, exist_ok=True)
         (empty / "vault-url").write_text("http://127.0.0.1:%d" % port, encoding="utf-8")
         os.environ["BIBLIO_KEYS_DIR"] = str(empty)
+        # кэш секрета в памяти сбрасываем: проверяем именно «секрета нет»
+        karman._secret_cache.update({"value": "", "source": "", "at": 0.0})
         status = karman.status()
         check(not status["ok"], "канал «открылся» без секрета")
         check(status["http"] == 0, "код не 0: %s" % status["http"])
@@ -276,8 +305,28 @@ def main() -> int:
         check(code == 0, "промт ушёл без секрета: %s" % code)
         check("секрет" in str(payload.get("error") or ""),
               "причина не про секрет: %s" % payload.get("error"))
-        check(not Handler.calls, "запрос на промт ушёл без секрета: %s" % Handler.calls)
+        writes = [c for c in Handler.calls if c[0] == "POST"]
+        check(not writes, "запись промта ушла без секрета: %s" % writes)
         os.environ["BIBLIO_KEYS_DIR"] = str(keys)
+
+        print("8) секрет канала берётся из vault-комнаты (без копирования руками)")
+        # токена комнаты нет — секрет лежит в файле; кладём файл токена и
+        # убираем файл секрета: секрет должен прийти из vault сам.
+        (keys / "room-token").write_text("skm_test-room\n", encoding="utf-8")
+        secret_file = keys / "prompts-ingest-secret"
+        kept = secret_file.read_text(encoding="utf-8")
+        secret_file.unlink()
+        karman._secret_cache.update({"value": "", "source": "", "at": 0.0})
+        value, source = karman.read_secret()
+        check(source == "vault", "секрет взят не из vault: %s" % source)
+        check(value == "vault-secret",
+              "значение секрета из vault не то (длина %d)" % len(value or ""))
+        status = karman.status()
+        check(status["ok"], "канал не открылся с секретом из vault: %s" % status["reason"])
+        check("vault-secret" not in json.dumps(status, ensure_ascii=False),
+              "значение секрета попало в отчёт")
+        secret_file.write_text(kept, encoding="utf-8")
+        karman._secret_cache.update({"value": "", "source": "", "at": 0.0})
     finally:
         server.shutdown()
         server.server_close()
@@ -287,7 +336,7 @@ def main() -> int:
             else:
                 os.environ[key] = value
 
-    print("8) чужие репозитории: читаем, но не лезем наружу и не читаем ключи")
+    print("9) чужие репозитории: читаем, но не лезем наружу и не читаем ключи")
     other = tmp / "workspace-other"
     other.mkdir(parents=True, exist_ok=True)
     project = other / "project"
@@ -311,7 +360,7 @@ def main() -> int:
     finally:
         repos.workspace_home = old_home
 
-    print("9) каталог инструментов: новые команды есть и опасные помечены")
+    print("10) каталог инструментов: новые команды есть и опасные помечены")
     tools_mod = load_bridge_module("minigen_tools")
     by_name = {tool["name"]: tool for tool in tools_mod.TOOLS}
     for name in ("agents.list", "agents.create", "agents.apply",
