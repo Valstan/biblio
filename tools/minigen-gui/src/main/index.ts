@@ -167,7 +167,11 @@ app.whenReady().then(() => {
                 continue
               }
               // вкладка тянет свои данные с моста — дать им прийти
-              await new Promise((resolve) => setTimeout(resolve, 1500))
+              // ⚠️ 4 с, а не 1,5: снимок состояния идёт ~1,5 с (три вызова
+              // PowerShell на демонов), и данные вкладки встают в очередь за
+              // ним ⇒ на 1,5 с приёмка снимала пустые поля (живой случай
+              // 24.11: «Версия: неизвестна», «Родословная не прочитана»).
+              await new Promise((resolve) => setTimeout(resolve, 4000))
               const text = (await mainWindow.webContents.executeJavaScript(
                 'document.body.innerText')) as string
               const geometry = (await mainWindow.webContents.executeJavaScript(

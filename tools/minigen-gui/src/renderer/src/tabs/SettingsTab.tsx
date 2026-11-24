@@ -22,10 +22,16 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   }, [settings, form])
 
   useEffect(() => {
-    const load = () => api.daemonsStatus().then(setDaemons).catch(() => undefined)
+    // ⚠️ Всё, что читаем с моста, спрашиваем **по таймеру**, а не один раз:
+    // окно открывается раньше моста, и разовый запрос в этот момент падает
+    // («мост не запущен») ⇒ поле оставалось пустым навсегда («Версия:
+    // неизвестна», «Родословная не прочитана» — живой случай 24.11).
+    const load = () => {
+      void api.daemonsStatus().then(setDaemons).catch(() => undefined)
+      void api.programVersion().then(setVersion).catch(() => undefined)
+      void api.lineageShow().then((data) => setLineage(data?.lineage ?? null)).catch(() => undefined)
+    }
     void load()
-    void api.programVersion().then(setVersion).catch(() => undefined)
-    void api.lineageShow().then((data) => setLineage(data?.lineage ?? null)).catch(() => undefined)
     const timer = window.setInterval(() => void load(), 5000)
     return () => window.clearInterval(timer)
   }, [])
