@@ -116,6 +116,41 @@ TOOLS: list[dict[str, Any]] = [
           {"type": "object", "properties": {}},
           "clone.sync"),
 
+    _tool("genes.list",
+          "Гены пула: наработки, которые опубликовали копии «МиниГена». Каждый "
+          "ген — манифест, diff и заметка: что сделано, кем, на какой версии. "
+          "Смотри его, когда ищешь, что можно взять себе.",
+          {"type": "object", "properties": {}},
+          "genes.list"),
+
+    _tool("genes.read",
+          "Прочитать ген: манифест, заметка «зачем» и сам diff.",
+          {"type": "object",
+           "properties": {"gene": {"type": "string",
+                                   "description": "идентификатор гена, например gene-mg-abcdef12-001"}},
+           "required": ["gene"]},
+          "genes.read"),
+
+    _tool("genes.publish",
+          "Опубликовать свою наработку в общий пул: берётся текущая правка "
+          "(code.branch + code.patch), упаковывается в ген и уходит в пул. "
+          "После публикации ген доступен другим копиям.",
+          {"type": "object",
+           "properties": {"title": {"type": "string"},
+                          "summary": {"type": "string", "description": "в двух словах"},
+                          "notes": {"type": "string", "description": "подробнее: зачем и как"}},
+           "required": ["title"]},
+          "genes.publish", True, "опубликует наработку в общем пуле (видят другие копии)"),
+
+    _tool("genes.adopt",
+          "Внедрить чужой ген: создаётся ветка в своём клоне, ген применяется, "
+          "прогоняются проверки — и открывается PR. Слияние — за владельцем.",
+          {"type": "object",
+           "properties": {"gene": {"type": "string"},
+                          "title": {"type": "string", "description": "своё название ветки/PR"}},
+           "required": ["gene"]},
+          "genes.adopt", True, "изменит код программы (предложит PR)"),
+
     _tool("stats.summary",
           "Сводка работы за период: сколько раз перезапускались области и по "
           "каким причинам (отказ по очкам, обрыв сети, компактизация контекста, "

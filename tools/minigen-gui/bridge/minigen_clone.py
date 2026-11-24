@@ -216,6 +216,11 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
         if not clone_pool.get("ok"):
             (POOL_DIR / ".git").mkdir(parents=True, exist_ok=True)
             git(["init", str(POOL_DIR)], POOL_DIR.parent)
+    # ветка пула — `pool`: глобальный хук машины (ADR-0002) запрещает прямой
+    # пуш в `main` и `master` любого репозитория, а пул — не код программы,
+    # а обмен наработками, поэтому он живёт на своей ветке.
+    git(["branch", "-M", "pool"], POOL_DIR)
+    gh(["repo", "edit", pool, "--default-branch", "pool"])
 
     # 5) родословная: от какой версии форк и куда мы пишем
     data["copy_repo"] = repo_name
