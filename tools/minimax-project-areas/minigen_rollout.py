@@ -29,6 +29,7 @@
  5. Проверяет: компиляция, живые демоны, вердикты сессий, состояние сети.
 """
 import json
+import re
 import os
 import subprocess
 import sys
@@ -176,6 +177,38 @@ def _copy_tree(src: Path, dst: Path, skip=()) -> int:
     return copied
 
 
+def _clean_stale_bundles(dst: Path) -> int:
+    """Убрать старые бандли окна: имя сборки содержит хеш, и каждая раскатка
+    оставляла в установленной папке ещё один мёртвый файл.
+
+    Занятый файл (открытое окно программы) не удаляем — переживёт до следующей
+    раскатки.
+    """
+    assets = dst / "out" / "renderer" / "assets"
+    if not assets.is_dir():
+        return 0
+    keep = set()
+    try:
+        page = (dst / "out" / "renderer" / "index.html").read_text(encoding="utf-8")
+        keep = set(re.findall(r"assets/([A-Za-z0-9_.-]+)", page))
+    except OSError:
+        pass
+    removed = 0
+    try:
+        items = list(assets.iterdir())
+    except OSError:
+        return 0
+    for item in items:
+        if item.name in keep:
+            continue
+        try:
+            item.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
 def install_program() -> bool:
     """Поставить программу в своё место и переписать ярлыки.
 
@@ -209,6 +242,7 @@ def install_program() -> bool:
         if src.is_file():
             shutil.copy2(src, electron / name)
     _copy_tree(PROGRAM_SRC / "out", app / "out")
+    _clean_stale_bundles(app)
     _copy_tree(PROGRAM_SRC / "bridge", app / "bridge", skip=("__pycache__", "*.pyc"))
     (app / "docs").mkdir(parents=True, exist_ok=True)
     src = PROGRAM_SRC / "docs" / "knowledge-pack.md"
