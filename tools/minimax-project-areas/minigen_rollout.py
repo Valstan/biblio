@@ -228,6 +228,17 @@ def install_program() -> bool:
         commit = ""
     version = {"commit": commit, "installed_at": int(time.time()),
                "source": str(REPO)}
+    # Родословная копии (заказ владельца 24.11): в версии программы видно,
+    # какая это копия, из какого семейства и от какой версии форк.
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mg_lineage", str(PROGRAM_SRC / "bridge" / "minigen_lineage.py"))
+        lineage_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(lineage_mod)
+        version = lineage_mod.stamp(version)
+    except Exception:  # noqa: BLE001
+        pass        # родословная — дополнительный штрих, без неё раскатка идёт
     (PROGRAM_ROOT / "version.json").write_text(
         json.dumps(version, ensure_ascii=False, indent=2), encoding="utf-8")
 
