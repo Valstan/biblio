@@ -359,6 +359,110 @@ TOOLS: list[dict[str, Any]] = [
           "Убрать worktree правки и её ветку (правка не нужна).",
           {"type": "object", "properties": {}},
           "code.discard", True, "удалит worktree правки и её ветку"),
+
+    # ── агенты «МиниГена» (заказ владельца 24.11) ────────────────────────
+    _tool("agents.list",
+          "Агенты «МиниГена»: кто заведён, где его репозиторий и область, "
+          "какие у него заявки. Начинай с этого, если говоришь об агентах.",
+          {"type": "object", "properties": {}},
+          "agents.list"),
+
+    _tool("agents.state",
+          "Состояние реестра агентов: сам реестр (репозиторий на GitHub), "
+          "есть ли он на этой машине, какие шаблоны агентов доступны.",
+          {"type": "object", "properties": {}},
+          "agents.state"),
+
+    _tool("agents.create",
+          "Создать нового агента «МиниГена»: рабочий репозиторий (существующий "
+          "или новый на GitHub), конституция AGENTS.md, скиллы из шаблона, "
+          "своя рабочая область и запись в реестр (чтобы восстановить "
+          "агента на любой машине).",
+          {"type": "object",
+           "properties": {
+               "slug": {"type": "string", "description": "короткое имя латиницей"},
+               "title": {"type": "string", "description": "название агента"},
+               "role": {"type": "string", "description": "чем он занимается"},
+               "repo": {"type": "string",
+                        "description": "репозиторий агента (owner/name); пусто — создать Valstan/<slug>"},
+               "template": {"type": "string",
+                            "description": "шаблон агента (каталог в agent-templates)"},
+               "area": {"type": "string",
+                        "description": "рабочая область (пусто — имя как у slug)"},
+               "no_area": {"type": "boolean",
+                           "description": "не заводить рабочую область"},
+           },
+           "required": ["slug", "title"]},
+          "agents.create", True,
+          "создаст репозиторий на GitHub, область и запись в реестре"),
+
+    _tool("agents.apply",
+          "Восстановить агента на этой машине по реестру: репозиторий, "
+          "конституция, скиллы и область. Так агента поднимают на другом "
+          "компьютере.",
+          {"type": "object",
+           "properties": {"slug": {"type": "string"},
+                          "area": {"type": "string",
+                                   "description": "область (пусто — как в манифесте)"}},
+           "required": ["slug"]},
+          "agents.apply", True, "склонирует репозиторий агента и поставит скиллы"),
+
+    # ── заявки: зачитка владельца → текст для другой нейросети ────────────
+    _tool("ingest.draft",
+          "Собрать каркас заявки по зачитке владельца: к какому проекту она "
+          "относится (или нужен новый), какие разделы заполнить и чего не "
+          "хватает. Текст заявки пишешь ты сам по этому каркасу.",
+          {"type": "object",
+           "properties": {"text": {"type": "string", "description": "зачитка владельца"},
+                          "title": {"type": "string"},
+                          "project": {"type": "string",
+                                      "description": "проект, если он назван прямо"}},
+           "required": ["text"]},
+          "ingest.draft"),
+
+    _tool("ingest.save",
+          "Сохранить заявку: в репозиторий агента (долговечно) и в раздел "
+          "КАРМАНА проекта (раздел заводится, если его нет).",
+          {"type": "object",
+           "properties": {
+               "agent": {"type": "string", "description": "агент-владелец заявки"},
+               "title": {"type": "string"},
+               "project": {"type": "string", "description": "проект (slug)"},
+               "summary": {"type": "string", "description": "суть в одну фразу"},
+               "body": {"type": "string",
+                        "description": "текст заявки с разделами (markdown)"},
+           },
+           "required": ["body"]},
+          "ingest.save", True, "запишет заявку в репозиторий агента и в КАРМАН"),
+
+    # ── чужие репозитории: только чтение ──────────────────────────────────
+    _tool("repos.list",
+          "Репозитории рабочего пространства: имена, удалённые репозитории, "
+          "ветка, есть ли конституция AGENTS.md. Это проекты, к которым можно "
+          "привязать заявку.",
+          {"type": "object", "properties": {}},
+          "repos.list"),
+
+    _tool("repos.read",
+          "Прочитать файл чужого репозитория (только чтение: файлы с ключами "
+          "закрыты). Читай, чтобы попасть в стиль проекта и назвать настоящие "
+          "модули.",
+          {"type": "object",
+           "properties": {"repo": {"type": "string", "description": "имя репозитория"},
+                          "path": {"type": "string", "description": "путь внутри репозитория"},
+                          "start_line": {"type": "integer"},
+                          "end_line": {"type": "integer"}},
+           "required": ["repo", "path"]},
+          "repos.read"),
+
+    _tool("repos.profile",
+          "Сводка по чужому репозиторию: README, конституция AGENTS.md, "
+          "языки, число файлов. Это «почерк» проекта — по нему заявка "
+          "пишется в его стиле.",
+          {"type": "object",
+           "properties": {"repo": {"type": "string", "description": "имя репозитория"}},
+           "required": ["repo"]},
+          "repos.profile"),
 ]
 
 

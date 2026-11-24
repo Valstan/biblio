@@ -23,6 +23,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Зависимости Python
+        run: pip install pyyaml
       - name: Приёмка панели «МиниГен» (архив)
         run: python3 tools/minimax-project-areas/archive/check_panel.py --source-only
       - name: Приёмка переключения серверов Happ
@@ -53,3 +58,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_rollout_stops_hidden.py
       - name: Приёмка отправки «Продолжай» (лечащий живёт без ядра)
         run: python3 tools/minimax-project-areas/test_autheal_continue_sends.py
+      - name: Приёмка экосистемы агентов (заявка из зачитки и раздел КАРМАНА)
+        run: python3 tools/minimax-project-areas/test_agents_ecosystem.py
