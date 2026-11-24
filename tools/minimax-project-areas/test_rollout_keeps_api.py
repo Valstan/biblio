@@ -89,6 +89,11 @@ def main() -> int:
             return answers.pop(0) if answers else {}
 
         rollout.api_status = fake_api_status
+        # ⚠️ Живой случай 24.11: `stop_managers()` гасит **живого** надзирателя
+        # (по файлу блокировки — его не видно в WMI). Приёмка зовёт её
+        # по-настоящему ⇒ на живой машине она гасила фоновый режим программы
+        # (и окно оставалось без API). Поэтому здесь надзиратель — «никто».
+        rollout.supervisor_pid = lambda: 0
         rollout.stop_managers()
         check(len(seen) >= 3,
               "порт не ждали: проверок API %d (ждать надо, пока не освободится)"

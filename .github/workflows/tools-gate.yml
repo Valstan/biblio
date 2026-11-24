@@ -51,3 +51,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_window_smoke_ui.py
       - name: Приёмка остановки непрозрачного (повышенные процессы не видны WMI)
         run: python3 tools/minimax-project-areas/test_rollout_stops_hidden.py
+      - name: Приёмка отправки «Продолжай» (лечащий живёт без ядра)
+        run: python3 tools/minimax-project-areas/test_autheal_continue_sends.py

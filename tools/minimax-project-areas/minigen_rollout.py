@@ -438,6 +438,72 @@ def daemon_pids_visible() -> list[int]:
     return pids
 
 
+def daemon_children_of(supervisor_pid: int) -> list[int]:
+    """Дети надзирателя — их видно даже без командных строк.
+
+    ⚠️ Живой случай 24.11: демоны, поднятые **повышенным** надзирателем, не
+    видны ни WMI (у них пустая командная строка), ни `taskkill`. Но **родитель**
+    у них виден всегда ⇒ по нему их и находим. Иначе раскатка оставила бы их
+    жить, а новый надзиратель поднял бы **вторые** копии (урок 22.11: два
+    лечащих брали аккаунты дважды).
+    """
+    if not supervisor_pid:
+        return []
+    ps = ("Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq %d } | "
+          "ForEach-Object { $_.ProcessId }" % int(supervisor_pid))
+    res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=60,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    pids: list[int] = []
+    for token in (res.stdout or "").split():
+        if token.strip().isdigit():
+            pids.append(int(token.strip()))
+    return pids
+
+
+def process_started_at(pid: int) -> str:
+    """Когда процесс был создан (по данным WMI) — пусто, если его нет."""
+    ps = ("Get-CimInstance Win32_Process -Filter \"ProcessId=%d\" | "
+          "ForEach-Object { $_.CreationDate.ToString('yyyy-MM-dd HH:mm:ss') }" % int(pid))
+    res = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                         capture_output=True, text=True, timeout=30,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return (res.stdout or "").strip().splitlines()[0] if (res.stdout or "").strip() else ""
+
+
+def daemon_pids_from_journal() -> list[int]:
+    """Pid'ы демонов, которых поднял надзиратель, — по журналу.
+
+    ⚠️ Живой случай 24.11: демоны могут быть не видны ни WMI (нет командной
+    строки), ни через API (надзиратель уже мёртв), ни по родителю (файл
+    блокировки устарел). Но **надзиратель писал их pid'ы в журнал**
+    («ДЕМОНЫ: лечащий не жил — поднял (pid …)») ⇒ это последний способ найти
+    их и остановить, чтобы новый надзиратель не поднял вторые копии.
+
+    ⚠️ Pid переиспользуется! Поэтому берём только те, что **живут и созданы
+    не позже** записи в журнале: иначе можно убить чужой процесс, которому
+    достался этот номер.
+    """
+    journal = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" / "journal.log"
+    try:
+        tail = journal.read_text(encoding="utf-8", errors="replace").splitlines()[-500:]
+    except OSError:
+        return []
+    pids: list[int] = []
+    for line in tail:
+        match = re.search(r"^\[(?P<ts>[\d\-]+ [\d:]+)\].*поднял\s*\(pid\s+(?P<pid>\d+)\)",
+                          line)
+        if not match:
+            continue
+        pid = int(match.group("pid"))
+        if pid in pids:
+            continue
+        born = process_started_at(pid)
+        if born and born <= match.group("ts"):
+            pids.append(pid)
+    return pids
+
+
 def stop_daemons() -> int:
     """Остановить демонов — и тех, кого WMI не видит.
 
@@ -457,6 +523,16 @@ def stop_daemons() -> int:
             except (TypeError, ValueError):
                 continue
     for pid in daemon_pids_visible():
+        if pid not in pids:
+            pids.append(pid)
+    # API мог и не ответить (надзиратель уже мёртв) ⇒ берём демонов по
+    # родителю: они — дети надзирателя, и родитель виден даже тогда, когда
+    # командная строка процесса не видна (живой случай 24.11).
+    for pid in daemon_children_of(supervisor_pid()):
+        if pid not in pids:
+            pids.append(pid)
+    # и последний способ — журнал: надзиратель писал, кого поднял.
+    for pid in daemon_pids_from_journal():
         if pid not in pids:
             pids.append(pid)
     stopped = 0
@@ -502,6 +578,11 @@ def manager_processes() -> list[tuple[int, str]]:
 
 def stop_managers() -> int:
     """Остановить **все** фоновые менеджеры программы.
+
+    ⚠️ ВНИМАНИЕ: функция гасит **живого** надзирателя (по файлу блокировки).
+    Из приёмок её можно звать только с подменой `supervisor_pid` — иначе
+    приёмка гасит фоновый режим на живой машине (живой случай 24.11: так
+    программа осталась без API, а окно — без надзирателя).
 
     ⚠️ Зачем (живой случай 23.11): программа живёт в своём месте (PR #79), а
     копии из дерева репозитория живут до перезагрузки. Каждая такая копия —
