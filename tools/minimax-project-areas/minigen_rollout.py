@@ -213,6 +213,30 @@ def _clean_stale_bundles(dst: Path) -> int:
     return removed
 
 
+def built_commit(program_src: Path | None = None) -> str:
+    """Коммит, из которого **собран бандл окна** (файл метки рядом с бандлом).
+
+    ⚠️ Зачем (живой случай 24.11): «версия на месте» должна описывать
+    установленный бандл, а не коммит рабочего дерева. Иначе раскатка (например,
+    после мержа одних документов, без пересборки) записывала в `version.json`
+    коммит master, а окно работало на старой сборке — и владелец вечно видел
+    «на диске новее, окно старое», а перезапуск **не помогал**: перезапускался
+    тот же бандл. Теперь версия берётся из самого бандла ⇒ расхождение
+    невозможно по построению.
+
+    Пусто — сборка без метки (тогда раскатка возьмёт коммит рабочего дерева).
+    """
+    src = program_src or PROGRAM_SRC
+    try:
+        data = json.loads((src / "out" / "build-info.json").read_text(encoding="utf-8"))
+        commit = str((data or {}).get("commit") or "").strip()
+        if commit:
+            return commit
+    except (OSError, ValueError, TypeError):
+        pass
+    return ""
+
+
 def install_program() -> bool:
     """Поставить программу в своё место и переписать ярлыки.
 
@@ -256,17 +280,22 @@ def install_program() -> bool:
     (PROGRAM_ROOT / "Запустить.cmd").write_bytes(LAUNCHER_CMD.encode("ascii"))
     (PROGRAM_ROOT / "Автозапуск.cmd").write_bytes(AUTOSTART_CMD.encode("ascii"))
 
-    # Версия установленной копии: коммит исходников + время установки.
-    # Урок 23.11: программа без версии меняется вместе с веткой репозитория;
-    # установленная копия версию имеет, и показывает её в окне.
+    # Версия установленной копии: **коммит, из которого собран бандл**, + время
+    # установки. Урок 23.11: программа без версии меняется вместе с веткой
+    # репозитория; установленная копия версию имеет, и показывает её в окне.
+    # ⚠️ 24.11: коммит берётся из метки сборки (`out/build-info.json`), а не из
+    # `HEAD` рабочего дерева — иначе «версия на месте» могла уехать вперёд
+    # относительно бандла, и окно вечно просило перезапуск, который не помогал.
     import time
-    commit = ""
-    try:
-        res = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
-                             capture_output=True, text=True, timeout=15)
-        commit = (res.stdout or "").strip()
-    except Exception:  # noqa: BLE001
-        commit = ""
+    commit = built_commit()
+    if not commit:
+        # запасной путь: сборка без метки — коммит рабочего дерева
+        try:
+            res = subprocess.run(["git", "-C", str(REPO), "rev-parse", "--short", "HEAD"],
+                                 capture_output=True, text=True, timeout=15)
+            commit = (res.stdout or "").strip()
+        except Exception:  # noqa: BLE001
+            commit = ""
     version = {"commit": commit, "installed_at": int(time.time()),
                "source": str(REPO)}
     # Родословная копии (заказ владельца 24.11): в версии программы видно,

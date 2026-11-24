@@ -1,7 +1,9 @@
 import { execSync } from 'child_process'
-import { resolve } from 'path'
+import { mkdirSync, writeFileSync } from 'fs'
+import { dirname, resolve } from 'path'
 import { defineConfig, externalizeDepsPlugin } from 'electron-vite'
 import react from '@vitejs/plugin-react'
+import type { Plugin } from 'vite'
 
 /**
  * Коммит, из которого собрано окно, — вшивается в бандл.
@@ -24,9 +26,61 @@ function buildCommit(): string {
   }
 }
 
+/** Ветка, из которой собрано окно (для честного отчёта). */
+function buildBranch(): string {
+  try {
+    return execSync('git rev-parse --abbrev-ref HEAD', {
+      cwd: __dirname,
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * Метка сборки **рядом с бандлом** (`out/build-info.json`).
+ *
+ * ⚠️ Зачем (живой случай 24.11): окно и «версия на месте» должны описывать
+ * одно и то же. Раньше раскатка писала в `version.json` коммит рабочего
+ * дерева, а окно несло метку той сборки, что лежит на диске. Стоило
+ * закатить только документы (без пересборки) — и «версия на месте» уезжала
+ * вперёд, а окно оставалось на старом коде: владелец вечно видел «на диске
+ * новее, окно старое», а перезапуск не помогал (перезапускался тот же
+ * бандл). Теперь версия ставится **из самого бандла** — расхождение невозможно
+ * по построению.
+ */
+function buildInfoPlugin(): Plugin {
+  return {
+    name: 'minigen-build-info',
+    closeBundle() {
+      try {
+        const file = resolve(__dirname, 'out/build-info.json')
+        mkdirSync(dirname(file), { recursive: true })
+        writeFileSync(
+          file,
+          JSON.stringify(
+            {
+              commit: buildCommit(),
+              branch: buildBranch(),
+              built_at: new Date().toISOString()
+            },
+            null,
+            2
+          ),
+          'utf-8'
+        )
+      } catch {
+        /* метка не записалась — раскатка возьмёт коммит рабочего дерева */
+      }
+    }
+  }
+}
+
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
+    plugins: [externalizeDepsPlugin(), buildInfoPlugin()],
     define: {
       'process.env.MINIGEN_COMMIT': JSON.stringify(buildCommit())
     },

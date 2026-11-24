@@ -43,3 +43,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_karman_prompts.py
       - name: Приёмка API при раскатке (программа не остаётся без API)
         run: python3 tools/minimax-project-areas/test_rollout_keeps_api.py
+      - name: Приёмка версии по бандлу (окно и «версия на месте» — одно и то же)
+        run: python3 tools/minimax-project-areas/test_rollout_version_from_build.py

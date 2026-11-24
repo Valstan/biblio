@@ -133,6 +133,8 @@ class UpdateTest(unittest.TestCase):
         def fake_git(args, cwd, timeout=120):
             if args and args[0] == "status":
                 return 0, "", ""
+            if args[:3] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return 0, "master", ""
             if args and args[0] == "remote":
                 return 0, "origin", ""
             return 0, "aaaaaaa", ""
@@ -143,6 +145,31 @@ class UpdateTest(unittest.TestCase):
             last = dict(update._last)
         self.assertFalse(last.get("ok"))
         self.assertIn("node_modules", last.get("why", ""))
+
+    def test_update_stops_on_a_branch(self) -> None:
+        """Исходники на ветке ⇒ обновление не идёт: окно собирается из master.
+
+        Живой случай 24.11: в дереве была ветка правки, сборка взяла метку из
+        неё, и окно потом вечно спорило с «версией на месте» — перезапуск не
+        помогал, потому что перезапускался тот же бандл.
+        """
+        def fake_git(args, cwd, timeout=120):
+            if args and args[0] == "status":
+                return 0, "", ""
+            if args[:3] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return 0, "agent/minigen-fix", ""
+            if args and args[0] == "remote":
+                return 0, "origin", ""
+            return 0, "aaaaaaa", ""
+        update._git = fake_git
+        update._stream = lambda args, cwd, step: 0
+        update._run()
+        with update._lock:
+            last = dict(update._last)
+        self.assertFalse(last.get("ok"))
+        why = last.get("why", "")
+        self.assertIn("ветке", why)
+        self.assertIn("master", why)
 
     # ── журнал и статус ────────────────────────────────────────────────
     def test_log_records_steps(self) -> None:

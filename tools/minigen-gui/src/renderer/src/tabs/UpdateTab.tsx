@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { UpdateState } from '@shared/types'
 import { api, desktop } from '../api'
-import { describeUpdate } from './update-view'
+import { describeUpdate, formatInstalledAt } from './update-view'
 
 /**
  * Вкладка «Обновление» — наглядный процесс обновления программы.
@@ -121,7 +121,7 @@ export default function UpdateTab() {
               <td className="muted">
                 {installed?.commit ? `коммит ${installed.commit}` : 'неизвестно'}
                 {installed?.installed_at
-                  ? ` · ${new Date(installed.installed_at).toLocaleString('ru-RU')}`
+                  ? ` · ${formatInstalledAt(installed.installed_at)}`
                   : ''}
               </td>
             </tr>
