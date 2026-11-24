@@ -42,6 +42,7 @@ import minigen_state as state          # noqa: E402
 import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
 import minigen_clone as clone_mod      # noqa: E402
+import minigen_genes as genes_mod      # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
 import minigen_lock as minigen_lock    # noqa: E402
 import minigen_lineage as lineage      # noqa: E402
@@ -182,6 +183,11 @@ class Bridge:
             "clone.status": self.cmd_clone_status,
             "clone.setup": self.cmd_clone_setup,
             "clone.sync": self.cmd_clone_sync,
+            # пул генов: обмен наработками между копиями
+            "genes.list": self.cmd_genes_list,
+            "genes.read": self.cmd_genes_read,
+            "genes.publish": self.cmd_genes_publish,
+            "genes.adopt": self.cmd_genes_adopt,
         }
 
     # Команды, чей вызов **не** отчитывается в «ящик отчётов»: иначе
@@ -581,6 +587,27 @@ class Bridge:
                                                   days=int(args.get("days") or 7)))
 
     # ──────────────────────────────────────────────────────── ящик отчётов
+    def cmd_genes_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Гены пула: какие наработки есть у копий."""
+        return {"genes": state.jsonable(genes_mod.list_genes())}
+
+    def cmd_genes_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Один ген: манифест, заметка и diff."""
+        return state.jsonable(genes_mod.read_gene(str(args.get("gene") or "")))
+
+    def cmd_genes_publish(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Опубликовать свою наработку в пул (уходит в общий репозиторий)."""
+        return state.jsonable(genes_mod.publish(
+            title=str(args.get("title") or ""),
+            summary=str(args.get("summary") or ""),
+            notes=str(args.get("notes") or "")))
+
+    def cmd_genes_adopt(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Внедрить чужой ген: ветка → проверки → PR (решение за владельцем)."""
+        return state.jsonable(genes_mod.adopt(
+            gene=str(args.get("gene") or ""),
+            title=str(args.get("title") or "")))
+
     def cmd_clone_status(self, args: dict[str, Any]) -> dict[str, Any]:
         """Свой клон копии: где он, какие репозитории, что в родословной."""
         return state.jsonable(clone_mod.status())
