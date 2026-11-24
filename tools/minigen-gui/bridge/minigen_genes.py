@@ -225,18 +225,72 @@ def publish(title: str, summary: str = "", notes: str = "",
             "why": "опубликовано в пул: %s" % gene}
 
 
-def _append_pool_lineage(gene: str, event: str) -> None:
-    """Летопись пула: свой файл на копию (общий журнал конфликтовал бы)."""
+def append_pool_event(event: str, gene: str = "", **fields: Any) -> bool:
+    """Дописать событие в летопись пула (свой файл на копию).
+
+    Общий журнал конфликтовал бы: копии пишут в пул одновременно.
+    """
     data = lineage.instance()
     instance = str(data.get("instance_id") or "copy")
-    record = {"ts": _now(), "event": event, "gene": gene, "instance": instance}
+    record = {"ts": _now(), "event": event, "instance": instance}
+    if gene:
+        record["gene"] = gene
+    for key, value in fields.items():
+        if value not in (None, "", [], {}):
+            record[key] = value
     try:
         directory = pool_dir() / LINEAGE_DIR
         directory.mkdir(parents=True, exist_ok=True)
         with (directory / ("%s.jsonl" % instance)).open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return True
     except OSError:
-        pass
+        return False
+
+
+def record_birth(fork_commit: str = "", **fields: Any) -> bool:
+    """Отметить в пуле рождение копии: «в какой точке родилась».
+
+    Карта родословной общая для всех копий (заказ владельца 24.11): кто
+    появился, от какой версии форк — и дальше по этой точке видно, кто у кого
+    брал гены.
+    """
+    return append_pool_event("born", fork_commit=fork_commit, **fields)
+
+
+def publish_birth(fork_commit: str = "", **fields: Any) -> dict[str, Any]:
+    """Записать рождение копии в пул **и отправить в общий репозиторий**.
+
+    Без отправки событие осталось бы на этой машине, и карта у соседей не
+    увидела бы, что появилась новая копия.
+    """
+    ready, why = _pool_ready()
+    if not ready:
+        return {"ok": False, "error": why}
+    data = lineage.instance()
+    instance = str(data.get("instance_id") or "copy")
+    if not record_birth(fork_commit, **fields):
+        return {"ok": False, "error": "не записать в летопись пула"}
+    add = _git(["add", "-A", LINEAGE_DIR], pool_dir())
+    if not add.get("ok"):
+        return {"ok": False, "error": "не добавить в индекс: %s"
+                % (add.get("err") or add.get("out"))}
+    commit = _git(["commit", "-m", "born: %s (карта родословной)" % instance],
+                  pool_dir(), timeout=180)
+    if not commit.get("ok"):
+        return {"ok": False, "error": "коммит не прошёл: %s"
+                % (commit.get("err") or commit.get("out"))}
+    push = _git(["push", "origin", "HEAD:refs/heads/pool"], pool_dir(), timeout=300)
+    if not push.get("ok"):
+        return {"ok": False, "error": "пуш в пул не прошёл: %s"
+                % (push.get("err") or push.get("out"))}
+    return {"ok": True, "instance": instance, "fork_commit": fork_commit,
+            "why": "рождение копии записано в пул"}
+
+
+def _append_pool_lineage(gene: str, event: str) -> None:
+    """Летопись пула: свой файл на копию (общий журнал конфликтовал бы)."""
+    append_pool_event(event, gene=gene)
 
 
 def adopt(gene: str, title: str = "") -> dict[str, Any]:
