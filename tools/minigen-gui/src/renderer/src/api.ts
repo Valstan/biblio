@@ -12,6 +12,10 @@ import type {
   CopyTokenRequest,
   CopyTokenStatus,
   DaemonStatus,
+  DbExportResult,
+  DbImportPlan,
+  DbImportReport,
+  DbStatus,
   GeneActionResult,
   GeneMap,
   GeneRecord,
@@ -187,7 +191,23 @@ export const api = {
     call<{ ok?: boolean; why?: string; error?: string }>('copy.token_trust', {
       instance_id,
       key_id
-    })
+    }),
+  // ── локальная база «МиниГена» (промт #92) ───────────────────────────────
+  dbStatus: () => call<DbStatus>('db.status'),
+  dbRecords: (kind?: string, limit?: number) =>
+    call<{ ok: boolean; records: unknown[]; count: number }>('db.records', {
+      kind,
+      limit
+    }),
+  /** Выгрузка: путь выбирает оператор (диалог главного процесса). */
+  dbExport: () => call<DbExportResult>('db.export'),
+  /** Разбор файла выгрузки — ничего не меняет, только план и вопросы. */
+  dbInspect: (path: string) => call<DbImportPlan>('db.inspect', { path }),
+  /** Импорт: решения оператора по спорным записям («вид|ключ» → решение). */
+  dbImport: (path: string, decisions?: Record<string, string>) =>
+    call<DbImportReport>('db.import', { path, decisions }),
+  /** Выбор файла выгрузки — диалог открывает главный процесс. */
+  dbPickFile: () => call<{ ok: boolean; path?: string; canceled?: boolean }>('db.pick')
 }
 
 /** Действия окна (не моста): перезапуск, метка сборки, состояние моста. */

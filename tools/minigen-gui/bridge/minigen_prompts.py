@@ -10,12 +10,19 @@
 
 Два провайдера хранилища:
 
-- `LocalPromptStore` — **в базе «МиниГена»** (SQLite, `%LOCALAPPDATA%\\
-  minigen-gui\\prompts.db`): работает всегда и без сети;
+- `LocalPromptStore` — **в локальной базе «МиниГена»** (SQLite,
+  `%LOCALAPPDATA%\\minigen-gui\\minigen.db`): работает всегда и без сети;
 - `KarmanPromptStore` — **внешний ресурс** (Карман со своим хранилищем):
   читает разделы секретом канала (тот приходит в программу сам из
   vault-комнаты), архивирует своим токеном раздела (`PROMPTS_TOKEN_<Раздел>`,
   он тоже лежит в vault-комнате, если выдан грант).
+
+⚠️ Промты лежат в **универсальной базе** программы (`minigen_db.py`): данные
+хранятся **видами** (`prompt`, `plan`), а не таблицами — чтобы база переживала
+смену версии программы и её можно было выгрузить в один файл и залить в
+другую копию «МиниГена» (промт #92). Старая база хранилища (`prompts.db`)
+переносится в новую один раз (`migrate_legacy_store`), а её файл остаётся на
+месте — запасная копия.
 
 Выбор места — **настройка окна** (`promptStore`: `local` | `karman`). Данные
 каждого хранилища живут у своего хозяина: переключение места не переносит
@@ -42,6 +49,7 @@ vault-комнаты или из файлов ключей, наружу ухо�
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import time
@@ -49,16 +57,29 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+import minigen_db
 import minigen_karman as karman
+import minigen_state as state
 
-#: База «МиниГена» с промтами и служебными отметками.
+#: Дом программы на машине: тут настройки, база и журнал.
 GUI_HOME = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "minigen-gui"
-LOCAL_DB = GUI_HOME / "prompts.db"
+#: **Универсальная база «МиниГена»** — промты, планы и всё, что программа
+#: складывает в базу. Схема не привязана к версии программы (промт #92), база
+#: выгружается в один файл и заливается в другую копию «МиниГена».
+LOCAL_DB = state.DB_FILE
+#: Старая база хранилища промтов (таблица на каждую сущность — привязана к
+#: версии программы). Из неё данные переносятся один раз; файл остаётся на
+#: месте как запасная копия.
+LEGACY_DB = GUI_HOME / "prompts.db"
 
 SOURCE_LOCAL = "local"
 SOURCE_KARMAN = "karman"
 KIND_PROMPT = "prompt"
 KIND_PLAN = "plan"
+#: Виды служебных отметок (пометка «раздавать автоматически» и журнал
+#: отправки) — в универсальной базе это тоже записи, просто свои виды.
+KIND_MARK = "prompt-mark"
+KIND_DISPATCH = "prompt-dispatch"
 
 #: Сколько символов промта уходит в область (текст задания).
 MAX_TASK_TEXT = 20_000
@@ -124,8 +145,8 @@ def normalize_record(raw: dict[str, Any], source: str) -> dict[str, Any]:
 
 # ──────────────────────────────────────────────────────── база «МиниГена»
 
-def ensure_schema(con: sqlite3.Connection) -> None:
-    """Таблицы хранилища: записи, отметки владельца, журнал раздачи."""
+def legacy_ensure_schema(con: sqlite3.Connection) -> None:
+    """Старая схема хранилища — нужна, чтобы прочитать базу при переносе."""
     con.execute(
         "CREATE TABLE IF NOT EXISTS records ("
         " id TEXT PRIMARY KEY, project TEXT NOT NULL, title TEXT NOT NULL,"
@@ -145,15 +166,44 @@ def ensure_schema(con: sqlite3.Connection) -> None:
     con.commit()
 
 
-def connect(db_path: Path | None = None) -> sqlite3.Connection:
-    """Открыть базу хранилища (схема создаётся при первом обращении)."""
-    target = Path(db_path or LOCAL_DB)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(target), timeout=15)
+def legacy_connect(db_path: Path | None = None) -> sqlite3.Connection:
+    """Открыть **старую** базу хранилища — только на чтение.
+
+    Старая база нужна для переноса (одноразового) и для запасного чтения,
+    если перенос по какой-то причине не прошёл.
+    """
+    target = Path(db_path or LEGACY_DB)
+    if not target.is_file():
+        raise sqlite3.Error("старой базы нет: %s" % target)
+    uri = target.resolve().as_uri() + "?mode=ro"
+    con = sqlite3.connect(uri, uri=True, timeout=15)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA busy_timeout=10000")
-    ensure_schema(con)
     return con
+
+
+def _legacy_tables(con: sqlite3.Connection) -> set[str]:
+    rows = con.execute("select name from sqlite_master where type='table'").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def _payload_of(raw: Any) -> dict[str, Any]:
+    """Содержимое записи — словарём (битое содержимое не должно ронять чтение)."""
+    try:
+        payload = json.loads(raw) if raw else {}
+    except (TypeError, ValueError):
+        return {}
+    return payload if isinstance(payload, dict) else {"value": payload}
+
+
+def _mark_key(source: str, project: str, prompt_id: str) -> str:
+    """Ключ служебной отметки (пометка «раздавать», журнал отправки)."""
+    return "%s|%s|%s" % (str(source or ""), str(project or ""),
+                         str(prompt_id or ""))
+
+
+def connect(db_path: Path | None = None) -> sqlite3.Connection:
+    """Открыть **универсальную** базу «МиниГена» (схема создаётся сама)."""
+    return minigen_db.connect(Path(db_path) if db_path else LOCAL_DB)
 
 
 # ─────────────────────────────────────────────── отметки владельца (marks)
@@ -163,10 +213,9 @@ def get_mark(source: str, project: str, prompt_id: str,
     """Помечен ли промт владельцем как «раздавать автоматически»."""
     con = connect(db_path)
     try:
-        row = con.execute(
-            "select auto from marks where source=? and project=? and id=?",
-            (source, project, prompt_id)).fetchone()
-        return bool(row and row["auto"])
+        rec = minigen_db.get_record(con, KIND_MARK,
+                                    _mark_key(source, project, prompt_id))
+        return bool((rec or {}).get("payload", {}).get("auto"))
     finally:
         con.close()
 
@@ -176,12 +225,12 @@ def set_mark(source: str, project: str, prompt_id: str, auto: bool,
     """Пометить (или снять пометку) — только владелец может."""
     con = connect(db_path)
     try:
-        con.execute(
-            "insert into marks (source, project, id, auto, at) values (?,?,?,?,?)"
-            " on conflict(source, project, id) do update set auto=excluded.auto,"
-            " at=excluded.at",
-            (source, project, prompt_id, 1 if auto else 0, now_ms()))
-        con.commit()
+        minigen_db.put_record(con, KIND_MARK,
+                              _mark_key(source, project, prompt_id),
+                              {"auto": bool(auto), "at": now_ms(),
+                               "source": str(source or ""),
+                               "project": str(project or ""),
+                               "id": str(prompt_id or "")})
         return {"ok": True, "auto": bool(auto)}
     finally:
         con.close()
@@ -192,10 +241,9 @@ def already_dispatched(source: str, project: str, prompt_id: str,
     """Раздавали ли этот промт уже — чтобы не раздать дважды."""
     con = connect(db_path)
     try:
-        row = con.execute(
-            "select 1 from dispatched where source=? and project=? and id=?",
-            (source, project, prompt_id)).fetchone()
-        return bool(row)
+        rec = minigen_db.get_record(con, KIND_DISPATCH,
+                                    _mark_key(source, project, prompt_id))
+        return rec is not None
     finally:
         con.close()
 
@@ -204,66 +252,244 @@ def mark_dispatched(source: str, project: str, prompt_id: str, area: str,
                      db_path: Path | None = None) -> None:
     con = connect(db_path)
     try:
-        con.execute(
-            "insert into dispatched (source, project, id, area, at) values (?,?,?,?,?)"
-            " on conflict(source, project, id) do update set area=excluded.area,"
-            " at=excluded.at",
-            (source, project, prompt_id, area or "", now_ms()))
-        con.commit()
+        minigen_db.put_record(con, KIND_DISPATCH,
+                              _mark_key(source, project, prompt_id),
+                              {"area": area or "", "at": now_ms(),
+                               "source": str(source or ""),
+                               "project": str(project or ""),
+                               "id": str(prompt_id or "")})
     finally:
         con.close()
 
 
 # ───────────────────────────────────────────────── локальное хранилище
 
+def migrate_legacy_store(legacy_path: Path | None = None,
+                         universal_path: Path | None = None) -> dict[str, Any]:
+    """Перенести старую базу хранилища в универсальную базу программы.
+
+    Старая база привязана к версии программы: в ней **таблица на каждую
+    сущность**. Универсальная база хранит то же содержимое **видами**
+    (`prompt`, `plan`, `prompt-mark`, `prompt-dispatch`) — и потому её можно
+    выгрузить в один файл и залить в другую копию «МиниГена» (промт #92).
+
+    Перенос **одноразовый** (помечаем в `schema_meta`) и **не трогает** старый
+    файл: тот остаётся запасной копией.
+    """
+    source = Path(legacy_path or LEGACY_DB)
+    target = Path(universal_path or LOCAL_DB)
+    out: dict[str, Any] = {"ok": True, "migrated": 0, "why": "",
+                            "legacy": str(source), "target": str(target)}
+    if not source.is_file():
+        out["why"] = "старой базы нет — переносить нечего"
+        return out
+    try:
+        if source.resolve() == target.resolve():
+            out["why"] = "старой базы нет — переносить нечего"
+            return out
+    except OSError:
+        pass
+    try:
+        con = minigen_db.connect(target)
+    except sqlite3.Error as exc:
+        return {"ok": False, "migrated": 0,
+                "why": "новая база не открылась: %s" % exc}
+    try:
+        marker = "legacy_prompts_migrated"
+        row = con.execute("select value from schema_meta where key=?",
+                          (marker,)).fetchone()
+        if row:
+            out["why"] = "старая база уже перенесена"
+            return out
+        try:
+            old = legacy_connect(source)
+        except sqlite3.Error as exc:
+            return {"ok": False, "migrated": 0,
+                    "why": "старая база не открылась: %s" % exc}
+        try:
+            tables = _legacy_tables(old)
+            moved = 0
+            if "records" in tables:
+                for row in old.execute(
+                        "select id, project, title, body, kind, archived,"
+                        " created_at from records").fetchall():
+                    kind = str(row["kind"] or KIND_PROMPT)
+                    if kind not in (KIND_PROMPT, KIND_PLAN):
+                        kind = KIND_PROMPT
+                    payload = {
+                        "project": str(row["project"] or ""),
+                        "title": str(row["title"] or ""),
+                        "body": str(row["body"] or ""),
+                        "archived": bool(row["archived"]),
+                        "kind": kind,
+                        "createdAt": iso_stamp(row["created_at"]),
+                    }
+                    minigen_db.put_record(con, kind, str(row["id"]), payload,
+                                          created_at=payload["createdAt"])
+                    moved += 1
+            if "marks" in tables:
+                for row in old.execute(
+                        "select source, project, id, auto, at from marks").fetchall():
+                    minigen_db.put_record(
+                        con, KIND_MARK,
+                        _mark_key(row["source"], row["project"], row["id"]),
+                        {"auto": bool(row["auto"]), "at": int(row["at"] or 0),
+                         "source": str(row["source"] or ""),
+                         "project": str(row["project"] or ""),
+                         "id": str(row["id"] or "")})
+                    moved += 1
+            if "dispatched" in tables:
+                for row in old.execute(
+                        "select source, project, id, area, at"
+                        " from dispatched").fetchall():
+                    minigen_db.put_record(
+                        con, KIND_DISPATCH,
+                        _mark_key(row["source"], row["project"], row["id"]),
+                        {"area": str(row["area"] or ""), "at": int(row["at"] or 0),
+                         "source": str(row["source"] or ""),
+                         "project": str(row["project"] or ""),
+                         "id": str(row["id"] or "")})
+                    moved += 1
+        finally:
+            old.close()
+        con.execute("insert into schema_meta(key,value) values(?,?)"
+                    " on conflict(key) do update set value=excluded.value",
+                    (marker, minigen_db.now_iso()))
+        con.commit()
+        out["migrated"] = moved
+        out["why"] = "перенесено записей из старой базы: %d" % moved
+    except sqlite3.Error as exc:
+        return {"ok": False, "migrated": 0, "why": "перенос не прошёл: %s" % exc}
+    finally:
+        con.close()
+    return out
+
+
 class LocalPromptStore:
-    """Промты в базе «МиниГена» — работает всегда и без сети."""
+    """Промты в универсальной базе «МиниГена» — работает всегда и без сети.
+
+    ⚠️ Хранилище **переехало** в универсальную базу программы: там данные
+    лежат видами, а не таблицами, — чтобы базу можно было выгрузить в один
+    файл и залить в другую копию «МиниГена» (промт #92). Старая база
+    (`prompts.db`) переносится один раз, а её файл остаётся на месте.
+    """
 
     kind = SOURCE_LOCAL
     label = "в базе «МиниГена»"
 
     def __init__(self, db_path: Path | None = None) -> None:
         self.db_path = Path(db_path or LOCAL_DB)
+        self.legacy_path = Path(LEGACY_DB)
+        self._legacy_cache: list[dict[str, Any]] | None = None
+        self.migration: dict[str, Any] = {"ok": True, "migrated": 0, "why": ""}
+        # Перенос из старой базы — **только в настоящей базе программы**:
+        # подменённый путь (тесты, чужой каталог) чужую базу не трогает.
+        if self._is_program_db():
+            try:
+                self.migration = migrate_legacy_store(self.legacy_path,
+                                                      self.db_path)
+            except Exception as exc:  # noqa: BLE001 — перенос не роняет программу
+                self.migration = {"ok": False, "migrated": 0,
+                                  "why": "перенос не прошёл: %s" % exc}
+
+    def _is_program_db(self) -> bool:
+        """Это настоящая база программы (а не подменённый путь)?"""
+        try:
+            return self.db_path.resolve() == Path(state.DB_FILE).resolve()
+        except OSError:
+            return False
 
     def location(self) -> str:
         return str(self.db_path)
 
-    def sections(self) -> list[str]:
+    def _legacy_records(self) -> list[dict[str, Any]]:
+        """Записи из старой базы — запасной путь, если перенос не прошёл."""
+        if self._legacy_cache is not None:
+            return self._legacy_cache
+        out: list[dict[str, Any]] = []
+        if self.legacy_path.is_file():
+            try:
+                old = legacy_connect(self.legacy_path)
+            except sqlite3.Error:
+                old = None
+            if old is not None:
+                try:
+                    if "records" in _legacy_tables(old):
+                        for row in old.execute(
+                                "select id, project, title, body, kind, archived,"
+                                " created_at from records").fetchall():
+                            out.append({
+                                "id": str(row["id"]),
+                                "project": str(row["project"] or ""),
+                                "title": str(row["title"] or ""),
+                                "body": str(row["body"] or ""),
+                                "kind": str(row["kind"] or KIND_PROMPT),
+                                "archived": bool(row["archived"]),
+                                "createdAt": iso_stamp(row["created_at"]),
+                            })
+                except sqlite3.Error:
+                    pass
+                finally:
+                    old.close()
+        self._legacy_cache = out
+        return out
+
+    def _records(self) -> list[dict[str, Any]]:
+        """Записи хранилища: из универсальной базы и то, что осталось в старой.
+
+        Старая база — **запасной путь**: если перенос по какой-то причине не
+        прошёл, промты у владельца всё равно видны (и не теряются).
+        """
         con = connect(self.db_path)
         try:
             rows = con.execute(
-                "select distinct project from records order by project").fetchall()
-            return [str(row["project"]) for row in rows if row["project"]]
+                "select key, payload, created_at from records"
+                " where kind in (?,?) and deleted_at is null",
+                (KIND_PROMPT, KIND_PLAN)).fetchall()
         finally:
             con.close()
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for row in rows:
+            payload = _payload_of(row["payload"])
+            ident = str(row["key"])
+            seen.add(ident)
+            out.append({
+                "id": ident,
+                "project": str(payload.get("project") or ""),
+                "title": str(payload.get("title") or ""),
+                "body": str(payload.get("body") or ""),
+                "kind": str(payload.get("kind") or KIND_PROMPT),
+                "archived": bool(payload.get("archived")),
+                "createdAt": str(payload.get("createdAt")
+                                 or iso_stamp(row["created_at"])),
+            })
+        for item in self._legacy_records():
+            if item["id"] in seen:
+                continue
+            seen.add(item["id"])
+            out.append(item)
+        out.sort(key=lambda item: (str(item.get("createdAt") or ""),
+                                    str(item.get("id") or "")), reverse=True)
+        return out
+
+    def sections(self) -> list[str]:
+        names = {item["project"] for item in self._records() if item["project"]}
+        return sorted(names)
 
     def list_prompts(self, project: str = "", include_archived: bool = False
                      ) -> list[dict[str, Any]]:
-        con = connect(self.db_path)
-        try:
-            sql = ("select id, project, title, body, kind, archived, created_at"
-                   " from records")
-            params: list[Any] = []
-            if project:
-                # ⚠️ Имя раздела в библиотеке каноническое (`MatricaRMZ`), а
-                # область называется слагом (`matricarmz`) ⇒ сравнение без
-                # учёта регистра, иначе раздел не найдётся никогда.
-                sql += " where project=? collate nocase"
-                params.append(project)
-            if not include_archived:
-                sql += " and archived=0" if project else " where archived=0"
-            sql += " order by created_at desc, id desc"
-            rows = con.execute(sql, params).fetchall()
-        finally:
-            con.close()
         out = []
-        for row in rows:
-            out.append(normalize_record({
-                "id": row["id"], "project": row["project"], "title": row["title"],
-                "body": row["body"], "kind": row["kind"],
-                "archived": bool(row["archived"]),
-                "createdAt": iso_stamp(row["created_at"]),
-            }, SOURCE_LOCAL))
+        want = str(project or "").strip().lower()
+        for item in self._records():
+            # ⚠️ Имя раздела в библиотеке каноническое (`MatricaRMZ`), а
+            # область называется слагом (`matricarmz`) ⇒ сравнение без
+            # учёта регистра, иначе раздел не найдётся никогда.
+            if want and item["project"].strip().lower() != want:
+                continue
+            if not include_archived and item["archived"]:
+                continue
+            out.append(normalize_record(item, SOURCE_LOCAL))
         return out
 
     def save(self, project: str, title: str, body: str) -> dict[str, Any]:
@@ -273,14 +499,14 @@ class LocalPromptStore:
         if not (body or "").strip():
             return {"ok": False, "error": "промт пуст"}
         prompt_id = uuid.uuid4().hex[:8]
+        kind = detect_kind(title or "", body)
+        payload = {"project": name, "title": (title or "").strip()[:200],
+                   "body": body, "archived": False, "kind": kind,
+                   "createdAt": iso_stamp(now_ms())}
         con = connect(self.db_path)
         try:
-            con.execute(
-                "insert into records (id, project, title, body, kind, archived,"
-                " created_at) values (?,?,?,?,?,0,?)",
-                (prompt_id, name, (title or "").strip()[:200], body,
-                 detect_kind(title or "", body), now_ms()))
-            con.commit()
+            minigen_db.put_record(con, kind, prompt_id, payload,
+                                  created_at=payload["createdAt"])
         finally:
             con.close()
         return {"ok": True, "id": prompt_id, "project": name}
@@ -288,11 +514,17 @@ class LocalPromptStore:
     def archive(self, prompt_id: str, project: str = "") -> dict[str, Any]:
         con = connect(self.db_path)
         try:
-            cur = con.execute("update records set archived=1 where id=?",
-                               (prompt_id,))
-            con.commit()
-            if not cur.rowcount:
+            rec = (minigen_db.get_record(con, KIND_PROMPT, prompt_id)
+                   or minigen_db.get_record(con, KIND_PLAN, prompt_id))
+            if rec is None:
                 return {"ok": False, "error": "такого промта в базе нет"}
+            payload = dict(rec.get("payload") or {})
+            payload["archived"] = True
+            minigen_db.put_record(con, str(rec.get("kind") or KIND_PROMPT),
+                                  prompt_id, payload,
+                                  version=int(rec.get("version") or 1),
+                                  created_at=rec.get("created_at"),
+                                  updated_at=rec.get("updated_at"))
         finally:
             con.close()
         return {"ok": True, "archived": True}
@@ -302,14 +534,18 @@ class LocalPromptStore:
             con = connect(self.db_path)
         except sqlite3.Error as exc:
             return {"ok": False, "reason": "база не открылась: %s" % exc}
-        try:
-            row = con.execute("select count(*) as n from records"
-                              " where archived=0").fetchone()
-            count = int(row["n"]) if row else 0
-        finally:
-            con.close()
-        return {"ok": True, "reason": "в базе «МиниГена» живых промтов: %d" % count,
-                "sections": self.sections()}
+        con.close()
+        count = 0
+        for item in self._records():
+            if not item["archived"]:
+                count += 1
+        out = {"ok": True,
+               "reason": "в базе «МиниГена» живых промтов: %d" % count,
+               "sections": self.sections()}
+        if self.migration.get("migrated"):
+            out["reason"] += " (перенесено из старой базы: %d)" % int(
+                self.migration["migrated"])
+        return out
 
 
 # ──────────────────────────────────────────── внешний ресурс (Карман)

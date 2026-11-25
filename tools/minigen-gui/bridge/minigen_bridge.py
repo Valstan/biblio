@@ -43,6 +43,7 @@ sys.path.insert(0, str(HERE))
 
 import minigen_state as state          # noqa: E402
 import minigen_tools as tools          # noqa: E402
+import minigen_db                      # noqa: E402 — локальная база «МиниГена»
 import minigen_code as code            # noqa: E402
 import minigen_clone as clone_mod      # noqa: E402
 import minigen_genes as genes_mod      # noqa: E402
@@ -291,6 +292,13 @@ class Bridge:
             "stats.summary": self.cmd_stats_summary,
             "settings.get": self.cmd_settings_get,
             "settings.set": self.cmd_settings_set,
+            # локальная база «МиниГена»: выгрузка в один файл и импорт без
+            # потерь (заказ владельца 24.11, промт #92)
+            "db.status": self.cmd_db_status,
+            "db.records": self.cmd_db_records,
+            "db.export": self.cmd_db_export,
+            "db.inspect": self.cmd_db_inspect,
+            "db.import": self.cmd_db_import,
             "daemons.status": self.cmd_daemons_status,
             "chat.send": self.cmd_chat_send,
             "chat.confirm": self.cmd_chat_confirm,
@@ -1025,6 +1033,74 @@ class Bridge:
 
     def cmd_settings_set(self, args: dict[str, Any]) -> dict[str, Any]:
         return state.write_settings(args or {})
+
+    # ───────────────────────────────── локальная база «МиниГена» (промт #92)
+    def cmd_db_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Где лежит локальная база, какая в ней схема и сколько записей."""
+        try:
+            return state.jsonable(minigen_db.status())
+        except Exception as exc:  # noqa: BLE001 — мост отвечает фактом
+            return {"ok": False, "error": str(exc)}
+
+    def cmd_db_records(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Записи базы (по виду или все) — для отчёта и проверок."""
+        kind = str(args.get("kind") or "")
+        try:
+            limit = int(args.get("limit") or 200)
+        except (TypeError, ValueError):
+            limit = 200
+        con = minigen_db.connect()
+        try:
+            records = minigen_db.list_records(con, kind=kind or None, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        finally:
+            con.close()
+        return {"ok": True, "records": state.jsonable(records),
+                "count": len(records)}
+
+    def cmd_db_export(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Выгрузить базу в один файл — его можно унести на другой компьютер."""
+        path = str(args.get("path") or "")
+        try:
+            return state.jsonable(minigen_db.export_db(path or None))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    def cmd_db_inspect(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Разбор файла выгрузки: что перенесётся, что спросить у оператора.
+
+        Ничего не меняет — только план и вопросы. Это и есть «помощник
+        импорта»: он спрашивает, **куда и как** переносить спорные данные.
+        """
+        path = str(args.get("path") or "")
+        if not path:
+            return {"ok": False, "error": "не указан файл выгрузки"}
+        try:
+            plan = minigen_db.plan_import(path)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        plan.pop("_body", None)          # тело файла наружу не отдаём
+        return state.jsonable(plan)
+
+    def cmd_db_import(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Импортировать базу из файла (решения оператора — по конфликтам).
+
+        ⚠️ Конфликт без решения оператора **не трогается**: молчаливых
+        перезаписей нет.
+        """
+        path = str(args.get("path") or "")
+        if not path:
+            return {"ok": False, "error": "не указан файл выгрузки"}
+        decisions = args.get("decisions")
+        if not isinstance(decisions, dict):
+            decisions = {}
+        try:
+            report = minigen_db.apply_import(path, decisions)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        report.pop("_body", None)
+        return state.jsonable(report)
 
     def cmd_daemons_status(self, args: dict[str, Any]) -> dict[str, Any]:
         return state.jsonable(state.daemons_status(self.mods))
