@@ -48,6 +48,7 @@ import minigen_clone as clone_mod      # noqa: E402
 import minigen_genes as genes_mod      # noqa: E402
 import minigen_copy as copy_mod        # noqa: E402
 import minigen_token as token_mod      # noqa: E402
+import minigen_chat_store as chat_store  # noqa: E402
 import minigen_map as map_mod          # noqa: E402
 import minigen_update as update_mod    # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
@@ -183,6 +184,13 @@ class Bridge:
                            token_provider=self._area_token,
                            settings_provider=state.read_settings)
         self.chat_history: list[dict[str, Any]] = []
+        # Видимая история чата живёт на диске (промт #129): после перезапуска
+        # окна переписка на месте. В память агента возвращаем **текст** реплик:
+        # подробности вызовов модель узнаёт через свои инструменты.
+        try:
+            self.chat_history = chat_store.agent_history(chat_store.load())
+        except Exception:  # noqa: BLE001
+            self.chat_history = []
         self._points: dict[str, dict[str, Any]] = {}
         self._points_at: dict[str, int] = {}
         self._points_lock = threading.Lock()
@@ -283,6 +291,9 @@ class Bridge:
             "chat.send": self.cmd_chat_send,
             "chat.confirm": self.cmd_chat_confirm,
             "chat.reset": self.cmd_chat_reset,
+            # видимая история чата с диска (промт #129): переписка не теряется
+            # при перезапуске окна
+            "chat.history": self.cmd_chat_history,
             "app.open_folder": self.cmd_open_folder,
             # самообновление программы
             "code.list": self.cmd_code_list,
@@ -1023,21 +1034,45 @@ class Bridge:
         # Прокси-переменные живут в реестре, а процесс мог устареть ⇒ перечитываем
         # их перед запросом (иначе модель «недоступна» при живом интернете).
         self.core.refresh_env()
+        # Реплика владельца — в историю сразу: даже если модель недоступна,
+        # вопрос остаётся в переписке (промт #129).
+        chat_store.append({"role": "user", "text": text})
         # Свежие отчёты программы — в контекст хода (заказ владельца 24.11):
         # нейросеть знает, что сторож и инструменты сделали, пока её не
-        # спрашивали.
-        history = list(self.chat_history)
+        # спрашивали. ⚠️ Это **подсказка хода**, а не реплика: отчёты сторожей
+        # в историю переписки не попадают (промт #129).
         feed = self._unread_reports()
-        if feed:
-            history.append({"role": "user", "content": feed})
         try:
-            result = self.agent.ask(history, text, area_slug, model)
+            result = self.agent.ask(list(self.chat_history), text, area_slug,
+                                    model, note=feed)
         except ModelUnavailable as exc:
+            chat_store.append({"role": "system", "text": str(exc)})
             return {"status": "unavailable", "error": str(exc),
                     "text": "", "calls": []}
         if result.get("status") == "done":
             self.chat_history = self._trim_history(result.get("history") or [])
-        return state.jsonable(result)
+        return state.jsonable(self._remember_reply(result))
+
+    def _remember_reply(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Ответ модели — в видимую историю (на диске) и в ответ окну.
+
+        ⚠️ Промежуточный ответ (`status: confirm`) в историю пишется **без**
+        вызовов: полный список вызовов хода придёт в следующем сообщении
+        (после подтверждения) — иначе одни и те же вызовы были бы видны дважды.
+        """
+        status = str(result.get("status") or "")
+        calls = list(result.get("calls") or [])
+        if status == "confirm":
+            calls = []
+        text = str(result.get("text") or "")
+        if status in ("done", "confirm"):
+            chat_store.append({"role": "assistant", "text": text, "calls": calls})
+        elif status in ("unavailable", "error"):
+            error = str(result.get("error") or "")
+            chat_store.append({"role": "system", "text": error or text})
+        out = dict(result)
+        out["calls"] = calls
+        return out
 
     def cmd_chat_confirm(self, args: dict[str, Any]) -> dict[str, Any]:
         approved = bool(args.get("approved"))
@@ -1048,12 +1083,20 @@ class Bridge:
         result = self.agent.confirm(approved, self.chat_history, area_slug, model)
         if result.get("status") == "done":
             self.chat_history = self._trim_history(result.get("history") or [])
-        return state.jsonable(result)
+        return state.jsonable(self._remember_reply(result))
 
     def cmd_chat_reset(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Очистить переписку: и в памяти, и в файле на диске."""
         self.chat_history = []
         self.agent.pending = None
+        chat_store.clear()
         return {"ok": True}
+
+    def cmd_chat_history(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Видимая история чата с диска (окно восстанавливает её при старте)."""
+        return {"messages": state.jsonable(chat_store.load()),
+                "path": str(chat_store.path()),
+                "limit": chat_store.MAX_MESSAGES}
 
     @staticmethod
     def _trim_history(history: list[dict[str, Any]],

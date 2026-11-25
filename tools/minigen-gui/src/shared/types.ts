@@ -354,6 +354,22 @@ export interface ChatReply {
   pending?: PendingAction
 }
 
+/**
+ * Реплика чата «Управляющий» — то, что видит владелец.
+ *
+ * ⚠️ Это **видимая** история, а не техническая: она лежит на диске машины
+ * (`%LOCALAPPDATA%\minigen-gui\chat-history.json`) и восстанавливается при
+ * перезапуске окна. Вызовы инструментов лежат здесь же, но в окне показываются
+ * свёрнутыми («Что сделано: N действий») — подробности открываются по клику.
+ */
+export interface ChatMessage {
+  role: 'user' | 'assistant' | 'system'
+  text: string
+  calls?: ToolCall[]
+  /** когда реплика (мс) */
+  at?: number
+}
+
 export interface Snapshot {
   at: number
   areas: Area[]

@@ -1,0 +1,64 @@
+import { beforeEach, describe, expect, it } from 'vitest'
+import type { ChatMessage } from '../src/shared/types'
+import * as chatStore from '../src/renderer/src/tabs/chat-store'
+
+/**
+ * Состояние переписки «Управляющего» живёт вне вкладки (промт #129).
+ *
+ * Проверяем главное: размонтирование вкладки (уход на другую вкладку окна)
+ * переписку **не стирает** — она лежит в модуле, а не в `useState` компонента.
+ */
+
+const user: ChatMessage = { role: 'user', text: 'проверь сеть' }
+const answer: ChatMessage = { role: 'assistant', text: 'проверил: сеть есть' }
+
+beforeEach(() => {
+  chatStore.reset()
+})
+
+describe('стор переписки', () => {
+  it('сообщения переживают размонтирование вкладки', () => {
+    // вкладка открыта: подписка есть
+    const off = chatStore.subscribe(() => undefined)
+    chatStore.setMessages([user, answer])
+    off()
+    // вкладку закрыли (уход на другую вкладку окна) и снова открыли
+    const again = chatStore.subscribe(() => undefined)
+    expect(chatStore.getMessages()).toEqual([user, answer])
+    again()
+  })
+
+  it('restore заменяет список целиком', () => {
+    chatStore.setMessages([user])
+    chatStore.restore([answer])
+    expect(chatStore.getMessages()).toEqual([answer])
+  })
+
+  it('reset очищает переписку', () => {
+    chatStore.setMessages([user, answer])
+    chatStore.reset()
+    expect(chatStore.getMessages()).toEqual([])
+  })
+
+  it('пока список не сменили, ссылка та же — снимок для React стабилен', () => {
+    chatStore.setMessages([user])
+    const first = chatStore.getMessages()
+    expect(chatStore.getMessages()).toBe(first)
+    chatStore.setMessages([user, answer])
+    expect(chatStore.getMessages()).not.toBe(first)
+  })
+
+  it('подписчика зовут при изменении, а после отписки — нет', () => {
+    let count = 0
+    const off = chatStore.subscribe(() => {
+      count += 1
+    })
+    chatStore.setMessages([user])
+    chatStore.restore([answer])
+    chatStore.reset()
+    expect(count).toBe(3)
+    off()
+    chatStore.setMessages([user])
+    expect(count).toBe(3)
+  })
+})

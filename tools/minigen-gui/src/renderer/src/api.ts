@@ -1,6 +1,7 @@
 import type {
   Area,
   AgentsSnapshot,
+  ChatMessage,
   ChatReply,
   CloneStatus,
   CopyFirstRunSnapshot,
@@ -74,6 +75,8 @@ export const api = {
   saveSettings: (patch: Partial<Settings>) => call<Settings>('settings.set', patch),
   chatSend: (text: string) => call<ChatReply>('chat.send', { text }),
   chatConfirm: (approved: boolean) => call<ChatReply>('chat.confirm', { approved }),
+  // История чата с диска машины: переписка не теряется при перезапуске окна.
+  chatHistory: () => call<{ messages: ChatMessage[]; path?: string }>('chat.history'),
   chatReset: () => call<{ ok: boolean }>('chat.reset'),
   daemonsStatus: () => call<DaemonStatus>('daemons.status'),
   programVersion: () => call<ProgramVersion>('program.version'),

@@ -1,12 +1,14 @@
-import { useEffect, useState } from 'react'
-import type { ChatReply, ModelCatalog, ModelEntry, ToolCall } from '@shared/types'
+import { useEffect, useState, useSyncExternalStore } from 'react'
+import type { ChatReply, ModelCatalog, ModelEntry } from '@shared/types'
 import { api } from '../api'
-
-interface Message {
-  role: 'user' | 'assistant' | 'system'
-  text: string
-  calls?: ToolCall[]
-}
+import * as chatStore from './chat-store'
+import {
+  appendAssistant,
+  appendMessage,
+  callDetails,
+  callsSummary,
+  restoreMessages
+} from './chat-view'
 
 /**
  * «Управляющий» — чат с встроенной нейросетью «МиниГена».
@@ -16,8 +18,15 @@ interface Message {
  * документацию, вызывает инструменты и выполняет их.
  *
  * Нейросеть не «говорит» — она вызывает инструменты и выполняет их. Поэтому
- * в чате видно, что она сделала. Опасные действия (перезапуск области, смена
- * аккаунта, отправка сообщения) требуют подтверждения владельца.
+ * в чате видно, что она сделала: вызовы свёрнуты («Что сделано: N действий»),
+ * а подробности открываются по клику. Опасные действия (перезапуск области,
+ * смена аккаунта, отправка сообщения) требуют подтверждения владельца.
+ *
+ * Переписка живёт **вне вкладки** (`tabs/chat-store.ts`): окно ставит вкладку
+ * условием, поэтому при уходе на другую вкладку компонент размонтируется, а
+ * переписка остаётся. После перезапуска окна её восстанавливает мост
+ * (`chat.history` — история лежит на диске машины; окно её читает и рисует,
+ * но файл не ведёт).
  *
  * Над чатом — выбор модели, размера контекста и уровня эффорта. Списки
  * берутся **из родного конфига платформы** (`contextWindowOptions`,
@@ -25,12 +34,8 @@ interface Message {
  * останется верным, когда появится другая платформа.
  */
 export default function ChatTab() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      role: 'system',
-      text: 'Я — Управляющий «МиниГена». Знаю устройство программы, вижу её состояние и выполняю действия через инструменты. Скажите, что проверить или починить: сеть и «минимаксы» у областей, состояние сессий, состояние самой программы.'
-    }
-  ])
+  // Переписка — из стора модуля: размонтирование вкладки её не стирает.
+  const messages = useSyncExternalStore(chatStore.subscribe, chatStore.getMessages)
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [pending, setPending] = useState<ChatReply['pending'] | undefined>(undefined)
@@ -39,6 +44,8 @@ export default function ChatTab() {
   const [context, setContext] = useState(0)
   const [effort, setEffort] = useState('')
   const [modelNote, setModelNote] = useState('')
+  // Пока мост отвечает на историю — говорим честно, а не показываем пустоту.
+  const [loadingHistory, setLoadingHistory] = useState(true)
 
   const loadCatalog = async () => {
     try {
@@ -53,8 +60,35 @@ export default function ChatTab() {
     }
   }
 
+  /**
+   * Восстановить переписку из истории моста (файл на диске машины).
+   * Мост может не ответить — тогда говорим честно, а не показываем пустоту.
+   */
+  const loadHistory = async () => {
+    try {
+      const history = await api.chatHistory()
+      chatStore.restore(restoreMessages(history?.messages ?? []))
+    } catch (err) {
+      chatStore.setMessages(
+        appendMessage(restoreMessages([]), {
+          role: 'system',
+          text: `мост не ответил — переписка не восстановлена: ${(err as Error).message}`
+        })
+      )
+    } finally {
+      setLoadingHistory(false)
+    }
+  }
+
   useEffect(() => {
     void loadCatalog()
+    // Историю спрашиваем, только если переписки ещё нет: вернувшись на
+    // вкладку, владелец видит ту же переписку, а не пустоту.
+    if (chatStore.getMessages().length === 0) {
+      void loadHistory()
+    } else {
+      setLoadingHistory(false)
+    }
   }, [])
 
   const entry: ModelEntry | undefined = catalog?.models.find((m) => m.id === model)
@@ -94,38 +128,28 @@ export default function ChatTab() {
     }
   }
 
-  const apply = (reply: ChatReply) => {
-    setMessages((prev) => [
-      ...prev,
-      { role: 'assistant', text: reply.text || '', calls: reply.calls }
-    ])
+  /** Ответ моста → реплики в переписке. */
+  const applyReply = (reply: ChatReply) => {
+    chatStore.setMessages(appendAssistant(chatStore.getMessages(), reply))
     setPending(reply.pending ?? undefined)
-    if (reply.status === 'unavailable' || reply.status === 'error') {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'system',
-          text:
-            reply.error ??
-            'Нейросеть недоступна. Управление остаётся у алгоритмических функций — сторожа продолжают работу.'
-        }
-      ])
-    }
   }
 
   const send = async () => {
     const text = input.trim()
     if (!text || busy) return
     setInput('')
-    setMessages((prev) => [...prev, { role: 'user', text }])
+    // Реплика владельца попадает в переписку сразу — не дожидаясь моста.
+    chatStore.setMessages(appendMessage(chatStore.getMessages(), { role: 'user', text }))
     setBusy(true)
     try {
-      apply(await api.chatSend(text))
+      applyReply(await api.chatSend(text))
     } catch (err) {
-      setMessages((prev) => [
-        ...prev,
-        { role: 'system', text: `чат недоступен: ${(err as Error).message}` }
-      ])
+      chatStore.setMessages(
+        appendMessage(chatStore.getMessages(), {
+          role: 'system',
+          text: `чат недоступен: ${(err as Error).message}`
+        })
+      )
     } finally {
       setBusy(false)
     }
@@ -134,25 +158,34 @@ export default function ChatTab() {
   const confirm = async (approved: boolean) => {
     setBusy(true)
     try {
-      apply(await api.chatConfirm(approved))
+      applyReply(await api.chatConfirm(approved))
+    } catch (err) {
+      chatStore.setMessages(
+        appendMessage(chatStore.getMessages(), {
+          role: 'system',
+          text: `чат недоступен: ${(err as Error).message}`
+        })
+      )
     } finally {
       setBusy(false)
       setPending(undefined)
     }
   }
 
+  /** «Очистить»: стираем переписку в окне и просим мост стереть файл. */
+  const clear = () => {
+    chatStore.reset()
+    // приветствие остаётся: это приветствие окна, а не реплика истории
+    chatStore.setMessages(restoreMessages([]))
+    setPending(undefined)
+    void api.chatReset()
+  }
+
   return (
     <section className="chat">
       <div className="row head">
         <h2>Управляющий</h2>
-        <button
-          className="ghost"
-          onClick={() => {
-            setMessages([])
-            setPending(undefined)
-            void api.chatReset()
-          }}
-        >
+        <button className="ghost" onClick={clear}>
           Очистить
         </button>
       </div>
@@ -210,20 +243,23 @@ export default function ChatTab() {
           <div key={index} className={`bubble ${message.role}`}>
             {message.text && <div className="text">{message.text}</div>}
             {message.calls && message.calls.length > 0 && (
-              <div className="calls">
-                {message.calls.map((call, callIndex) => (
-                  <div key={callIndex} className="call">
-                    <span className="chip info">{call.tool}</span>
-                    <span className="muted small">{JSON.stringify(call.args)}</span>
-                    <div className="muted small result">
-                      {JSON.stringify(call.result).slice(0, 400)}
+              <details className="calls">
+                <summary>{callsSummary(message.calls)}</summary>
+                {message.calls.map((call, callIndex) => {
+                  const details = callDetails(call)
+                  return (
+                    <div key={callIndex} className="call">
+                      <span className="chip info">{details.tool}</span>
+                      <pre className="args">{details.args}</pre>
+                      <pre className="out">{details.result}</pre>
                     </div>
-                  </div>
-                ))}
-              </div>
+                  )
+                })}
+              </details>
             )}
           </div>
         ))}
+        {loadingHistory && <div className="bubble system muted">переписка восстанавливается…</div>}
         {busy && <div className="bubble assistant muted">нейросеть думает…</div>}
       </div>
 

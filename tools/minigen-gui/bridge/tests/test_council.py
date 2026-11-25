@@ -224,6 +224,22 @@ class PipelineTest(unittest.TestCase):
                                 "основному ходу должен остаться бюджет")
         self.assertLessEqual(budget["left"], agent_mod.MAX_ROUNDS)
 
+    def test_council_does_not_eat_the_work_budget(self) -> None:
+        """Совет обсуждает — работа делает: бюджет работы не трогаем.
+
+        ⚠️ Живой случай 25.11 (проба самоотладки, промт #129): бюджет был
+        общим, и совет съедал его целиком — на работу оставалось 4 шага, а
+        задача «найди дефект и почини» (поиск → чтение → ветка → правка →
+        проверки → коммит → PR) столько не занимает: проба остановилась на
+        «достигнут лимит шагов» и PR не открыла.
+        """
+        fake = FakeAgent(council_replies())
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        fake._council([{"role": "user", "content": TASK}], {}, budget, {}, TASK)
+        self.assertEqual(budget["left"], agent_mod.MAX_ROUNDS,
+                         "совет не должен отнимать бюджет у работы")
+        self.assertLessEqual(agent_mod.COUNCIL_ROUNDS, agent_mod.MAX_ROUNDS)
+
     def test_council_can_be_switched_off(self) -> None:
         self.assertTrue(council.enabled({}))
         self.assertFalse(council.enabled({"councilEnabled": False}))

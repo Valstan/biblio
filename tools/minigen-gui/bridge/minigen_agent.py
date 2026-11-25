@@ -45,9 +45,11 @@ DEFAULT_TIMEOUT = 120
 # читаются целиком — иначе модель видит только начало модуля и не может
 # найти нестыковку (окно модели — 1 млн токенов, места хватает).
 TOOL_RESULT_LIMIT = 24_000
-#: Раундов резервируем основному ходу агента: совет не должен съесть весь
-#: бюджет задачи (иначе работа останется без хода).
-COUNCIL_RESERVE = 4
+#: Бюджет совета — **свой**, работа его не съедает (живой случай 25.11, проба
+#: самоотладки: при общем бюджете на работу оставалось 4 шага, а задача «найди
+#: дефект и почини» столько не занимает). Совет обсуждает — работа делает;
+#: одно не отменяет другого.
+COUNCIL_ROUNDS = 16
 
 
 class ModelUnavailable(RuntimeError):
@@ -275,7 +277,8 @@ class Agent:
 
     # ── основной ход ──
     def ask(self, history: list[dict[str, Any]], user_text: str,
-            area_slug: str = "minigen", model: str = "") -> dict[str, Any]:
+            area_slug: str = "minigen", model: str = "",
+            note: str = "") -> dict[str, Any]:
         """Обработать реплику владельца. Возвращает ответ и ход работы.
 
         Новое задание сначала обсуждает **совет специалистов** (промт #132):
@@ -283,6 +286,12 @@ class Agent:
         решение и назначает исполнителей → основной ход работает по решению.
         Продолжения нитки («Продолжай») совет не зовёт — он по этой задаче уже
         отработал.
+
+        ⚠️ `note` — подсказка на **один ход** (сводка отчётов сторожей, заказ
+        24.11). Она попадает в системную подсказку хода, а **не** в историю
+        сообщений: отчёты сторожей — не реплики владельца, и в переписке им
+        не место (промт #129). В историю попадают только слова владельца и
+        ответы модели.
         """
         cfg = self._model_config(area_slug, model)
         messages = list(history)
@@ -303,7 +312,10 @@ class Agent:
             council_text = str(outcome.get("council_text") or "")
             decision = outcome.get("decision") or {}
             messages = outcome.get("history") or messages
-        result = self._loop(messages, cfg, [], budget=budget)
+        system = system_prompt()
+        if note.strip():
+            system = "%s\n\n%s" % (system, note.strip())
+        result = self._loop(messages, cfg, [], budget=budget, system=system)
         if council_text:
             result["text"] = "%s\n\n%s" % (council_text, result.get("text") or "")
         if decision:
@@ -330,7 +342,13 @@ class Agent:
         if not cohort:
             return {"status": "done", "history": messages, "council_text": ""}
         limit = council.max_roles(settings)
-        initial = max(2, budget.get("left", MAX_ROUNDS) - COUNCIL_RESERVE)
+        # ⚠️ Живой случай 25.11 (проба самоотладки, промт #129): бюджет был
+        # общим, и совет съедал его целиком — на работу оставалось 4 шага, а
+        # задача «найди дефект и почини» (поиск → чтение → ветка → правка →
+        # проверки → коммит → PR) столько не занимает. Теперь у совета **свой**
+        # предел (COUNCIL_ROUNDS), а работа получает весь MAX_ROUNDS: совет
+        # обсуждает, а работу он не отменяет.
+        initial = max(2, min(COUNCIL_ROUNDS, budget.get("left", MAX_ROUNDS)))
         used = {"left": initial}
 
         # 1) секретарь отбирает, кто нужен на задачу
@@ -392,8 +410,8 @@ class Agent:
                             "text": (turn.get("text") or "").strip()
                             [:council.ROLE_TEXT_LIMIT]})
 
-        consumed = initial - used.get("left", initial)
-        budget["left"] = max(2, budget.get("left", MAX_ROUNDS) - consumed)
+        # ⚠️ Бюджет работы **не трогаем**: у совета свой предел (COUNCIL_ROUNDS),
+        # и работа получает все MAX_ROUNDS (живой случай 25.11 — см. выше).
         context = council.context_block(decision, opinions, outputs)
         return {"status": "done",
                 "history": list(messages) + [{"role": "user", "content": context}],
