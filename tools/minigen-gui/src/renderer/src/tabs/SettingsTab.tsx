@@ -4,6 +4,9 @@ import type {
   CopyFirstRunSnapshot,
   CopyMode,
   CopyModeOption,
+  CopyTokenIssue,
+  CopyTokenRequest,
+  CopyTokenStatus,
   DaemonStatus,
   LineageInfo,
   ProgramVersion,
@@ -14,6 +17,19 @@ import { api } from '../api'
 import { TZ_LABEL, formatDateTime } from '../time'
 import { answerConfirmText, firstRunView, modeConfirmText, modeRows, type Tone } from './copy-view'
 import { lineageRows as lineageRowsOf } from './lineage-view'
+import {
+  accessCheckText,
+  issueConfirmText,
+  maskToken,
+  requestConfirmText,
+  tokenIssueView,
+  tokenRequestResultText,
+  tokenRequestRows,
+  tokenSetConfirmText,
+  tokenSetResultText,
+  tokenStateView,
+  tokenStatusRows
+} from './token-view'
 
 interface Props {
   settings: Settings | null
@@ -51,6 +67,24 @@ const TONE_TEXT: Record<Tone, string> = {
   bad: 'неизвестно'
 }
 
+/**
+ * Ответ моста на сохранение токена.
+ *
+ * ⚠️ В обёртке `api.copyTokenSet` объявлены только поля состояния, а мост
+ * присылает ещё и `why`/`error`/`ok` — без них окно не сказало бы, принят
+ * токен или нет.
+ */
+type TokenSetResult = CopyTokenStatus & {
+  bound?: boolean
+  ok?: boolean
+  why?: string
+  error?: string
+}
+
+/** Класс баннера по тону: «ок» — обычный, «внимание» и «плохо» — свои. */
+const bannerClass = (tone: Tone): string =>
+  tone === 'warn' ? 'banner warn' : tone === 'bad' ? 'banner bad' : 'banner'
+
 export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   const [form, setForm] = useState<Settings | null>(settings)
   const [note, setNote] = useState('')
@@ -63,6 +97,19 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   const [statusError, setStatusError] = useState('')
   const [modeChoice, setModeChoice] = useState<CopyMode | ''>('')
   const [busy, setBusy] = useState(false)
+  // ── токен копии (заказ владельца 25.11, промт #130) ──────────────────────
+  const [tokenStatus, setTokenStatus] = useState<CopyTokenStatus | null>(null)
+  const [tokenRequests, setTokenRequests] = useState<CopyTokenRequest[] | null>(null)
+  const [tokenError, setTokenError] = useState('')
+  const [requestsError, setRequestsError] = useState('')
+  const [tokenInput, setTokenInput] = useState('')
+  const [githubNote, setGithubNote] = useState('')
+  const [githubTone, setGithubTone] = useState<Tone>('ok')
+  const [requestsNote, setRequestsNote] = useState('')
+  const [requestsTone, setRequestsTone] = useState<Tone>('ok')
+  /** Выпущенный токен — значение показывается один раз, отдельным блоком. */
+  const [issued, setIssued] = useState<CopyTokenIssue | null>(null)
+  const [issuedShown, setIssuedShown] = useState(false)
 
   useEffect(() => {
     if (settings && !form) setForm(settings)
@@ -87,6 +134,26 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
     }
   }, [])
 
+  /**
+   * Токен копии и заявки на него — тоже по таймеру: окно открывается раньше
+   * моста, и разовый запрос падает («мост не запущен»).
+   */
+  const loadTokens = useCallback(async () => {
+    try {
+      setTokenStatus(await api.copyTokenStatus())
+      setTokenError('')
+    } catch (err) {
+      setTokenError(`состояние токена не принесли: ${String((err as Error).message || err)}`)
+    }
+    try {
+      const data = await api.copyTokenRequests()
+      setTokenRequests(Array.isArray(data?.requests) ? data.requests : [])
+      setRequestsError('')
+    } catch (err) {
+      setRequestsError(`заявки на токен не принесли: ${String((err as Error).message || err)}`)
+    }
+  }, [])
+
   useEffect(() => {
     // ⚠️ Всё, что читаем с моста, спрашиваем **по таймеру**, а не один раз:
     // окно открывается раньше моста, и разовый запрос в этот момент падает
@@ -97,11 +164,12 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
       void api.programVersion().then(setVersion).catch(() => undefined)
       void api.lineageShow().then((data) => setLineage(data?.lineage ?? null)).catch(() => undefined)
       void loadCopy()
+      void loadTokens()
     }
     void load()
     const timer = window.setInterval(() => void load(), 5000)
     return () => window.clearInterval(timer)
-  }, [loadCopy])
+  }, [loadCopy, loadTokens])
 
   const lineageRows = lineageRowsOf(lineage)
   const first = firstRunView(copySnapshot)
@@ -112,6 +180,13 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   const selectedMode = modeChoice || currentMode || ''
   const selectedOption = modes.find((option) => option.id === selectedMode)
   const copyRows = modeRows(cloneStatus)
+  // ── токен копии: строки карточки «GitHub» и заявки ───────────────────────
+  const tokenRows = tokenStatusRows(tokenStatus, cloneStatus)
+  const tokenState = tokenStateView(tokenStatus)
+  const requestRows = tokenRequestRows(tokenRequests)
+  const issuedView = tokenIssueView(issued)
+  const hasToken = tokenStatus?.has_token === true
+  const requestsSection = form?.copyRequestsSection || 'MiniGen-tokens'
 
   if (!form) return <section><p className="muted">Загружаю настройки…</p></section>
 
@@ -176,6 +251,132 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
       await loadCopy()
     } catch (err) {
       setNote(`режим не сменили: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Сохранить токен, полученный от владельца.
+   *
+   * ⚠️ Перед записью — подтверждение: токен ложится в стор на машине (вне
+   * репозитория), и в чат его вставлять не надо.
+   */
+  const saveToken = async () => {
+    const value = tokenInput.trim()
+    if (!value) {
+      setGithubTone('bad')
+      setGithubNote('вставьте значение токена')
+      return
+    }
+    if (!window.confirm(tokenSetConfirmText())) return
+    setBusy(true)
+    try {
+      const res = (await api.copyTokenSet({ token: value })) as TokenSetResult
+      setGithubTone(res.ok === false ? 'bad' : 'ok')
+      setGithubNote(tokenSetResultText(res))
+      // Значение из поля убираем: секрет в сторе, лишний раз в окне он не нужен.
+      if (res.ok !== false) setTokenInput('')
+      await loadTokens()
+    } catch (err) {
+      setGithubTone('bad')
+      setGithubNote(`токен не сохранили: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Проверка доступа: токен есть и выдан под эту папку — или нет. */
+  const checkAccess = async () => {
+    setBusy(true)
+    try {
+      const view = accessCheckText(await api.copyTokenCheck())
+      setGithubTone(view.tone)
+      setGithubNote(view.text)
+    } catch (err) {
+      setGithubTone('bad')
+      setGithubNote(`доступ не проверили: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Заявка на токен — уходит владельцу в его «МиниГен» (в раздел КАРМАНА).
+   */
+  const requestToken = async () => {
+    setBusy(true)
+    try {
+      const res = await api.copyTokenRequest(undefined, requestsSection)
+      setGithubTone(res.ok === false ? 'bad' : 'ok')
+      setGithubNote(tokenRequestResultText(res))
+    } catch (err) {
+      setGithubTone('bad')
+      setGithubNote(`заявка не ушла: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Выпуск токена по заявке (действие владельца).
+   *
+   * ⚠️ Значение токена показывается **один раз** — отдельным блоком под
+   * маской; в заявках и в переписке его нет.
+   */
+  const issueToken = async (request: CopyTokenRequest | undefined) => {
+    if (!request) {
+      setRequestsTone('bad')
+      setRequestsNote('заявка не найдена — обновите список')
+      return
+    }
+    if (!window.confirm(issueConfirmText(request))) return
+    setBusy(true)
+    try {
+      const res = await api.copyTokenIssue({
+        instance_id: request.instance_id,
+        folder: request.folder,
+        name: request.name
+      })
+      const view = tokenIssueView(res)
+      setRequestsTone(view.tone)
+      setRequestsNote(view.text)
+      setIssued(view.token ? res : null)
+      setIssuedShown(false)
+      await loadTokens()
+    } catch (err) {
+      setRequestsTone('bad')
+      setRequestsNote(`токен не выпустили: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Закрепить копию (TOFU): запомнить отпечаток подписи, чтобы заявки этой
+   * копии с другим отпечатком считались подделкой.
+   */
+  const trustCopy = async (request: CopyTokenRequest | undefined) => {
+    if (!request) {
+      setRequestsTone('bad')
+      setRequestsNote('заявка не найдена — обновите список')
+      return
+    }
+    if (!window.confirm(requestConfirmText(request))) return
+    setBusy(true)
+    try {
+      const res = await api.copyTokenTrust(request.instance_id, request.key_id)
+      if (res.ok === false) {
+        setRequestsTone('bad')
+        setRequestsNote(res.error || 'копию не закрепили')
+        return
+      }
+      setRequestsTone('ok')
+      setRequestsNote(res.why || 'копия закреплена')
+      await loadTokens()
+    } catch (err) {
+      setRequestsTone('bad')
+      setRequestsNote(`копию не закрепили: ${String((err as Error).message || err)}`)
     } finally {
       setBusy(false)
     }
@@ -364,6 +565,160 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
           (вкладка «Гены») при этом работает.
         </p>
       </div>
+
+      <div className="card">
+        <h3>GitHub</h3>
+        <p className="muted small">
+          Репозиторий копии и токен доступа к своей папке в общем репозитории
+          программы. Токен выпускает владелец — по заявке, которая приходит
+          ему в его собственный «МиниГен».
+        </p>
+        {tokenError && <div className="banner bad">{tokenError}</div>}
+        {githubNote && <div className={bannerClass(githubTone)}>{githubNote}</div>}
+
+        <p>
+          <span className={`chip ${tokenState.tone}`}>{tokenState.label}</span>{' '}
+          <span className="muted small">{tokenState.detail}</span>
+        </p>
+
+        <table className="grid compact">
+          <tbody>
+            {tokenRows.map((row) => (
+              <tr key={row.label}>
+                <td className="muted">{row.label}</td>
+                <td>{row.value}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <p className="muted small" style={{ marginTop: 8 }}>
+          Токен, который дал владелец
+        </p>
+        <div className="row">
+          <input
+            type="password"
+            value={tokenInput}
+            onChange={(event) => setTokenInput(event.target.value)}
+            placeholder="вставьте код из выпуска (секрет.доказательство)"
+            autoComplete="off"
+          />
+          <button
+            className="primary"
+            onClick={() => void saveToken()}
+            disabled={busy || !tokenInput.trim()}
+          >
+            Сохранить токен
+          </button>
+          <button className="ghost" onClick={() => void checkAccess()} disabled={busy}>
+            Проверить доступ
+          </button>
+        </div>
+        {!hasToken && (
+          <div className="row">
+            <button className="ghost" onClick={() => void requestToken()} disabled={busy}>
+              Запросить токен
+            </button>
+          </div>
+        )}
+        <p className="muted small">
+          Значение токена в чат не вставляют: в переписку и в отчёты оно не
+          попадает. Программа хранит его в сторе на машине — вне репозитория.
+          Вставлять надо код из выпуска целиком: секрет и доказательство
+          (одной строкой). Без доказательства токен не подтвердит свою папку.
+        </p>
+      </div>
+
+      <div className="card">
+        <h3>Заявки на токен</h3>
+        <p className="muted small">
+          Заявки копий, которые ждут токен. Значения токена в заявках нет: видно,
+          кто прислал, чья это копия и в каком состоянии подпись.
+        </p>
+        {requestsError && <div className="banner bad">{requestsError}</div>}
+        {requestsNote && (
+          <div className={bannerClass(requestsTone)}>{requestsNote}</div>
+        )}
+
+        {requestRows.length === 0 ? (
+          <p className="muted small">
+            Заявок нет: в разделе «{requestsSection}» пока пусто (или раздел
+            недоступен).
+          </p>
+        ) : (
+          <table className="grid compact">
+            <thead>
+              <tr>
+                <th>Кто прислал</th>
+                <th>Чья это копия</th>
+                <th>Подпись</th>
+                <th>Папка</th>
+                <th>Когда</th>
+                <th>Действия</th>
+              </tr>
+            </thead>
+            <tbody>
+              {requestRows.map((row, index) => {
+                const request = tokenRequests?.[index]
+                return (
+                  <tr key={row.id === '—' ? `${row.instance_id}-${index}` : row.id}>
+                    <td>{row.who}</td>
+                    <td>
+                      <span className={`chip ${row.tone}`}>{row.relation}</span>{' '}
+                      <span className="muted small">{row.relation_detail}</span>
+                    </td>
+                    <td className="muted small">{row.signature}</td>
+                    <td className="muted small">{row.folder}</td>
+                    <td className="muted small">{row.when}</td>
+                    <td className="actions">
+                      <button
+                        className="ghost"
+                        onClick={() => void issueToken(request)}
+                        disabled={busy || !request}
+                      >
+                        Выпустить токен
+                      </button>
+                      <button
+                        className="ghost"
+                        onClick={() => void trustCopy(request)}
+                        disabled={busy || !request}
+                      >
+                        Закрепить копию
+                      </button>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      {issuedView.token && (
+        <div className="card">
+          <h3>Выпущенный токен</h3>
+          <p className="muted small">
+            Значение показывают один раз: второй раз мост его не отдаст — в
+            сторе остаётся только отпечаток.
+          </p>
+          <div className="row">
+            <span className="title">
+              {issuedShown ? issuedView.token : maskToken(issuedView.token)}
+            </span>
+            <button
+              className="ghost"
+              onClick={() => setIssuedShown(!issuedShown)}
+              disabled={busy}
+            >
+              {issuedShown ? 'Скрыть' : 'Показать'}
+            </button>
+          </div>
+          <p className="muted small">
+            Передайте копии этот код целиком: в чат его вставлять не надо — в
+            переписку и в отчёты значение токена попадать не должно.
+          </p>
+        </div>
+      )}
 
       <div className="card">
         <h3>Демоны «МиниГена»</h3>

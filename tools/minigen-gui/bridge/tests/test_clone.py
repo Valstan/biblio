@@ -27,6 +27,7 @@ sys.path.insert(0, str(BRIDGE_DIR))
 
 import minigen_clone as clone_mod  # noqa: E402
 import minigen_code as code        # noqa: E402
+import minigen_lineage as lineage  # noqa: E402
 
 
 class _FakeGit:
@@ -52,6 +53,11 @@ class _FakeGit:
                 return {"ok": True, "out": out, "err": "", "code": 0}
         if head == "clone":
             self.exists = True
+            # настоящий клон — это каталог с `.git` (иначе «клона нет»)
+            try:
+                Path(str(args[-1]), ".git").mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
             return {"ok": True, "out": "cloned", "err": "", "code": 0}
         if head == "remote" and len(args) > 2 and args[1] == "add":
             self.remotes[args[2]] = args[3]
@@ -118,7 +124,8 @@ class SetupTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_own_repo_is_created_when_fork_is_forbidden(self) -> None:
-        report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool")
+        report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool",
+                                 mode="own")
         self.assertTrue(report.get("ok"), report)
         kinds = [str(s.get("how")) for s in report["steps"]]
         self.assertIn("свой репозиторий", kinds)
@@ -130,9 +137,25 @@ class SetupTest(unittest.TestCase):
     def test_fork_is_preferred_when_possible(self) -> None:
         self._gh = _FakeGh(fork_allowed=True)
         clone_mod.gh = self._gh
-        report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool")
+        report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool",
+                                 mode="own")
         kinds = [str(s.get("how")) for s in report["steps"]]
         self.assertIn("форк", kinds)
+
+    def test_default_mode_creates_no_repository_on_github(self) -> None:
+        """Дефолт (промт #130) — папка в общем репозитории, без своего репо.
+
+        ⚠️ Живой случай 25.11: пока дефолтом был «свой репозиторий», каждая
+        новая копия заводила репозиторий в аккаунте владельца — а владелец
+        просил, чтобы по умолчанию копия работала папкой в общем репозитории
+        и аккаунт на GitHub не требовался.
+        """
+        report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool")
+        self.assertEqual(report.get("mode"), "shared")
+        created = [call for call in self._gh.calls if call[:2] == ["repo", "create"]]
+        self.assertEqual(created, [], "свой репозиторий создавать нельзя")
+        forks = [call for call in self._gh.calls if call[:2] == ["repo", "fork"]]
+        self.assertEqual(forks, [], "форк заводить нельзя")
 
     def test_clone_and_pool_are_taken(self) -> None:
         report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool")
@@ -144,6 +167,63 @@ class SetupTest(unittest.TestCase):
         report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool")
         self.assertNotIn(str(self.tmp.name).lower(),
                          str(report.get("repo", "")).lower())
+
+
+class RegisterFolderTest(unittest.TestCase):
+    """Папка копии в общем репозитории программы (промт #130)."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_clone = clone_mod.CLONE_DIR
+        self._old_git = clone_mod.git
+        self._old_instance = lineage.instance
+        clone_mod.CLONE_DIR = Path(self.tmp.name) / "clone"
+        (clone_mod.CLONE_DIR / ".git").mkdir(parents=True, exist_ok=True)
+        self._git = _FakeGit()
+        self._git.remotes = {"origin": "https://github.com/Valstan/biblio.git"}
+        clone_mod.git = self._git
+        lineage.instance = lambda: {"instance_id": "mg-abcdef12",
+                                    "family": "minigen", "generation": 2,
+                                    "fork_of": {"commit": "abc1234"}}
+
+    def tearDown(self) -> None:
+        clone_mod.CLONE_DIR = self._old_clone
+        clone_mod.git = self._old_git
+        lineage.instance = self._old_instance
+        self.tmp.cleanup()
+
+    def test_folder_is_registered_in_the_program_repo(self) -> None:
+        report = clone_mod.register_folder("mg-abcdef12", upstream="Valstan/biblio")
+        self.assertTrue(report.get("ok"), report)
+        self.assertEqual(report["folder"], "copies/mg-abcdef12")
+        self.assertEqual(report["branch"], "copies/mg-abcdef12")
+        marker = clone_mod.CLONE_DIR / "copies" / "mg-abcdef12" / "copy.json"
+        self.assertTrue(marker.is_file())
+        text = marker.read_text(encoding="utf-8")
+        self.assertIn("mg-abcdef12", text)
+        # ⚠️ путь и имя машины в общий репозиторий не попадают (D-038)
+        self.assertNotIn(str(self.tmp.name).lower(), text.lower())
+        pushes = [call for call in self._git.calls if call[:1] == ["push"]]
+        self.assertTrue(pushes, "ветка копии должна уйти в репозиторий программы")
+        self.assertIn("refs/heads/copies/mg-abcdef12", " ".join(pushes[0]))
+
+    def test_a_lookalike_remote_is_not_pushed_to(self) -> None:
+        """«Valstan/biblio-minigen» — не репозиторий программы."""
+        self._git.remotes = {"origin": "https://github.com/Valstan/biblio-minigen.git"}
+        report = clone_mod.register_folder("mg-abcdef12", upstream="Valstan/biblio")
+        self.assertFalse(report.get("ok"), report)
+        self.assertEqual([c for c in self._git.calls if c[:1] == ["push"]], [])
+
+    def test_without_a_clone_it_is_refused(self) -> None:
+        clone_mod.CLONE_DIR = Path(self.tmp.name) / "empty"
+        report = clone_mod.register_folder("mg-abcdef12")
+        self.assertFalse(report.get("ok"), report)
+        self.assertIn("клона нет", report["why"])
+
+    def test_instance_id_cannot_escape_the_folder(self) -> None:
+        report = clone_mod.register_folder("../../evil", upstream="Valstan/biblio")
+        self.assertNotIn("..", report["folder"])
+        self.assertTrue(report["folder"].startswith("copies/"))
 
 
 class PullRequestTargetTest(unittest.TestCase):

@@ -47,6 +47,7 @@ import minigen_code as code            # noqa: E402
 import minigen_clone as clone_mod      # noqa: E402
 import minigen_genes as genes_mod      # noqa: E402
 import minigen_copy as copy_mod        # noqa: E402
+import minigen_token as token_mod      # noqa: E402
 import minigen_map as map_mod          # noqa: E402
 import minigen_update as update_mod    # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
@@ -331,6 +332,14 @@ class Bridge:
             "copy.first_run": self.cmd_copy_first_run,
             "copy.answer": self.cmd_copy_answer,
             "copy.mode": self.cmd_copy_mode,
+            # токен копии: заявка, выпуск, привязка к папке (25.11, промт #130)
+            "copy.token_status": self.cmd_copy_token_status,
+            "copy.token_request": self.cmd_copy_token_request,
+            "copy.token_requests": self.cmd_copy_token_requests,
+            "copy.token_issue": self.cmd_copy_token_issue,
+            "copy.token_set": self.cmd_copy_token_set,
+            "copy.token_check": self.cmd_copy_token_check,
+            "copy.token_trust": self.cmd_copy_token_trust,
             # обновление программы из окна (заказ владельца 24.11)
             "update.status": self.cmd_update_status,
             "update.check": self.cmd_update_check,
@@ -840,17 +849,72 @@ class Bridge:
         """Сменить режим копии (свой репозиторий / общий репозиторий / локально)."""
         return state.jsonable(copy_mod.set_mode(str(args.get("mode") or "")))
 
+    # ──────────────────────────────────────────────────────── токен копии
+
+    def cmd_copy_token_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Токен копии: есть ли, где лежит, отпечаток, привязка к папке."""
+        return state.jsonable(token_mod.status())
+
+    def cmd_copy_token_request(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Заявка на токен — в раздел КАРМАНА (владелец её увидит)."""
+        return state.jsonable(token_mod.publish_request(
+            section=str(args.get("section") or token_mod.REQUESTS_SECTION),
+            name=str(args.get("name") or "")))
+
+    def cmd_copy_token_requests(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Заявки на токен, которые пришли в раздел (с пометкой «свой/чужой»)."""
+        return {"requests": state.jsonable(token_mod.requests(
+            section=str(args.get("section") or token_mod.REQUESTS_SECTION)))}
+
+    def cmd_copy_token_issue(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Выпустить токен копии (действие владельца).
+
+        ⚠️ Значение токена возвращается **один раз** — владелец отдаёт его
+        копии. В отчёты и журнал значение не попадает: отчёт пишет только
+        «команда: ок».
+        """
+        return state.jsonable(token_mod.issue(
+            instance_id=str(args.get("instance_id") or ""),
+            folder=str(args.get("folder") or ""),
+            name=str(args.get("name") or "")))
+
+    def cmd_copy_token_set(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Сохранить токен, полученный от владельца, и проверить привязку.
+
+        ⚠️ Вставляется **код из выпуска**: `секрет.доказательство`. Доказательство
+        едет вместе с секретом, иначе копия не сможет подтвердить свою папку.
+        Значение в отчёт и в журнал не попадает: отчёт пишет только «ок».
+        """
+        return state.jsonable(token_mod.set_token(
+            value=str(args.get("token") or ""),
+            instance_id=str(args.get("instance_id") or ""),
+            folder=str(args.get("folder") or ""),
+            proof=str(args.get("proof") or ""),
+            issued_at=int(args.get("issued_at") or 0)))
+
+    def cmd_copy_token_check(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Проверить доступ: токен выдан под эту папку (или нет)."""
+        return state.jsonable(token_mod.verify(
+            folder=str(args.get("folder") or ""),
+            instance_id=str(args.get("instance_id") or "")))
+
+    def cmd_copy_token_trust(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Закрепить копию (TOFU): её отпечаток подписи запоминается."""
+        return state.jsonable(token_mod.trust(
+            instance_id=str(args.get("instance_id") or ""),
+            key_id=str(args.get("key_id") or "")))
+
     def cmd_clone_status(self, args: dict[str, Any]) -> dict[str, Any]:
         """Свой клон копии: где он, какие репозитории, что в родословной."""
         return state.jsonable(clone_mod.status())
 
     def cmd_clone_setup(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Завести копию: свой репозиторий на GitHub или папку в общем.
+        """Завести копию: папку в общем репозитории (дефолт) или свой репозиторий.
 
         Опасное действие: создаёт репозитории в аккаунте владельца — только
         после подтверждения.
         """
-        mode = str(args.get("mode") or "own").strip() or "own"
+        mode = str(args.get("mode") or "shared").strip() or "shared"
         if mode not in copy_mod.MODES:
             return {"ok": False, "error": "неизвестный режим: %s" % mode}
         return state.jsonable(clone_mod.setup(

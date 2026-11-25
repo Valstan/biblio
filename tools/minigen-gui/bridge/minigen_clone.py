@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,15 @@ def copy_repo_name(instance_id: str = "") -> str:
     """Имя репозитория копии: `minigen-<идентификатор>`."""
     ident = (instance_id or lineage.instance().get("instance_id") or "").replace("mg-", "")
     return "%s-%s" % (COPY_REPO_PREFIX, ident or "copy")
+
+
+def _safe_ident(value: str) -> str:
+    """Идентификатор копии, пригодный для пути (ветка и папка)."""
+    raw = "".join(ch for ch in str(value or "")
+                  if ch.isalnum() or ch in "-_.").strip()
+    if not raw or raw in (".", "..") or ".." in raw:
+        return "copy"
+    return raw
 
 
 def _owner_of(slug: str) -> str:
@@ -146,20 +156,106 @@ def status() -> dict[str, Any]:
     return info
 
 
+def register_folder(instance_id: str = "", upstream: str = DEFAULT_UPSTREAM
+                    ) -> dict[str, Any]:
+    """Завести **папку копии** в общем репозитории программы.
+
+    Папка — `copies/<идентификатор копии>/`: в ней файл регистрации (кто
+    копия, от какой версии форк, когда зарегистрирована) — без путей и имён
+    машин (D-038). Ветка — `copies/<идентификатор копии>`: правки копии не
+    мешают другим копиям и не требуют аккаунта на GitHub.
+
+    Опасное действие: пишет в репозиторий программы ⇒ только после
+    подтверждения владельца.
+    """
+    data = lineage.instance()
+    ident = _safe_ident(instance_id or str(data.get("instance_id") or "copy"))
+    branch = "copies/%s" % ident
+    folder = "copies/%s" % ident
+    report: dict[str, Any] = {"instance_id": ident, "branch": branch,
+                              "folder": folder, "upstream": upstream,
+                              "steps": []}
+    if not (CLONE_DIR / ".git").is_dir():
+        report["ok"] = False
+        report["why"] = "клона нет — сначала clone.setup"
+        return report
+    # куда пушить: remote, чей адрес — репозиторий программы
+    # ⚠️ Сравнение строгое: «github.com/Valstan/biblio» — это подстрока и
+    # «github.com/Valstan/biblio-minigen», а такой пушить нельзя.
+    target = ""
+    want = "github.com/%s" % upstream
+    remotes = _remotes(CLONE_DIR)
+    for name, url in remotes.items():
+        clean = url.strip()
+        if clean.endswith(".git"):
+            clean = clean[:-4]
+        if clean == want or clean.endswith("/" + want):
+            target = name
+            break
+    if not target:
+        report["ok"] = False
+        report["why"] = ("не найден remote на репозиторий программы (%s) — "
+                         "ветку некуда отправить" % upstream)
+        return report
+    checkout = git(["checkout", "-B", branch, "master"], CLONE_DIR)
+    if not checkout.get("ok"):
+        report["ok"] = False
+        report["why"] = "ветку не создать: %s" % (checkout.get("err") or checkout.get("out"))
+        return report
+    marker = {
+        "instance_id": ident,
+        "family": str(data.get("family") or "minigen"),
+        "generation": int(data.get("generation") or 1),
+        "fork_commit": str((data.get("fork_of") or {}).get("commit") or ""),
+        "registered_at": int(time.time() * 1000),
+    }
+    path = CLONE_DIR / folder / "copy.json"
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(marker, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+    except OSError as exc:
+        report["ok"] = False
+        report["why"] = "не записать регистрацию папки: %s" % exc
+        return report
+    add = git(["add", "-A", "copies"], CLONE_DIR)
+    if not add.get("ok"):
+        report["ok"] = False
+        report["why"] = "не добавить в индекс: %s" % (add.get("err") or add.get("out"))
+        return report
+    commit = git(["commit", "-m", "copy: register %s" % ident], CLONE_DIR, timeout=180)
+    if not commit.get("ok"):
+        report["ok"] = False
+        report["why"] = "коммит не прошёл: %s" % (commit.get("err") or commit.get("out"))
+        return report
+    push = git(["push", target, "HEAD:refs/heads/%s" % branch], CLONE_DIR, timeout=600)
+    if not push.get("ok"):
+        report["ok"] = False
+        report["why"] = "папка не ушла в репозиторий программы: %s" % (
+            push.get("err") or push.get("out"))
+        return report
+    report["ok"] = True
+    report["why"] = "папка копии заведена в общем репозитории: %s (ветка %s)" % (
+        folder, branch)
+    report["steps"].append({"folder": folder, "branch": branch, "how": "заведена"})
+    return report
+
+
 def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
-          private: bool = True, mode: str = "own") -> dict[str, Any]:
+          private: bool = True, mode: str = "shared") -> dict[str, Any]:
     """Завести копию: репозиторий копии и клон (+ пул генов).
 
     Опасное действие: создаёт репозитории в аккаунте владельца ⇒ только после
     подтверждения.
 
-    Режимы (заказ владельца 25.11, промт #131):
+    Режимы (заказ владельца 25.11, промт #131 и #130):
 
-    - `own` — копия заводит **свой** репозиторий на GitHub (`minigen-<id>`),
-      ветки живут в нём, PR идут в репозиторий программы (это был прежний
-      порядок работы);
-    - `shared` — копия правит программу **в общем репозитории**: клон берётся
-      прямо из него, PR идёт туда же (своё имя репозитория не заводится);
+    - `shared` — **дефолт**: копия работает **папкой в общем репозитории
+      программы** (`copies/<идентификатор копии>/`); свой репозиторий на GitHub
+      не заводится и аккаунт не нужен;
+    - `own` — прежнее поведение: копия заводит **свой** репозиторий на
+      GitHub (`minigen-<id>`), ветки живут в нём, PR идут в репозиторий
+      программы;
     - `local` — сети нет: клона не берётся, правки идут в локальный
       git-репозиторий на машине (`minigen_copy.ensure_local_repo`).
     """
@@ -313,6 +409,19 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
                                 "how": born.get("why") or born.get("error")})
     except Exception as exc:  # noqa: BLE001
         report["steps"].append({"born": "не записано", "how": str(exc)})
+
+    # 7) папка копии в общем репозитории (режим «папка в общем репозитории»):
+    #    `copies/<идентификатор копии>/` — свои правки копии никому не мешают,
+    #    и аккаунт на GitHub не нужен.
+    if shared:
+        folder = register_folder(instance_id, upstream)
+        report["steps"].append({"folder": folder.get("folder", ""),
+                                "ok": bool(folder.get("ok")),
+                                "why": folder.get("why")})
+        if not folder.get("ok"):
+            report["ok"] = False
+            report["why"] = folder.get("why")
+            return report
 
     report["ok"] = True
     report["why"] = "клон копии готов: %s (upstream %s)" % (repo_name, upstream)
