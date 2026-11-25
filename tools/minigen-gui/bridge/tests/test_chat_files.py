@@ -62,12 +62,14 @@ class _FakeAgent:
     def __init__(self) -> None:
         self.blocks: list[dict] = []
         self.task = ""
+        self.council_note = ""
         self.pending = None
 
     def ask(self, history, user_text, area_slug="minigen", model="", note="",
-            blocks=None):
+            blocks=None, council_note=""):
         self.task = user_text
         self.blocks = list(blocks or [])
+        self.council_note = council_note
         return {"status": "done", "text": "файл посмотрен", "calls": [],
                 "history": list(history)}
 
@@ -198,6 +200,24 @@ class ChatFilesTest(unittest.TestCase):
                                    "attachments": [{"path": str(path)}]})
         self.assertIn("заметка.txt", self.bridge.agent.task)
         self.assertEqual(len(self.bridge.agent.blocks), 1)
+
+    def test_the_council_receives_the_content_of_the_file(self) -> None:
+        """Совет должен видеть файл: иначе роли ищут его по диску (живой случай)."""
+        path = self._write("щиток.txt", "На щитке 17 выключателей".encode("utf-8"))
+        self.bridge.cmd_chat_send({"text": "сколько выключателей?",
+                                   "attachments": [{"path": str(path)}]})
+        note = self.bridge.agent.council_note
+        self.assertIn("17 выключателей", note)
+        self.assertIn("щиток.txt", note)
+
+    def test_the_council_is_told_about_a_picture(self) -> None:
+        """Картинку совет не видит — но знает, что она приложена."""
+        path = self._write("схема.png", PNG)
+        self.bridge.cmd_chat_send({"text": "что на картинке?",
+                                   "attachments": [{"path": str(path)}]})
+        note = self.bridge.agent.council_note
+        self.assertIn("схема.png", note)
+        self.assertIn("изображение", note)
 
     def test_a_request_without_text_and_files_is_refused(self) -> None:
         out = self.bridge.cmd_chat_send({"text": "   "})

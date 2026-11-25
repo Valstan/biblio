@@ -251,6 +251,53 @@ class PipelineTest(unittest.TestCase):
         self.assertFalse(council.is_continuation(TASK))
 
 
+class CouncilFileTaskTest(unittest.TestCase):
+    """Задание с приложенным файлом: совет должен видеть содержимое.
+
+    ⚠️ Живой случай 25.11 (проба промта #90): роли совета живут в своём
+    контексте и файла оператора не видели — «Супер-программист» бросался искать
+    его по диску и не укладывался в шаги («специалист не уложился в 5 шагов»).
+    Теперь содержимое файла приходит совету словом.
+    """
+
+    def test_the_council_receives_the_attached_file(self) -> None:
+        fake = FakeAgent(council_replies())
+        captured: dict[str, str] = {}
+
+        def fake_council(messages, cfg, budget, settings, task):
+            captured["task"] = task
+            return {"status": "done", "history": messages,
+                    "council_text": "", "decision": {}}
+
+        fake._council = fake_council
+        fake.settings_provider = lambda: {"councilEnabled": True}
+        fake._model_config = lambda area_slug, model="": {"model": "тест"}
+        fake._loop = lambda messages, cfg, calls, **kwargs: {
+            "status": "done", "text": "ок", "calls": [], "history": messages}
+        fake.ask([], "Сколько выключателей на щитке?", "minigen", "",
+                 council_note="Файл «щиток.txt» (текст, 27 Б):\n"
+                             "На щитке 17 выключателей.")
+        self.assertIn("17 выключателей", captured.get("task", ""))
+        self.assertIn("щиток.txt", captured.get("task", ""))
+
+    def test_without_a_file_the_task_is_unchanged(self) -> None:
+        fake = FakeAgent(council_replies())
+        captured: dict[str, str] = {}
+
+        def fake_council(messages, cfg, budget, settings, task):
+            captured["task"] = task
+            return {"status": "done", "history": messages,
+                    "council_text": "", "decision": {}}
+
+        fake._council = fake_council
+        fake.settings_provider = lambda: {"councilEnabled": True}
+        fake._model_config = lambda area_slug, model="": {"model": "тест"}
+        fake._loop = lambda messages, cfg, calls, **kwargs: {
+            "status": "done", "text": "ок", "calls": [], "history": messages}
+        fake.ask([], TASK, "minigen", "")
+        self.assertEqual(captured.get("task"), TASK)
+
+
 # ────────────────────────────────────────────────────── новый специалист
 
 class NewSpecialistTest(unittest.TestCase):
