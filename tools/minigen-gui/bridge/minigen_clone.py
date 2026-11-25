@@ -118,6 +118,23 @@ def status() -> dict[str, Any]:
         "copy_repo": data.get("copy_repo") or "",
         "upstream": data.get("upstream") or DEFAULT_UPSTREAM,
     }
+    # ⚠️ Режим копии (заказ владельца 25.11): смена режима должна быть видна
+    # в `clone.status` — иначе «режим» был бы только строчкой в настройках.
+    try:
+        import minigen_copy
+        info["mode"] = minigen_copy.mode()
+        info["mode_label"] = minigen_copy.mode_label()
+        info["exchange"] = minigen_copy.exchange_state()
+        info["local_repo"] = minigen_copy.local_repo_state()
+        info["first_run"] = minigen_copy.first_run_state()
+    except Exception as exc:  # noqa: BLE001
+        info["mode"] = ""
+        info["mode_label"] = "неизвестно"
+        info["exchange"] = {"available": False, "transport": "нет", "pool": "",
+                            "pool_exists": False, "why": str(exc)}
+        info["local_repo"] = {"path": "", "exists": False}
+        info["first_run"] = {"asked": False, "agreed": False, "mode": "",
+                             "answered_at": 0, "instance": ""}
     if info["clone_exists"]:
         res = git(["rev-parse", "--abbrev-ref", "HEAD"], CLONE_DIR)
         info["branch"] = res.get("out") or ""
@@ -130,22 +147,49 @@ def status() -> dict[str, Any]:
 
 
 def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
-          private: bool = True) -> dict[str, Any]:
-    """Завести репозиторий копии на GitHub и склонировать его (+ пул генов).
+          private: bool = True, mode: str = "own") -> dict[str, Any]:
+    """Завести копию: репозиторий копии и клон (+ пул генов).
 
     Опасное действие: создаёт репозитории в аккаунте владельца ⇒ только после
     подтверждения.
+
+    Режимы (заказ владельца 25.11, промт #131):
+
+    - `own` — копия заводит **свой** репозиторий на GitHub (`minigen-<id>`),
+      ветки живут в нём, PR идут в репозиторий программы (это был прежний
+      порядок работы);
+    - `shared` — копия правит программу **в общем репозитории**: клон берётся
+      прямо из него, PR идёт туда же (своё имя репозитория не заводится);
+    - `local` — сети нет: клона не берётся, правки идут в локальный
+      git-репозиторий на машине (`minigen_copy.ensure_local_repo`).
     """
+    if mode == "local":
+        import minigen_copy
+        local = minigen_copy.ensure_local_repo()
+        return {"ok": bool(local.get("ok")), "mode": "local",
+                "repo": local.get("repo") or "",
+                "steps": [{"what": "локальный репозиторий",
+                           "ok": bool(local.get("ok")),
+                           "why": local.get("why")}],
+                "why": local.get("why")}
+    shared = mode == "shared"
     data = lineage.instance()
     instance_id = str(data.get("instance_id") or "")
     repo_name = copy_repo_name(instance_id)
-    report: dict[str, Any] = {"instance_id": instance_id, "repo": repo_name,
-                              "upstream": upstream, "pool": pool, "steps": []}
+    report: dict[str, Any] = {"instance_id": instance_id,
+                              "repo": (upstream if shared else repo_name),
+                              "upstream": upstream, "pool": pool, "mode": mode,
+                              "steps": []}
 
     # 1) свой репозиторий копии (или форк, если платформа его разрешит)
     owner = _owner_of(upstream) or "Valstan"
     full_name = "%s/%s" % (owner, repo_name)
-    if _repo_exists(full_name):
+    if shared:
+        # Режим «папка в общем репозитории»: своего репозитория не заводим —
+        # копия правит программу там же, где она живёт.
+        report["steps"].append({"repo": full_name,
+                                "how": "свой репозиторий не нужен — общий"})
+    elif _repo_exists(full_name):
         report["steps"].append({"repo": full_name, "how": "уже есть"})
     else:
         fork = gh(["repo", "fork", upstream, "--clone=false"])
@@ -167,7 +211,8 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
         report["steps"].append({"clone": str(CLONE_DIR), "how": "уже есть"})
     else:
         CLONE_DIR.parent.mkdir(parents=True, exist_ok=True)
-        clone = git(["clone", url, str(CLONE_DIR)], CLONE_DIR.parent, timeout=900)
+        clone_url = ("https://github.com/%s.git" % upstream) if shared else url
+        clone = git(["clone", clone_url, str(CLONE_DIR)], CLONE_DIR.parent, timeout=900)
         if not clone.get("ok"):
             report["ok"] = False
             report["why"] = "клон не взялся: %s" % (clone.get("err") or clone.get("out"))
@@ -176,13 +221,30 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
 
     # 3) upstream — репозиторий программы
     remotes = _remotes(CLONE_DIR)
-    if "upstream" not in remotes:
-        add = git(["remote", "add", "upstream", "https://github.com/%s.git" % upstream],
-                  CLONE_DIR)
-        report["steps"].append({"upstream": upstream,
-                                "how": "добавлен" if add.get("ok") else "не добавился"})
-    if "origin" in remotes:
-        git(["remote", "set-url", "origin", url], CLONE_DIR)
+    if shared:
+        # ⚠️ Живой случай 25.11: первая версия режима «общий репозиторий»
+        # переставляла `origin` у уже взятого клона. У живого копии свой
+        # origin — её репозиторий, и молчаливая перестановка сломала бы
+        # настроенную машину. Теперь: клона нет — берём общий репозиторий
+        # сразу; клон есть — репозитории не трогаем, а режим меняет только
+        # то, **куда уходит ветка** (см. `code.open_pr`).
+        if not remotes:
+            git(["remote", "set-url", "origin",
+                 "https://github.com/%s.git" % upstream], CLONE_DIR)
+            report["steps"].append({"origin": upstream,
+                                    "how": "общий репозиторий (клон свежий)"})
+        else:
+            report["steps"].append({"origin": remotes.get("origin", ""),
+                                    "how": "репозитории клона не переставляем — "
+                                           "меняется только то, куда уходит ветка"})
+    else:
+        if "upstream" not in remotes:
+            add = git(["remote", "add", "upstream", "https://github.com/%s.git" % upstream],
+                      CLONE_DIR)
+            report["steps"].append({"upstream": upstream,
+                                    "how": "добавлен" if add.get("ok") else "не добавился"})
+        if "origin" in remotes:
+            git(["remote", "set-url", "origin", url], CLONE_DIR)
 
     # 3a) берём код программы в локальную ветку master (она смотрит в
     #     upstream). В **свой** репозиторий код программы кладём веткой `base`:
@@ -190,17 +252,26 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
     #     пуш в master любого репозитория, а `base` — не master и ничего не
     #     нарушает: канон программы (её master) остаётся нетронутым, PR идут
     #     в upstream. Репозиторий копии живёт на ветках правок.
-    fetch = git(["fetch", "upstream", "master"], CLONE_DIR, timeout=600)
+    fetch_from = "origin" if (shared and "upstream" not in remotes) else "upstream"
+    fetch = git(["fetch", fetch_from, "master"], CLONE_DIR, timeout=600)
     if fetch.get("ok"):
         git(["checkout", "-B", "master", "FETCH_HEAD"], CLONE_DIR)
-        git(["branch", "--set-upstream-to=upstream/master", "master"], CLONE_DIR)
-        push_base = git(["push", "origin", "FETCH_HEAD:refs/heads/base"], CLONE_DIR,
-                         timeout=600)
-        if push_base.get("ok"):
-            gh(["repo", "edit", full_name, "--default-branch", "base"])
-        report["steps"].append({"seed": "base",
-                                "how": "код программы в ветке base (master пушить "
-                                       "нельзя — правило машины)"})
+        if shared:
+            # В режиме «общий репозиторий» ветка правок уходит прямо в
+            # репозиторий программы: пушить в master нельзя (правило машины),
+            # но PR открывается оттуда.
+            git(["branch", "--set-upstream-to=%s/master" % fetch_from, "master"], CLONE_DIR)
+            report["steps"].append({"master": "от %s (общий репозиторий)" % fetch_from,
+                                    "how": "правки и PR — в общий репозиторий"})
+        else:
+            git(["branch", "--set-upstream-to=upstream/master", "master"], CLONE_DIR)
+            push_base = git(["push", "origin", "FETCH_HEAD:refs/heads/base"], CLONE_DIR,
+                             timeout=600)
+            if push_base.get("ok"):
+                gh(["repo", "edit", full_name, "--default-branch", "base"])
+            report["steps"].append({"seed": "base",
+                                    "how": "код программы в ветке base (master пушить "
+                                           "нельзя — правило машины)"})
     else:
         report["steps"].append({"seed": "base", "how": "upstream не отдал master"})
 
@@ -223,11 +294,13 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
     gh(["repo", "edit", pool, "--default-branch", "pool"])
 
     # 5) родословная: от какой версии форк и куда мы пишем
-    data["copy_repo"] = repo_name
+    if not shared:
+        data["copy_repo"] = repo_name
     data["upstream"] = upstream
+    data["copy_mode"] = mode
     data["fork_of"] = data.get("fork_of") or {"commit": "", "installed_at": 0}
     lineage._write_json(lineage.INSTANCE_FILE, data)
-    lineage.record("clone", repo=repo_name, upstream=upstream, pool=pool)
+    lineage.record("clone", repo=repo_name, upstream=upstream, pool=pool, mode=mode)
 
     # 6) копия появилась на карте: «в какой точке родилась» — это коммит форка.
     #    Пишем в пул, чтобы карта была общей: каждая копия дописывает в неё
@@ -249,6 +322,18 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
 def sync() -> dict[str, Any]:
     """Обновить клон и пул (только fast-forward, локальные правки не трогаем)."""
     out: dict[str, Any] = {"steps": []}
+    # ⚠️ Локальный режим (заказ владельца 25.11): сети нет — обновлять
+    # нечего. Говорим прямо, а не делаем вид, что «обновление прошло».
+    try:
+        import minigen_copy
+        if minigen_copy.is_local():
+            return {"ok": False, "steps": [
+                {"what": "клон", "ok": False,
+                 "why": "локальный режим: сети нет — обновлять нечего"}],
+                "why": "локальный режим: обмен и обновление с другими копиями "
+                       "недоступны"}
+    except Exception:  # noqa: BLE001
+        pass
     for name, path in (("clone", CLONE_DIR), ("pool", POOL_DIR)):
         if not (path / ".git").is_dir():
             out["steps"].append({"what": name, "ok": False, "why": "клона нет"})

@@ -46,6 +46,7 @@ import minigen_tools as tools          # noqa: E402
 import minigen_code as code            # noqa: E402
 import minigen_clone as clone_mod      # noqa: E402
 import minigen_genes as genes_mod      # noqa: E402
+import minigen_copy as copy_mod        # noqa: E402
 import minigen_map as map_mod          # noqa: E402
 import minigen_update as update_mod    # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
@@ -322,6 +323,14 @@ class Bridge:
             "genes.read": self.cmd_genes_read,
             "genes.publish": self.cmd_genes_publish,
             "genes.adopt": self.cmd_genes_adopt,
+            # подсказки наработок и ручной обмен (25.11, промт #131)
+            "genes.suggest": self.cmd_genes_suggest,
+            "genes.export": self.cmd_genes_export,
+            "genes.import": self.cmd_genes_import,
+            # режимы копии и первый запуск (25.11, промт #131)
+            "copy.first_run": self.cmd_copy_first_run,
+            "copy.answer": self.cmd_copy_answer,
+            "copy.mode": self.cmd_copy_mode,
             # обновление программы из окна (заказ владельца 24.11)
             "update.status": self.cmd_update_status,
             "update.check": self.cmd_update_check,
@@ -797,20 +806,58 @@ class Bridge:
             gene=str(args.get("gene") or ""),
             title=str(args.get("title") or "")))
 
+    def cmd_genes_suggest(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Чужие наработки, которые стоит посмотреть (с причиной совпадения)."""
+        return state.jsonable(genes_mod.suggestions())
+
+    def cmd_genes_export(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Выгрузить наработки в папку (обмен вручную, без сети)."""
+        return state.jsonable(genes_mod.export_pool(str(args.get("path") or "")))
+
+    def cmd_genes_import(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Внести наработки из выгруженной папки (обмен вручную, без сети)."""
+        return state.jsonable(genes_mod.import_pool(str(args.get("path") or "")))
+
+    def cmd_copy_first_run(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Первый запуск: спрашивали ли про регистрацию папки копии."""
+        return state.jsonable({"first_run": copy_mod.first_run_state(),
+                               "offer": copy_mod.offer(),
+                               "mode": copy_mod.mode(),
+                               "mode_label": copy_mod.mode_label(),
+                               "exchange": copy_mod.exchange_state()})
+
+    def cmd_copy_answer(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Ответ на вопрос первого запуска (согласиться или отказаться).
+
+        Опасное действие: согласие означает запись в репозиторий программы —
+        только после подтверждения владельца.
+        """
+        return state.jsonable(copy_mod.answer_first_run(
+            agree=bool(args.get("agree")),
+            wanted_mode=str(args.get("mode") or "")))
+
+    def cmd_copy_mode(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Сменить режим копии (свой репозиторий / общий репозиторий / локально)."""
+        return state.jsonable(copy_mod.set_mode(str(args.get("mode") or "")))
+
     def cmd_clone_status(self, args: dict[str, Any]) -> dict[str, Any]:
         """Свой клон копии: где он, какие репозитории, что в родословной."""
         return state.jsonable(clone_mod.status())
 
     def cmd_clone_setup(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Завести репозиторий копии на GitHub и взять клон (+ пул генов).
+        """Завести копию: свой репозиторий на GitHub или папку в общем.
 
         Опасное действие: создаёт репозитории в аккаунте владельца — только
         после подтверждения.
         """
+        mode = str(args.get("mode") or "own").strip() or "own"
+        if mode not in copy_mod.MODES:
+            return {"ok": False, "error": "неизвестный режим: %s" % mode}
         return state.jsonable(clone_mod.setup(
             upstream=str(args.get("upstream") or clone_mod.DEFAULT_UPSTREAM),
             pool=str(args.get("pool") or clone_mod.DEFAULT_POOL),
-            private=bool(args.get("private", True))))
+            private=bool(args.get("private", True)),
+            mode=mode))
 
     def cmd_clone_sync(self, args: dict[str, Any]) -> dict[str, Any]:
         """Обновить клон и пул (fast-forward, локальные правки не трогаем)."""

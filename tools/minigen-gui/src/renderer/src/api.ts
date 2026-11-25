@@ -2,8 +2,14 @@ import type {
   Area,
   AgentsSnapshot,
   ChatReply,
+  CloneStatus,
+  CopyFirstRunSnapshot,
+  CopyMode,
   DaemonStatus,
+  GeneActionResult,
   GeneMap,
+  GeneRecord,
+  GeneSuggestions,
   JournalLine,
   KarmanChannel,
   LineageInfo,
@@ -119,7 +125,33 @@ export const api = {
   promptsMark: (payload: { id: string; project?: string; auto: boolean }) =>
     call<{ ok: boolean; error?: string }>('prompts.mark', payload),
   promptsDispatch: (payload: { id: string; project?: string; area: string }) =>
-    call<{ ok: boolean; error?: string; why?: string }>('prompts.dispatch', payload)
+    call<{ ok: boolean; error?: string; why?: string }>('prompts.dispatch', payload),
+  // ── копия: режимы, первый запуск, обмен наработками (25.11, #131) ────────
+  cloneStatus: () => call<CloneStatus>('clone.status'),
+  cloneSetup: (args: { mode?: CopyMode; upstream?: string; pool?: string; private?: boolean }) =>
+    call<GeneActionResult & { steps?: unknown[] }>('clone.setup', args),
+  cloneSync: () =>
+    call<{ ok: boolean; why?: string; steps?: { what: string; ok: boolean; why?: string }[] }>(
+      'clone.sync'
+    ),
+  genesList: () => call<{ genes: GeneRecord[] }>('genes.list'),
+  genesRead: (gene: string) =>
+    call<{ manifest?: Record<string, unknown>; notes?: string; patch?: string; error?: string }>(
+      'genes.read',
+      { gene }
+    ),
+  genesPublish: (payload: { title: string; summary?: string; notes?: string }) =>
+    call<GeneActionResult>('genes.publish', payload),
+  genesAdopt: (gene: string, title?: string) =>
+    call<GeneActionResult>('genes.adopt', title ? { gene, title } : { gene }),
+  genesSuggest: () => call<GeneSuggestions>('genes.suggest'),
+  genesExport: (path?: string) =>
+    call<GeneActionResult>('genes.export', path ? { path } : {}),
+  genesImport: (path: string) => call<GeneActionResult>('genes.import', { path }),
+  copyFirstRun: () => call<CopyFirstRunSnapshot>('copy.first_run'),
+  copyAnswer: (agree: boolean, mode?: CopyMode) =>
+    call<GeneActionResult>('copy.answer', mode ? { agree, mode } : { agree }),
+  copyMode: (mode: CopyMode) => call<GeneActionResult>('copy.mode', { mode })
 }
 
 /** Действия окна (не моста): перезапуск, метка сборки, состояние моста. */
