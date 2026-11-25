@@ -282,6 +282,9 @@ class Bridge:
             "agents.create": self.cmd_agents_create,
             "agents.apply": self.cmd_agents_apply,
             "agents.registry_restore": self.cmd_agents_registry_restore,
+            # канал промтов КАРМАНА: живой ли он и куда уходят заявки
+            # (вкладка «Агенты» в окне, заявка от 24.11)
+            "karman.status": self.cmd_karman_status,
             # заявки: зачитка владельца → заявка для другой нейросети (24.11)
             "ingest.draft": self.cmd_ingest_draft,
             "ingest.save": self.cmd_ingest_save,
@@ -296,7 +299,10 @@ class Bridge:
     # отчётов (шум вместо пользы).
     # ⚠️ `update.status` тоже: окно опрашивает его раз в секунду — в ящике
     # отчётов было бы тысячи одинаковых записей.
-    NO_REPORT_CMDS = ("chat.", "reports.", "update.status")
+    # ⚠️ `agents.list` и `karman.status`: их тоже спрашивает окно (вкладка
+    # «Агенты» обновляется сама) — это чтение, а не действие.
+    NO_REPORT_CMDS = ("chat.", "reports.", "update.status",
+                     "agents.list", "karman.status")
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         handler = self.handlers.get(cmd)
@@ -1019,6 +1025,24 @@ class Bridge:
         state = agents_mod.agent_state()
         restored["agents"] = state.get("agents") or []
         return restored
+
+    # ──────────────────────────────────────────────────────── канал КАРМАНА
+    def cmd_karman_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Состояние канала промтов КАРМАНА — для вкладки «Агенты».
+
+        Отдаёт только **состояние**: жив ли канал, откуда взят секрет и
+        сколько разделов. Значение секрета в ответе нет (в отчёте — только
+        источник: `file` / `env` / `vault`) — иначе окно показывало бы
+        секрет на экране.
+
+        Ничего не меняет: это чтение, а не действие.
+        """
+        status = karman_mod.status()
+        # Значение секрета наружу не пускаем — даже если кто-то добавит его
+        # в отчёт сервиса (страховка от утечки в снимок окна).
+        status.pop("secret", None)
+        status.pop("value", None)
+        return status
 
     # ──────────────────────────────────────────────────────────── заявки
     def _known_projects(self) -> list[dict[str, Any]]:
