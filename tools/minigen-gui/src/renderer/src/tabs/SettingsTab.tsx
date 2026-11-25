@@ -8,6 +8,8 @@ import type {
   CopyTokenRequest,
   CopyTokenStatus,
   DaemonStatus,
+  DbImportPlan,
+  DbStatus,
   LineageInfo,
   ProgramVersion,
   Settings,
@@ -16,6 +18,13 @@ import type {
 import { api } from '../api'
 import { TZ_LABEL, formatDateTime } from '../time'
 import { answerConfirmText, firstRunView, modeConfirmText, modeRows, type Tone } from './copy-view'
+import {
+  DB_DECISIONS,
+  dbPlanSummary,
+  dbQuestions,
+  dbStatusRows,
+  type DbDecision
+} from './db-view'
 import { lineageRows as lineageRowsOf } from './lineage-view'
 import {
   accessCheckText,
@@ -110,6 +119,12 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
   /** Выпущенный токен — значение показывается один раз, отдельным блоком. */
   const [issued, setIssued] = useState<CopyTokenIssue | null>(null)
   const [issuedShown, setIssuedShown] = useState(false)
+  // ── локальная база «МиниГена» (промт #92) ────────────────────────────────
+  const [dbStatus, setDbStatus] = useState<DbStatus | null>(null)
+  const [dbPlan, setDbPlan] = useState<DbImportPlan | null>(null)
+  const [dbDecisions, setDbDecisions] = useState<Record<string, DbDecision>>({})
+  const [dbNote, setDbNote] = useState('')
+  const [dbError, setDbError] = useState('')
 
   useEffect(() => {
     if (settings && !form) setForm(settings)
@@ -154,6 +169,19 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
     }
   }, [])
 
+  /**
+   * Состояние локальной базы — по таймеру, как и всё остальное: окно
+   * открывается раньше моста, и разовый запрос падает («мост не запущен»).
+   */
+  const loadDb = useCallback(async () => {
+    try {
+      setDbStatus(await api.dbStatus())
+      setDbError('')
+    } catch (err) {
+      setDbError(`состояние базы не принесли: ${String((err as Error).message || err)}`)
+    }
+  }, [])
+
   useEffect(() => {
     // ⚠️ Всё, что читаем с моста, спрашиваем **по таймеру**, а не один раз:
     // окно открывается раньше моста, и разовый запрос в этот момент падает
@@ -165,11 +193,12 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
       void api.lineageShow().then((data) => setLineage(data?.lineage ?? null)).catch(() => undefined)
       void loadCopy()
       void loadTokens()
+      void loadDb()
     }
     void load()
     const timer = window.setInterval(() => void load(), 5000)
     return () => window.clearInterval(timer)
-  }, [loadCopy, loadTokens])
+  }, [loadCopy, loadTokens, loadDb])
 
   const lineageRows = lineageRowsOf(lineage)
   const first = firstRunView(copySnapshot)
@@ -296,6 +325,84 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
     } catch (err) {
       setGithubTone('bad')
       setGithubNote(`доступ не проверили: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Выгрузить базу в один файл (промт #92).
+   *
+   * ⚠️ Файл с данными уходит с машины по решению человека: путь выбирает
+   * оператор в диалоге (главный процесс), а данные берёт мост.
+   */
+  const exportDb = async () => {
+    setBusy(true)
+    setDbError('')
+    try {
+      const res = await api.dbExport()
+      if (res.canceled) {
+        setDbNote('выгрузка отменена')
+        return
+      }
+      if (res.ok === false) {
+        setDbError(res.error || 'выгрузить не вышло')
+        return
+      }
+      setDbNote(`выгружено: ${res.path} (записей: ${res.total ?? 0})`)
+    } catch (err) {
+      setDbError(`выгрузить не вышло: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Импорт базы: сначала **разбор** файла (ничего не меняя), потом — решение
+   * оператора по спорным записям.
+   */
+  const importDb = async () => {
+    setBusy(true)
+    setDbError('')
+    try {
+      const picked = await api.dbPickFile()
+      if (!picked?.ok || !picked.path) {
+        setDbNote('импорт отменён')
+        return
+      }
+      const plan = await api.dbInspect(picked.path)
+      if (plan.ok === false) {
+        setDbError(plan.error || 'файл не разобран')
+        setDbPlan(null)
+        return
+      }
+      setDbPlan(plan)
+      setDbDecisions({})
+      setDbNote('файл разобран — посмотрите план и решите спорные записи')
+    } catch (err) {
+      setDbError(`разбор не прошёл: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Залить данные из файла — с решениями оператора по конфликтам. */
+  const applyDbImport = async () => {
+    if (!dbPlan?.path) return
+    setBusy(true)
+    setDbError('')
+    try {
+      const res = await api.dbImport(dbPlan.path, dbDecisions)
+      if (res.ok === false) {
+        setDbError(res.error || 'импорт не прошёл')
+        return
+      }
+      setDbNote(res.why || 'импорт закончен')
+      setDbPlan(null)
+      setDbDecisions({})
+      await loadDb()
+    } catch (err) {
+      setDbError(`импорт не прошёл: ${String((err as Error).message || err)}`)
     } finally {
       setBusy(false)
     }
@@ -429,6 +536,104 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
           «установлено» — всё в нём, независимо от зоны машины, на которой
           программа стоит.
         </p>
+      </div>
+
+      <div className="card">
+        <h3>База «МиниГена»</h3>
+        <p className="muted small">
+          Локальная база программы: промты, планы и всё, что «МиниГен» копит
+          на этой машине. Её можно выгрузить в один файл и залить в другую
+          копию «МиниГена» на другом компьютере. Структура базы не привязана к
+          версии программы, поэтому данные переживают обновление, а чужое и
+          будущее не выбрасывается — лежит в неразобранном и уходит в
+          следующей выгрузке.
+        </p>
+        {dbError && <div className="banner bad">{dbError}</div>}
+        {dbNote && <div className="banner">{dbNote}</div>}
+        <table className="grid compact">
+          <tbody>
+            {dbStatusRows(dbStatus).map((row) => (
+              <tr key={row.label}>
+                <td className="muted">{row.label}</td>
+                <td>{row.value}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        <div className="row">
+          <button onClick={() => void exportDb()} disabled={busy}>
+            Выгрузить базу
+          </button>
+          <button onClick={() => void importDb()} disabled={busy}>
+            Импортировать базу
+          </button>
+        </div>
+        {dbPlan && (
+          <>
+            <p className="muted small" style={{ marginTop: 8 }}>
+              План импорта: {dbPlanSummary(dbPlan)}
+            </p>
+            {dbQuestions(dbPlan).length > 0 && (
+              <ul className="muted small">
+                {dbQuestions(dbPlan).map((question, index) => (
+                  <li key={`${index}-${question}`}>{question}</li>
+                ))}
+              </ul>
+            )}
+            {(dbPlan.conflicts ?? []).length > 0 && (
+              <table className="grid compact">
+                <tbody>
+                  {dbPlan.conflicts.map((conflict) => (
+                    <tr key={conflict.id}>
+                      <td className="muted">
+                        {conflict.title} / {conflict.key}
+                      </td>
+                      <td>
+                        <select
+                          value={dbDecisions[conflict.id] ?? 'keep'}
+                          onChange={(event) =>
+                            setDbDecisions((current) => ({
+                              ...current,
+                              [conflict.id]: event.target.value as DbDecision
+                            }))
+                          }
+                        >
+                          {DB_DECISIONS.map((option) => (
+                            <option key={option.id} value={option.id}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+            <div className="row">
+              <button
+                className="primary"
+                onClick={() => void applyDbImport()}
+                disabled={busy}
+              >
+                Импортировать
+              </button>
+              <button
+                onClick={() => {
+                  setDbPlan(null)
+                  setDbDecisions({})
+                }}
+                disabled={busy}
+              >
+                Отмена
+              </button>
+            </div>
+            <p className="muted small">
+              Спорная запись без вашего решения остаётся нетронутой: молча
+              ничего не перезаписывается.
+            </p>
+          </>
+        )}
       </div>
 
       <div className="card">

@@ -21,6 +21,21 @@ import { clickTabScript, mapGeometryScript, parseSmokeTabs, shotName } from './s
 
 const daemonMode = process.argv.includes('--daemon-mode')
 
+/**
+ * Имя файла выгрузки базы по умолчанию — с меткой времени.
+ *
+ * Выгрузка — это файл с данными: он уходит с машины только по решению
+ * оператора, поэтому имя должно быть понятным и не перетирать прошлые.
+ */
+function defaultExportName(): string {
+  const now = new Date()
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  const stamp =
+    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+    `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  return `minigen-${stamp}.minigen.json`
+}
+
 if (daemonMode) {
   // Отдельный профиль: иначе включится блокировка одного экземпляра и
   // окно владельца не откроется (или откроется вместо фонового режима).
@@ -85,6 +100,32 @@ app.whenReady().then(() => {
 
   ipcMain.handle('minigen:call', async (_event, cmd: string, args: Record<string, unknown>) => {
     if (!bridge) throw new Error('мост не запущен')
+    // ── локальная база «МиниГена» (промт #92): файлы выбирает оператор ──
+    // Выгрузка и импорт — это файлы с данными: их путь выбирает человек
+    // (диалог главного процесса), а сама база — моста. Окно на диск не ходит.
+    if (cmd === 'db.pick') {
+      const result = await dialog.showOpenDialog({
+        properties: ['openFile'],
+        filters: [
+          { name: 'Выгрузка базы «МиниГена»', extensions: ['json'] },
+          { name: 'Все файлы', extensions: ['*'] }
+        ]
+      })
+      if (result.canceled || result.filePaths.length === 0) {
+        return { ok: false, canceled: true }
+      }
+      return { ok: true, path: result.filePaths[0] }
+    }
+    if (cmd === 'db.export' && !args?.path) {
+      const result = await dialog.showSaveDialog({
+        defaultPath: defaultExportName(),
+        filters: [{ name: 'Выгрузка базы «МиниГена»', extensions: ['json'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        return { ok: false, canceled: true }
+      }
+      return bridge.exportDatabase(result.filePath)
+    }
     return bridge.call(cmd, args ?? {})
   })
 

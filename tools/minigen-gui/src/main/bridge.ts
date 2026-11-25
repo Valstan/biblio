@@ -2,6 +2,12 @@ import { spawn, type ChildProcessWithoutNullStreams } from 'child_process'
 import { existsSync } from 'fs'
 import { join, resolve } from 'path'
 import { app } from 'electron'
+import type {
+  DbExportResult,
+  DbImportPlan,
+  DbImportReport,
+  DbStatus
+} from '@shared/types'
 
 /**
  * Мост «МиниГена»: дочерний процесс Python, который говорит с ядром.
@@ -149,6 +155,48 @@ export class Bridge {
         }
       })
     })
+  }
+
+  // ───────────────────────────────── локальная база «МиниГена» (промт #92)
+  /**
+   * Состояние базы: где лежит, какая схема, сколько записей.
+   *
+   * Читающий вызов — выполняется сразу.
+   */
+  async databaseStatus(): Promise<DbStatus> {
+    return (await this.call('db.status')) as DbStatus
+  }
+
+  /**
+   * Выгрузить базу в один файл.
+   *
+   * Путь не указан — его выбирает оператор (диалог в главном процессе).
+   * Файл с данными уходит с машины только по решению человека.
+   */
+  async exportDatabase(path?: string): Promise<DbExportResult> {
+    return (await this.call('db.export', path ? { path } : {})) as DbExportResult
+  }
+
+  /** Разбор файла выгрузки: что перенесётся и о чём спросить оператора. */
+  async inspectDatabase(path: string): Promise<DbImportPlan> {
+    return (await this.call('db.inspect', { path })) as DbImportPlan
+  }
+
+  /**
+   * Импорт базы из файла.
+   *
+   * `decisions` — решения оператора по спорным записям: «вид|ключ» →
+   * `file` (взять из файла) / `keep` (оставить своё) / `copy` (положить
+   * рядом). Без решения конфликт не трогается.
+   */
+  async importDatabase(
+    path: string,
+    decisions?: Record<string, string>
+  ): Promise<DbImportReport> {
+    return (await this.call(
+      'db.import',
+      decisions ? { path, decisions } : { path }
+    )) as DbImportReport
   }
 
   stop(): void {

@@ -714,3 +714,113 @@ export interface PromptsSnapshot {
   /** автораздача без живого оператора включена ли */
   auto_dispatch: boolean
 }
+
+/**
+ * Локальная база «МиниГена» (заказ владельца 24.11, промт #92).
+ *
+ * ⚠️ Схема базы **не привязана к версии программы**: данные лежат видами
+ * (`kind`), а версия программы знает только, какие виды понимает. Чужой вид
+ * не выбрасывается, а лежит в «неразобранном» — и уезжает в следующей
+ * выгрузке.
+ */
+export interface DbStatus {
+  ok: boolean
+  /** где лежит файл базы */
+  path: string
+  /** версия схемы хранилища (не версия программы) */
+  schema_version: number
+  total: number
+  counts_by_kind: Record<string, number>
+  kinds_present: string[]
+  /** виды, которые эта версия программы понимает */
+  kinds_known: string[]
+  /** как каждый известный вид называется для человека */
+  kind_titles?: Record<string, string>
+  /** виды, которых она не знает (лежат в неразобранном) */
+  kinds_unknown: string[]
+  unparsed: number
+  format: string
+  format_version: number
+  error?: string
+}
+
+/** Запись базы — общий контейнер: вид, ключ, содержимое. */
+export interface DbRecord {
+  kind: string
+  key: string
+  payload: Record<string, unknown>
+  version: number
+  created_at: string
+  updated_at: string
+  deleted_at?: string | null
+}
+
+/** Выгрузка базы в один файл (ответ моста `db.export`). */
+export interface DbExportResult {
+  ok: boolean
+  path: string
+  total: number
+  counts_by_kind: Record<string, number>
+  checksum: string
+  exported_at: string
+  schema_version: number
+  /** оператор отменил выбор файла */
+  canceled?: boolean
+  error?: string
+}
+
+/** Спорная запись при импорте — её решает оператор, а не программа. */
+export interface DbConflict {
+  /** «вид|ключ» — под этим идентификатором решение и принимается */
+  id: string
+  kind: string
+  key: string
+  title: string
+  question: string
+}
+
+/** Разбор файла выгрузки (ответ моста `db.inspect`) — ничего не меняет. */
+export interface DbImportPlan {
+  ok: boolean
+  path: string
+  file?: {
+    schema_version?: number
+    total?: number
+    counts_by_kind?: Record<string, number>
+    exported_at?: string
+  }
+  version?: {
+    ours?: number
+    theirs?: number
+    same?: boolean
+    note?: string
+  }
+  counts?: {
+    insert?: number
+    same?: number
+    conflict?: number
+  }
+  conflicts: DbConflict[]
+  /** вопросы оператору: куда и как переносить спорные данные */
+  questions: string[]
+  unknown_kinds: string[]
+  checksums_ok?: boolean
+  error?: string
+}
+
+/** Отчёт об импорте (ответ моста `db.import`). */
+export interface DbImportReport {
+  ok: boolean
+  path: string
+  inserted: number
+  same: number
+  overwritten: number
+  kept: number
+  copied: number
+  unparsed: number
+  /** конфликты без решения оператора — их не тронули */
+  unresolved: string[]
+  questions: string[]
+  why: string
+  error?: string
+}
