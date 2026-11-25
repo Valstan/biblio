@@ -1,5 +1,138 @@
 /** Формы данных «МиниГена» — общий контракт окна и моста. */
 
+/**
+ * Режим копии (заказ владельца 25.11, промт #131):
+ * - `own` — свой репозиторий на GitHub, PR — в общий репозиторий программы;
+ * - `shared` — папка в общем репозитории программы (дефолт после согласия);
+ * - `local` — только локально, без сети: правки в локальном git-репозитории,
+ *   PR не открывается, обмен с другими копиями недоступен.
+ */
+export type CopyMode = 'own' | 'shared' | 'local'
+
+/** Режим копии — подпись и что режим значит (для окна). */
+export interface CopyModeOption {
+  id: CopyMode
+  label: string
+  hint: string
+}
+
+/** Обмен наработками: доступен ли и почему — если нет. */
+export interface CopyExchange {
+  available: boolean
+  transport: string
+  pool: string
+  pool_exists?: boolean
+  why: string
+}
+
+/** Локальный git-репозиторий правок (режим «только локально»). */
+export interface CopyLocalRepo {
+  path: string
+  exists: boolean
+  commit?: string
+  branch?: string
+  dirty?: boolean
+  remotes?: string
+}
+
+/** Ответ на вопрос первого запуска (хранится в родословной копии). */
+export interface CopyFirstRun {
+  asked: boolean
+  agreed: boolean
+  mode: string
+  answered_at: number
+  instance: string
+}
+
+/** Текст вопроса первого запуска: репозиторий, папка, что даёт, отказ. */
+export interface CopyOffer {
+  title: string
+  repository: string
+  folder: string
+  gives: string[]
+  if_refuse: string[]
+  who: string
+  modes: CopyModeOption[]
+}
+
+/** Снимок первого запуска и режима копии (ответ моста `copy.first_run`). */
+export interface CopyFirstRunSnapshot {
+  first_run: CopyFirstRun
+  offer: CopyOffer
+  /** '' — режим не определён (мост не ответил или состояние неизвестно) */
+  mode: CopyMode | ''
+  mode_label: string
+  exchange: CopyExchange
+}
+
+/** Состояние клона копии (ответ моста `clone.status`). */
+export interface CloneStatus {
+  instance_id?: string
+  family?: string
+  generation?: number
+  clone_dir: string
+  clone_exists: boolean
+  pool_dir: string
+  pool_exists: boolean
+  copy_repo: string
+  upstream: string
+  branch?: string
+  dirty?: boolean
+  remotes?: Record<string, string>
+  /** '' — режим не определён (мост не ответил или состояние неизвестно) */
+  mode: CopyMode | ''
+  mode_label: string
+  exchange: CopyExchange
+  /** локальный репозиторий — есть не всегда (мост отвечает не всегда) */
+  local_repo?: CopyLocalRepo
+  /** ответ на вопрос первого запуска — есть не всегда */
+  first_run?: CopyFirstRun
+}
+
+/** Ген пула наработок. */
+export interface GeneRecord {
+  id: string
+  title: string
+  summary: string
+  author: string
+  created_at: number
+  files: string[]
+  base_commit?: string
+  path?: string
+}
+
+/** Чужая наработка, которую стоит посмотреть (ответ моста `genes.suggest`). */
+export interface GeneSuggestion extends GeneRecord {
+  score: number
+  why: string
+  fits: boolean
+}
+
+/** Подсказки наработок. */
+export interface GeneSuggestions {
+  suggestions: GeneSuggestion[]
+  fits: number
+  my_files: string[]
+  transport: string
+  available: boolean
+  why: string
+}
+
+/** Ответ моста на действие с генами (публикация, внедрение, обмен). */
+export interface GeneActionResult {
+  ok?: boolean
+  gene?: string
+  pr?: string
+  branch?: string
+  local_only?: boolean
+  path?: string
+  files?: number
+  added?: string[]
+  skipped?: string[]
+  why?: string
+  error?: string
+}
+
 export interface AccountState {
   email?: string
   expires_at?: number | null
@@ -113,6 +246,8 @@ export interface Settings {
   councilEnabled: boolean
   /** сколько ролей совета реально отвечают на задачу (совет дорог) */
   councilMaxRoles: number
+  /** режим копии: '' (не выбран), 'own', 'shared', 'local' */
+  copyMode: CopyMode | ''
 }
 
 export interface ToolCall {

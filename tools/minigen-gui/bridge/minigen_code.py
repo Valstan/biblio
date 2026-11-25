@@ -46,18 +46,29 @@ def repo_root() -> Path:
 
     Порядок поиска:
 
-    1. `MINIGEN_CODE_REPO` — явное указание;
-    2. **клон копии** (`<Programs>\\МиниГен\\clone`) — если он есть, то это
+    1. **режим копии «только локально»** — правки идут в локальный
+       git-репозиторий на машине (заказ владельца 25.11, промт #131): сети
+       нет, PR не открывается, но история, откат и diff — работают;
+    2. `MINIGEN_CODE_REPO` — явное указание;
+    3. **клон копии** (`<Programs>\\МиниГен\\clone`) — если он есть, то это
        рабочее дерево копии: заказ владельца (24.11) — каждая копия правит
        программу в **своём** клоне, а не в чужом дереве;
-    3. настройка `codeRepo` (её пишет установщик): программа может стоять
+    4. настройка `codeRepo` (её пишет установщик): программа может стоять
        в своём месте (`%LOCALAPPDATA%\\Programs\\МиниГен`), а исходники —
        в репозитории; правки и PR делаются по исходникам;
-    4. вверх по дереву до каталога с `.git` — когда программа запущена из
+    5. вверх по дереву до каталога с `.git` — когда программа запущена из
        самого репозитория (разработка);
-    5. иначе — каталог программы (правки работать не смогут, и команда
+    6. иначе — каталог программы (правки работать не смогут, и команда
        это скажет).
     """
+    try:
+        import minigen_copy
+        if minigen_copy.is_local():
+            local = minigen_copy.local_repo()
+            if (local / ".git").is_dir():
+                return local.resolve()
+    except Exception:  # noqa: BLE001
+        pass
     env = os.environ.get("MINIGEN_CODE_REPO")
     if env:
         return Path(env).resolve()
@@ -88,16 +99,37 @@ def repo_root() -> Path:
 REPO = repo_root()
 
 
+def refresh_repo() -> Path:
+    """Пересчитать корень репозитория (после смены режима копии).
+
+    ⚠️ Живой случай 25.11: режим копии меняется на ходу («только локально» —
+    правки идут в локальный репозиторий), а `REPO` был посчитан один раз при
+    импорте модуля ⇒ программа продолжала править старый каталог, и режим
+    не значил ничего. Теперь после смены режима корень пересчитывается.
+    """
+    global REPO, WORKTREES
+    REPO = repo_root()
+    WORKTREES = _worktrees_dir()
+    return REPO
+
+
 def _worktrees_dir() -> Path:
     """Каталог worktree'ов.
 
     Если репозиторий — клон копии, worktree'и лежат **вне** клона: иначе
     клон виделся бы «грязным» (untracked-каталог) и правки в нём путались бы
-    с чужими.
+    с чужими. Для локального репозитория — то же самое.
     """
     try:
         import minigen_clone
         if REPO == minigen_clone.CLONE_DIR.resolve():
+            return (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                    / "minigen-gui" / "worktrees")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import minigen_copy
+        if REPO == minigen_copy.local_repo().resolve():
             return (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
                     / "minigen-gui" / "worktrees")
     except Exception:  # noqa: BLE001
@@ -655,9 +687,20 @@ def open_pr(title: str, body: str = "") -> dict[str, Any]:
     branch = current_branch(worktree)
     if not branch or branch == "master":
         return {"error": "PR только из ветки, не из master"}
-    push = git(["push", "-u", "origin", branch], worktree, timeout=300)
-    if not push["ok"]:
-        return {"error": "push не прошёл: %s" % (push["err"] or push["out"])}
+    # ⚠️ Режим «только локально» (заказ владельца 25.11): GitHub недоступен,
+    # PR не открыть. Говорим это прямо — молчаливый пустой ответ выглядел бы
+    # как «PR есть, но ничего не видно».
+    try:
+        import minigen_copy
+        if minigen_copy.is_local():
+            return {"error": "локальный режим: PR не открывается — GitHub "
+                             "недоступен. Правка осталась в ветке «%s»: "
+                             "история, откат и diff — в локальном репозитории"
+                             % branch,
+                    "local": True, "branch": branch,
+                    "why": "PR без GitHub не открывается"}
+    except Exception:  # noqa: BLE001
+        pass
     title = (title or "").strip()
     if not title:
         title = "fix(minigen): правка модуля программы"
@@ -667,6 +710,34 @@ def open_pr(title: str, body: str = "") -> dict[str, Any]:
                      "Проверки запускались в worktree правки; решение — за владельцем.")
     target = upstream_slug(worktree)
     head_repo = _repo_slug(_remote_url("origin", worktree))
+    # ⚠️ Режим копии решает, **куда уходит ветка** (заказ владельца 25.11):
+    # - `own` — ветка живёт в своём репозитории копии (и копия — в общем);
+    # - `shared` — ветка уходит прямо в репозиторий программы.
+    # Репозитории клона при этом не переставляются: живой клон не трогаем.
+    mode = "own"
+    try:
+        import minigen_copy
+        mode = minigen_copy.mode()
+    except Exception:  # noqa: BLE001
+        mode = "own"
+    head = branch
+    push_to_upstream = False
+    if mode == "shared":
+        push_remote = ""
+        for name in ("upstream", "origin"):
+            if target and _repo_slug(_remote_url(name, worktree)) == target:
+                push_remote = name
+                break
+        if not push_remote:
+            return {"error": "в режиме «папка в общем репозитории» не найден "
+                             "remote на репозиторий программы (%s)" % (target or "—")}
+        push = git(["push", "-u", push_remote, branch], worktree, timeout=300)
+        if not push["ok"]:
+            return {"error": "push не прошёл: %s" % (push["err"] or push["out"])}
+    else:
+        push = git(["push", "-u", "origin", branch], worktree, timeout=300)
+        if not push["ok"]:
+            return {"error": "push не прошёл: %s" % (push["err"] or push["out"])}
     args = ["gh", "pr", "create", "--base", "master"]
     if target:
         args += ["--repo", target]
@@ -675,7 +746,8 @@ def open_pr(title: str, body: str = "") -> dict[str, Any]:
         instance = str(lineage.instance().get("instance_id") or "")
     except Exception:  # noqa: BLE001
         instance = ""
-    head, push_to_upstream = pr_head(branch, head_repo, target, instance)
+    if mode != "shared":
+        head, push_to_upstream = pr_head(branch, head_repo, target, instance)
     if push_to_upstream:
         # репозиторий копии — не форк ⇒ GitHub ветку в нём не увидит:
         # отправляем её ещё и в репозиторий программы (под своим именем).
