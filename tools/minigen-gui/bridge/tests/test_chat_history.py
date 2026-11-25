@@ -45,13 +45,15 @@ class _FakeAgent:
     def __init__(self, status: str = "done") -> None:
         self.status = status
         self.note = ""
+        self.council_note = ""
         self.blocks: list[dict] = []
         self.pending = None
         self.history: list[dict] = []
 
     def ask(self, history, user_text, area_slug="minigen", model="", note="",
-            blocks=None):
+            blocks=None, council_note=""):
         self.note = note
+        self.council_note = council_note
         self.blocks = list(blocks or [])
         content = user_text
         if self.blocks:

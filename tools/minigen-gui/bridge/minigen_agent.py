@@ -278,7 +278,8 @@ class Agent:
     # ── основной ход ──
     def ask(self, history: list[dict[str, Any]], user_text: str,
             area_slug: str = "minigen", model: str = "",
-            note: str = "", blocks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+            note: str = "", blocks: list[dict[str, Any]] | None = None,
+            council_note: str = "") -> dict[str, Any]:
         """Обработать реплику владельца. Возвращает ответ и ход работы.
 
         Новое задание сначала обсуждает **совет специалистов** (промт #132):
@@ -296,6 +297,11 @@ class Agent:
         ⚠️ `blocks` — файлы, приложенные оператором (промт #90): они уходят в
         сообщение **блоками** (текст документа или картинка), а не строкой.
         Протокол вендора блоки уже умеет — менять ничего не пришлось.
+
+        ⚠️ `council_note` — то же содержимое **словом** для совета: роли совета
+        видят свой контекст отдельно от основного хода, и без этого файла они
+        бросались искать его по диску и не укладывались в шаги (живая проба
+        25.11: «специалист не уложился в 5 шагов»).
         """
         cfg = self._model_config(area_slug, model)
         messages = list(history)
@@ -314,7 +320,13 @@ class Agent:
         council_text = ""
         decision: dict[str, Any] = {}
         if council_on and not council.is_continuation(user_text):
-            outcome = self._council(messages, cfg, budget, settings, user_text)
+            # ⚠️ Совет обсуждает **то же задание**, что и работа: с содержимым
+            # приложенных файлов (живая проба 25.11 — без этого роли искали
+            # файл по диску и не укладывались в шаги).
+            council_task = user_text
+            if council_note.strip():
+                council_task = "%s\n\n%s" % (user_text, council_note.strip())
+            outcome = self._council(messages, cfg, budget, settings, council_task)
             if outcome.get("status") in ("unavailable", "error"):
                 return outcome
             council_text = str(outcome.get("council_text") or "")

@@ -65,6 +65,9 @@ import minigen_repos as repos_mod      # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
+#: Сколько символов содержимого приложенного файла показывается **совету**
+#: специалистов: хватает, чтобы обсудить задачу, и не раздувает каждый вызов.
+COUNCIL_FILE_CHARS = 20_000
 #: Как часто программа проверяет хранилище промтов (секунды).
 #: Раздача без живого оператора — неспешная: минут хватает, а лишних
 #: запросов к внешнему ресурсу не делается.
@@ -1042,7 +1045,7 @@ class Bridge:
         # Файлы оператора читает мост (окно на диск не ходит). Содержимое уходит
         # в контекст хода **блоками** — документ текстом, картинка картинкой
         # (промт #90).
-        blocks, notes = self._read_attachments(attachments)
+        blocks, notes, council_note = self._read_attachments(attachments)
         # Реплика владельца — в историю сразу: даже если модель недоступна,
         # вопрос остаётся в переписке (промт #129).
         chat_store.append({"role": "user", "text": text, "attachments": notes})
@@ -1056,7 +1059,8 @@ class Bridge:
         task = text or self._attachment_task(notes)
         try:
             result = self.agent.ask(list(self.chat_history), task, area_slug,
-                                    model, note=feed, blocks=blocks)
+                                    model, note=feed, blocks=blocks,
+                                    council_note=council_note)
         except ModelUnavailable as exc:
             chat_store.append({"role": "system", "text": str(exc)})
             return {"status": "unavailable", "error": str(exc),
@@ -1076,15 +1080,20 @@ class Bridge:
 
     @staticmethod
     def _read_attachments(attachments: list[dict[str, Any]]
-                          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+                          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
         """Файлы оператора → блоки контекста модели + список для видимой реплики.
 
-        Возвращает `(blocks, notes)`:
-        - `blocks` — что уходит вендору (текст документа / картинка);
-        - `notes` — что видит владелец в переписке (имя, вид, размер).
+        Возвращает `(blocks, notes, council_note)`:
+        - `blocks` — что уходит вендору в основном ходе (текст документа /
+          картинка);
+        - `notes` — что видит владелец в переписке (имя, вид, размер);
+        - `council_note` — то же содержимое **словом** для совета специалистов:
+          роли совета живут в своём контексте и без этого бросались искать
+          файл по диску (живая проба 25.11).
         """
         blocks: list[dict[str, Any]] = []
         notes: list[dict[str, Any]] = []
+        council_lines: list[str] = []
         for item in attachments:
             path = str(item.get("path") or "").strip()
             if not path:
@@ -1099,10 +1108,10 @@ class Bridge:
             notes.append({"name": name, "kind": kind, "size": size,
                           "ok": bool(read.get("ok")), "path": path})
             if not read.get("ok"):
-                blocks.append({"type": "text",
-                               "text": "Файл «%s» не прочитан: %s"
-                                       % (name, read.get("error")
-                                          or "неизвестная причина")})
+                message = ("Файл «%s» не прочитан: %s"
+                           % (name, read.get("error") or "неизвестная причина"))
+                blocks.append({"type": "text", "text": message})
+                council_lines.append(message)
                 continue
             if kind == "image":
                 blocks.append({
@@ -1112,16 +1121,28 @@ class Bridge:
                                                 or "image/png"),
                                "data": str(read.get("image") or "")},
                 })
+                council_lines.append(
+                    "Картинка «%s» (%s, %s) приложена к сообщению: её "
+                    "содержимое модель видит как изображение в основном ходе."
+                    % (name, kind, files_mod.human_size(size)))
                 continue
             warnings = [str(item) for item in (read.get("warnings") or [])]
             header = "Файл «%s» (%s, %s):" % (name, kind,
                                              files_mod.human_size(size))
             tail = ("\n[предупреждения при чтении: %s]" % "; ".join(warnings)
                     if warnings else "")
-            blocks.append({"type": "text",
-                           "text": "%s\n%s%s" % (header, read.get("text") or "",
-                                                 tail)})
-        return blocks, notes
+            body = str(read.get("text") or "")
+            blocks.append({"type": "text", "text": "%s\n%s%s" % (header, body,
+                                                                tail)})
+            # Совету — начало содержимого: хватает, чтобы обсудить задачу, и
+            # не раздувает каждый вызов совета.
+            shown = body[:COUNCIL_FILE_CHARS]
+            council_lines.append(
+                "%s\n%s%s%s" % (header, shown,
+                                "\n… (файл показан частично)" if len(body) > len(shown) else "",
+                                tail))
+        council_note = "\n\n".join(council_lines)
+        return blocks, notes, council_note
 
     def cmd_files_read(self, args: dict[str, Any]) -> dict[str, Any]:
         """Прочитать файл, приложенный оператором (инструмент нейросети).
