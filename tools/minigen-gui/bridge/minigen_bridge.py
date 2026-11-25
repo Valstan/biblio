@@ -54,10 +54,15 @@ import minigen_provider as provider_mod  # noqa: E402
 import minigen_agents as agents_mod    # noqa: E402
 import minigen_ingest as ingest        # noqa: E402
 import minigen_karman as karman_mod    # noqa: E402
+import minigen_prompts as prompts_mod  # noqa: E402
 import minigen_repos as repos_mod      # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
+#: Как часто программа проверяет хранилище промтов (секунды).
+#: Раздача без живого оператора — неспешная: минут хватает, а лишних
+#: запросов к внешнему ресурсу не делается.
+PROMPT_DISPATCH_EVERY = 60
 
 
 def _title_from(text: str) -> str:
@@ -179,8 +184,51 @@ class Bridge:
         self._points_lock = threading.Lock()
         self._daemon_stop = threading.Event()
         self._daemon_thread: threading.Thread | None = None
+        self._prompt_stop = threading.Event()
+        self._prompt_thread: threading.Thread | None = None
         self.handlers = self._build_handlers()
         self.start_daemon_supervision()
+        self.start_prompt_dispatch()
+
+    def start_prompt_dispatch(self) -> None:
+        """Раздавать промты рабочим областям без живого оператора.
+
+        Заказ владельца (24.11, промт #94): «чтобы отсылать рабочим областям
+        проектов эти промты прямо из хранилища автоматически, если есть такое
+        задание на самостоятельное автоматическое программирование без участия
+        живого оператора».
+
+        ⚠️ Раздаётся **только** то, что владелец сам пометил как
+        «автоматическое», и только в область своего проекта. Пока выключено
+        (по умолчанию) — поток спит и ничего не трогает.
+        """
+        if self._prompt_thread is not None:
+            return
+        self._prompt_thread = threading.Thread(
+            target=self._prompt_dispatch_loop, args=(self._prompt_stop,),
+            daemon=True)
+        self._prompt_thread.start()
+
+    def _prompt_dispatch_loop(self, stop: threading.Event) -> None:
+        """Цикл автораздачи: раз в PROMPT_DISPATCH_EVERY секунд."""
+        while not stop.wait(PROMPT_DISPATCH_EVERY):
+            try:
+                settings = state.read_settings()
+                if not settings.get("promptAutoDispatch"):
+                    continue
+                store = prompts_mod.store_for(settings)
+                results = prompts_mod.auto_dispatch_scan(self.mods, store, settings)
+                for item in results:
+                    if item.get("ok"):
+                        self.core.log("ПРОМТЫ: промт %s отдан в область %s "
+                                      "автоматически" % (item.get("id"),
+                                                         item.get("area")))
+            except Exception as exc:  # noqa: BLE001
+                # Автораздача не должна ронять программу: сбой — в журнал.
+                try:
+                    self.core.log("ПРОМТЫ: автораздача не прошла: %s" % exc)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def start_daemon_supervision(self) -> None:
         """Следить за демонами: поднимать упавшего.
@@ -285,6 +333,13 @@ class Bridge:
             # канал промтов КАРМАНА: живой ли он и куда уходят заявки
             # (вкладка «Агенты» в окне, заявка от 24.11)
             "karman.status": self.cmd_karman_status,
+            # «Хранилище промтов»: где лежат промты и планы (заказ владельца
+            # 24.11, промт #94) — база «МиниГена» или внешний ресурс
+            "prompts.list": self.cmd_prompts_list,
+            "prompts.save": self.cmd_prompts_save,
+            "prompts.archive": self.cmd_prompts_archive,
+            "prompts.mark": self.cmd_prompts_mark,
+            "prompts.dispatch": self.cmd_prompts_dispatch,
             # заявки: зачитка владельца → заявка для другой нейросети (24.11)
             "ingest.draft": self.cmd_ingest_draft,
             "ingest.save": self.cmd_ingest_save,
@@ -301,8 +356,9 @@ class Bridge:
     # отчётов было бы тысячи одинаковых записей.
     # ⚠️ `agents.list` и `karman.status`: их тоже спрашивает окно (вкладка
     # «Агенты» обновляется сама) — это чтение, а не действие.
+    # ⚠️ `prompts.list` — то же самое (вкладка «Промты» обновляется сама).
     NO_REPORT_CMDS = ("chat.", "reports.", "update.status",
-                     "agents.list", "karman.status")
+                     "agents.list", "karman.status", "prompts.list")
 
     def dispatch(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         handler = self.handlers.get(cmd)
@@ -1043,6 +1099,146 @@ class Bridge:
         status.pop("secret", None)
         status.pop("value", None)
         return status
+
+    # ────────────────────────────────────────────── «Хранилище промтов»
+    def _prompt_store(self) -> Any:
+        """Провайдер хранилища по настройке окна (база или внешний ресурс)."""
+        return prompts_mod.store_for(state.read_settings())
+
+    def _prompt_targets(self) -> list[dict[str, Any]]:
+        """Области, куда можно отдать промт (раздел промта = проект области)."""
+        out: list[dict[str, Any]] = []
+        try:
+            areas = self.core.areas()
+        except Exception:  # noqa: BLE001
+            return out
+        for area in areas:
+            busy = False
+            try:
+                for verdict in state.session_verdicts(self.mods, area) or []:
+                    if str(verdict.get("verdict") or "") in ("работает", "ход завис"):
+                        busy = True
+                        break
+            except Exception:  # noqa: BLE001
+                busy = False
+            out.append({
+                "slug": area.get("slug") or "",
+                "title": area.get("title") or area.get("slug") or "",
+                "section": area.get("karman") or area.get("slug") or "",
+                "busy": busy,
+            })
+        return out
+
+    def _prompt_records(self, store: Any, project: str = "") -> list[dict[str, Any]]:
+        """Промты выбранного хранилища с пометками владельца."""
+        try:
+            records = store.list_prompts(project)
+        except prompts_mod.KarmanUnavailable as exc:
+            raise ValueError("внешний ресурс не отдал промты: %s" % exc)
+        for record in records:
+            record["auto"] = prompts_mod.get_mark(
+                record.get("source", ""), record.get("project", ""),
+                record.get("id", ""))
+        return records
+
+    def cmd_prompts_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Снимок хранилища: место, разделы, промты и области-получатели.
+
+        Ничего не меняет: это чтение, а не действие.
+        """
+        settings = state.read_settings()
+        store = self._prompt_store()
+        project = str(args.get("project") or "").strip()
+        info: dict[str, Any] = {
+            "kind": store.kind,
+            "label": store.label,
+            "location": store.location(),
+            "ok": True,
+            "reason": "",
+            "sections": [],
+        }
+        prompts: list[dict[str, Any]] = []
+        try:
+            status = store.status()
+            info["ok"] = bool(status.get("ok"))
+            info["reason"] = str(status.get("reason") or "")
+            info["sections"] = list(status.get("sections") or [])
+            prompts = self._prompt_records(store, project)
+        except prompts_mod.KarmanUnavailable as exc:
+            info["ok"] = False
+            info["reason"] = "внешний ресурс недоступен: %s" % exc
+        except Exception as exc:  # noqa: BLE001
+            info["ok"] = False
+            info["reason"] = "хранилище не отдало промты: %s" % exc
+        return {
+            "store": info,
+            "prompts": prompts,
+            "targets": self._prompt_targets(),
+            "auto_dispatch": bool(settings.get("promptAutoDispatch")),
+        }
+
+    def cmd_prompts_save(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Положить промт в хранилище (локальная база или внешний ресурс)."""
+        store = self._prompt_store()
+        res = store.save(str(args.get("project") or ""),
+                         str(args.get("title") or ""),
+                         str(args.get("body") or ""))
+        if res.get("ok"):
+            self.core.log("ПРОМТЫ: промт сохранён (%s)" % res.get("project"))
+        return res
+
+    def cmd_prompts_archive(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Архивировать выполненный промт (архив = сделано)."""
+        store = self._prompt_store()
+        res = store.archive(str(args.get("id") or ""),
+                            str(args.get("project") or ""))
+        if res.get("ok"):
+            self.core.log("ПРОМТЫ: промт архивирован (%s)" % (args.get("id") or ""))
+        return res
+
+    def cmd_prompts_mark(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Пометить промт как «раздавать автоматически» (или снять пометку).
+
+        Помечает только владелец: без пометки автораздача не трогает промт.
+        """
+        prompt_id = str(args.get("id") or "")
+        project = str(args.get("project") or "")
+        auto = bool(args.get("auto"))
+        if not prompt_id:
+            return {"ok": False, "error": "не указан промт"}
+        res = prompts_mod.set_mark(self._prompt_store().kind, project,
+                                   prompt_id, auto)
+        if res.get("ok"):
+            self.core.log("ПРОМТЫ: промт %s помечен как %s"
+                          % (prompt_id, "автоматический" if auto else "обычный"))
+        return res
+
+    def cmd_prompts_dispatch(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Отдать промт в рабочую область проекта.
+
+        Опасное действие: тратит очки аккаунта области и открывает работу.
+        Проверка раздела — обязательная: раздел промта должен совпадать с
+        проектом области, иначе задание уедет не туда.
+        """
+        store = self._prompt_store()
+        prompt_id = str(args.get("id") or "")
+        area_slug = str(args.get("area") or "")
+        if not prompt_id or not area_slug:
+            return {"ok": False, "error": "нужен промт и область"}
+        area = self._area(area_slug)
+        records = self._prompt_records(store)
+        record = next((item for item in records if item.get("id") == prompt_id), None)
+        if record is None:
+            return {"ok": False, "error": "такого промта в хранилище нет"}
+        plan = prompts_mod.find_plan(records, record)
+        res = prompts_mod.dispatch_to_area(self.mods, area, record, plan)
+        if res.get("ok"):
+            prompts_mod.mark_dispatched(record.get("source", ""),
+                                        record.get("project", ""), prompt_id,
+                                        area_slug)
+            self.core.log("ПРОМТЫ: промт %s отдан в область %s"
+                          % (prompt_id, area_slug))
+        return res
 
     # ──────────────────────────────────────────────────────────── заявки
     def _known_projects(self) -> list[dict[str, Any]]:

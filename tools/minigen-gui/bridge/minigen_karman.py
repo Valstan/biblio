@@ -181,7 +181,8 @@ def _opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
-def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+def call(method: str, path: str, body: dict | None = None,
+         token: str = "") -> tuple[int, dict]:
     """Один вызов сервиса. Возвращает (код, payload).
 
     Код ``0`` — вызова не было вовсе (нет адреса/секрета или сеть недоступна);
@@ -189,17 +190,18 @@ def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
     """
     secret, secret_src = read_secret()
     base, base_src = read_base()
+    used, used_src = (token, "section") if token else (secret, secret_src)
     if not base:
         return 0, {"error": "адрес сервиса не задан (файл vault-url или KARMAN_URL)",
-                   "secret_source": secret_src, "url_source": base_src}
-    if not secret:
+                   "secret_source": used_src, "url_source": base_src}
+    if not used:
         return 0, {"error": "секрет канала не задан (файл %s или %s)"
                           % (SECRET_FILE, SECRET_ENV),
                    "secret_source": "", "url_source": base_src}
     url = base.rstrip("/") + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", "Bearer " + secret)
+    req.add_header("Authorization", "Bearer " + used)
     req.add_header("Accept", "application/json")
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -216,7 +218,7 @@ def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
     except (urllib.error.URLError, OSError) as exc:
         reason = getattr(exc, "reason", exc)
         return 0, {"error": "сеть недоступна: %s" % (reason,),
-                   "secret_source": secret_src, "url_source": base_src}
+                   "secret_source": used_src, "url_source": base_src}
     payload: dict = {}
     if raw:
         try:
@@ -224,7 +226,7 @@ def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
             payload = loaded if isinstance(loaded, dict) else {"items": loaded}
         except ValueError:
             payload = {"raw": raw[:400]}
-    payload.setdefault("secret_source", secret_src)
+    payload.setdefault("secret_source", used_src)
     payload.setdefault("url_source", base_src)
     return code, payload
 

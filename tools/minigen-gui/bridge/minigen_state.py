@@ -79,6 +79,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "agentsRegistry": "Valstan/minigen-agents",
     # где живут рабочие репозитории агентов
     "agentsWorkspace": r"D:\valstan\REPO",
+    # где лежат промты: в базе «МиниГена» или на внешнем ресурсе (Карман)
+    "promptStore": "local",
+    # раздавать ли промты рабочим областям без живого оператора
+    "promptAutoDispatch": False,
 }
 
 

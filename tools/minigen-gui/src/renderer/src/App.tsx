@@ -11,6 +11,7 @@ import ChatTab from './tabs/ChatTab'
 import JournalTab from './tabs/JournalTab'
 import GenesTab from './tabs/GenesTab'
 import AgentsTab from './tabs/AgentsTab'
+import PromptsTab from './tabs/PromptsTab'
 import SettingsTab from './tabs/SettingsTab'
 import UpdateTab from './tabs/UpdateTab'
 
@@ -160,6 +161,7 @@ export default function App() {
         {tab === 'journal' && <JournalTab snapshot={snapshot} />}
         {tab === 'genes' && <GenesTab />}
         {tab === 'agents' && <AgentsTab />}
+        {tab === 'prompts' && <PromptsTab />}
         {tab === 'update' && <UpdateTab />}
         {tab === 'settings' && (
           <SettingsTab settings={settings} snapshot={snapshot} onSaved={setSettings} />
