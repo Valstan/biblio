@@ -17,8 +17,10 @@ function read(...parts: string[]): string {
 
 describe('имя главного чата', () => {
   it('вкладка называется «Управляющий»', () => {
-    const app = read(src, 'renderer', 'src', 'App.tsx')
-    expect(app).toContain("{ id: 'chat', label: 'Управляющий' }")
+    // Список вкладок живёт в `tabs/tabs.ts` (его проверяет и тест вкладки
+    // «Агенты» — заодно видно, что список не расползся по файлам).
+    const tabs = read(src, 'renderer', 'src', 'tabs', 'tabs.ts')
+    expect(tabs).toContain("{ id: 'chat', label: 'Управляющий' }")
   })
 
   it('заголовок в чате — «Управляющий»', () => {

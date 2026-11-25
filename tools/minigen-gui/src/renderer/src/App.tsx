@@ -3,30 +3,19 @@ import type { ProgramVersion, Settings, Snapshot } from '@shared/types'
 import { api, desktop } from './api'
 import { buildStatsCsv } from './format'
 import { headerStatus } from './tabs/header-status'
+import { TABS, type TabId } from './tabs/tabs'
 import AreasTab from './tabs/AreasTab'
 import StatsTab from './tabs/StatsTab'
 import NetworkTab from './tabs/NetworkTab'
 import ChatTab from './tabs/ChatTab'
 import JournalTab from './tabs/JournalTab'
 import GenesTab from './tabs/GenesTab'
+import AgentsTab from './tabs/AgentsTab'
 import SettingsTab from './tabs/SettingsTab'
 import UpdateTab from './tabs/UpdateTab'
 
-type Tab = 'areas' | 'stats' | 'network' | 'chat' | 'journal' | 'genes' | 'update' | 'settings'
-
-const TABS: { id: Tab; label: string }[] = [
-  { id: 'areas', label: 'Области' },
-  { id: 'stats', label: 'Статистика' },
-  { id: 'network', label: 'Сеть' },
-  { id: 'chat', label: 'Управляющий' },
-  { id: 'journal', label: 'Журнал' },
-  { id: 'genes', label: 'Гены' },
-  { id: 'update', label: 'Обновление' },
-  { id: 'settings', label: 'Настройки' }
-]
-
 export default function App() {
-  const [tab, setTab] = useState<Tab>('areas')
+  const [tab, setTab] = useState<TabId>('areas')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
   const [version, setVersion] = useState<ProgramVersion | null>(null)
@@ -170,6 +159,7 @@ export default function App() {
         {tab === 'chat' && <ChatTab />}
         {tab === 'journal' && <JournalTab snapshot={snapshot} />}
         {tab === 'genes' && <GenesTab />}
+        {tab === 'agents' && <AgentsTab />}
         {tab === 'update' && <UpdateTab />}
         {tab === 'settings' && (
           <SettingsTab settings={settings} snapshot={snapshot} onSaved={setSettings} />

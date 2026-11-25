@@ -332,3 +332,72 @@ export interface GeneMap {
   pool_ready: boolean
   note: string
 }
+
+/**
+ * Манифест агента (реестр `agents/<slug>/agent.yaml`).
+ *
+ * Поля могут отсутствовать: манифест — это yaml, и старый агент мог быть
+ * заведён без роли или области. Тогда окно показывает «—», а не врёт.
+ */
+export interface AgentManifest {
+  slug: string
+  title?: string
+  role?: string
+  repo?: string
+  area?: string
+  template?: string
+  model?: string
+  constitution?: string
+  skills?: string[]
+}
+
+/** Заявка агента, уже сохранённая в его репозитории. */
+export interface AgentRequest {
+  path: string
+  project: string
+  size: number
+}
+
+/** Агент реестра + его заявки (ответ моста `agents.list`). */
+export interface AgentRecord extends AgentManifest {
+  requests?: AgentRequest[]
+}
+
+/** Локальная копия реестра: совпадает ли с GitHub (источник правды). */
+export interface RegistryState {
+  registry: string
+  path: string
+  cloned: boolean
+  dirty: boolean
+  files: string[]
+  why: string
+}
+
+/** Снимок реестра агентов (ответ моста `agents.list`). */
+export interface AgentsSnapshot {
+  registry: string
+  registry_path: string
+  registry_cloned: boolean
+  registry_state?: RegistryState
+  workspace: string
+  agents: AgentRecord[]
+  templates: string[]
+  digest?: string
+}
+
+/**
+ * Состояние канала промтов КАРМАНА (ответ моста `karman.status`).
+ *
+ * Значения секрета здесь нет — только источник (`file` / `env` / `vault`).
+ */
+export interface KarmanChannel {
+  has_url: boolean
+  has_secret: boolean
+  secret_source: string
+  url_source: string
+  room_token_source?: string
+  http: number
+  ok: boolean
+  sections: string[]
+  reason: string
+}

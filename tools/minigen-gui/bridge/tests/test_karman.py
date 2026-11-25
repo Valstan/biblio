@@ -189,6 +189,15 @@ class KarmanVaultTest(unittest.TestCase):
         missing = bridge._published_prompt_id(SECTION, TITLE, "# другая\n")
         self.assertEqual(missing, "")
 
+    def test_bridge_command_reports_channel_state(self) -> None:
+        """`karman.status` — состояние канала для окна (без секрета)."""
+        result = bridge.Bridge.cmd_karman_status(
+            bridge.Bridge.__new__(bridge.Bridge), {})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["secret_source"], "vault")
+        self.assertIn(SECTION, result["sections"])
+        self.assertNotIn(SECRET, json.dumps(result, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     unittest.main()

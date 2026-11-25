@@ -1,9 +1,11 @@
 import type {
   Area,
+  AgentsSnapshot,
   ChatReply,
   DaemonStatus,
   GeneMap,
   JournalLine,
+  KarmanChannel,
   LineageInfo,
   ModelCatalog,
   NetworkState,
@@ -78,7 +80,34 @@ export const api = {
   updateStatus: () => call<UpdateState>('update.status'),
   updateCheck: () => call<UpdateAvailable>('update.check'),
   updateStart: () => call<{ ok: boolean; why?: string; error?: string }>('update.start'),
-  openFolder: (path: string) => call<{ ok: boolean; error?: string }>('app.open_folder', { path })
+  openFolder: (path: string) => call<{ ok: boolean; error?: string }>('app.open_folder', { path }),
+  // ── агенты «МиниГена» (вкладка «Агенты», 25.11) ─────────────────────────
+  agentsList: () => call<AgentsSnapshot>('agents.list'),
+  agentsApply: async (slug: string) => {
+    const result = await call<{ ok: boolean; error?: string; area?: string; skills_installed?: string[] }>(
+      'agents.apply',
+      { slug }
+    )
+    if (result?.error) throw new Error(result.error)
+    return result
+  },
+  agentsCreate: async (draft: { slug: string; title: string; role: string }) => {
+    const result = await call<{ ok: boolean; error?: string; repo?: string; area?: string }>(
+      'agents.create',
+      { slug: draft.slug, title: draft.title, role: draft.role }
+    )
+    if (result?.error) throw new Error(result.error)
+    return result
+  },
+  agentsRegistryRestore: async () => {
+    const result = await call<{ ok: boolean; error?: string; before?: string[]; after?: string[] }>(
+      'agents.registry_restore',
+      {}
+    )
+    if (result?.error) throw new Error(result.error)
+    return result
+  },
+  karmanStatus: () => call<KarmanChannel>('karman.status')
 }
 
 /** Действия окна (не моста): перезапуск, метка сборки, состояние моста. */
