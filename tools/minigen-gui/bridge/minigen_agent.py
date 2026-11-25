@@ -37,6 +37,7 @@ HERE = Path(__file__).resolve().parent
 KNOWLEDGE_PACK = HERE.parent / "docs" / "knowledge-pack.md"
 
 import minigen_provider as provider  # noqa: E402
+import minigen_council as council    # noqa: E402
 
 MAX_ROUNDS = 24
 DEFAULT_TIMEOUT = 120
@@ -44,6 +45,9 @@ DEFAULT_TIMEOUT = 120
 # читаются целиком — иначе модель видит только начало модуля и не может
 # найти нестыковку (окно модели — 1 млн токенов, места хватает).
 TOOL_RESULT_LIMIT = 24_000
+#: Раундов резервируем основному ходу агента: совет не должен съесть весь
+#: бюджет задачи (иначе работа останется без хода).
+COUNCIL_RESERVE = 4
 
 
 class ModelUnavailable(RuntimeError):
@@ -220,14 +224,16 @@ class Agent:
         self.pending: dict[str, Any] | None = None
 
     # ── низкий уровень ──
-    def _tool_payload(self) -> list[dict[str, Any]]:
+    def _tool_payload(self, tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        """Описание инструментов для модели (свой набор — у голоса совета)."""
+        source = tools if tools is not None else self.tools
         return [
             {
                 "name": tool["name"],
                 "description": tool["description"],
                 "input_schema": tool["parameters"],
             }
-            for tool in self.tools
+            for tool in source
         ]
 
     def _model_config(self, area_slug: str, model: str = "") -> dict[str, Any]:
@@ -270,18 +276,157 @@ class Agent:
     # ── основной ход ──
     def ask(self, history: list[dict[str, Any]], user_text: str,
             area_slug: str = "minigen", model: str = "") -> dict[str, Any]:
-        """Обработать реплику владельца. Возвращает ответ и ход работы."""
+        """Обработать реплику владельца. Возвращает ответ и ход работы.
+
+        Новое задание сначала обсуждает **совет специалистов** (промт #132):
+        секретарь отбирает роли → специалисты дают оценки → судья выносит
+        решение и назначает исполнителей → основной ход работает по решению.
+        Продолжения нитки («Продолжай») совет не зовёт — он по этой задаче уже
+        отработал.
+        """
         cfg = self._model_config(area_slug, model)
         messages = list(history)
         messages.append({"role": "user", "content": user_text})
-        return self._loop(messages, cfg, [])
+        budget = {"left": MAX_ROUNDS}
+        settings = self.settings_provider() if self.settings_provider else {}
+        # Совет включается **настройкой программы**: агент без провайдера
+        # настроек (тесты, вызовы из стороннего кода) работает без совета —
+        # иначе любая проверка агента платила бы за лишние вызовы модели.
+        council_on = (self.settings_provider is not None
+                      and council.enabled(settings))
+        council_text = ""
+        decision: dict[str, Any] = {}
+        if council_on and not council.is_continuation(user_text):
+            outcome = self._council(messages, cfg, budget, settings, user_text)
+            if outcome.get("status") in ("unavailable", "error"):
+                return outcome
+            council_text = str(outcome.get("council_text") or "")
+            decision = outcome.get("decision") or {}
+            messages = outcome.get("history") or messages
+        result = self._loop(messages, cfg, [], budget=budget)
+        if council_text:
+            result["text"] = "%s\n\n%s" % (council_text, result.get("text") or "")
+        if decision:
+            result["council"] = decision
+        return result
+
+    def _role_turn(self, system: str, messages: list[dict[str, Any]],
+                   tool_names: list[str], cfg: dict[str, Any], rounds: int,
+                   budget: dict[str, int]) -> dict[str, Any]:
+        """Один голос в совете: свой системный промпт, свои инструменты, свой предел."""
+        tools = [tool for tool in self.tools if tool["name"] in (tool_names or [])]
+        return self._loop(messages, cfg, [], system=system, tools=tools,
+                          budget=budget, rounds=rounds)
+
+    def _council(self, messages: list[dict[str, Any]], cfg: dict[str, Any],
+                 budget: dict[str, int], settings: dict[str, Any],
+                 task: str) -> dict[str, Any]:
+        """Совет специалистов: отбор ролей → обсуждение → решение → исполнители.
+
+        Если совет не сложился (модель недоступна, реестр не прочитан, решения
+        нет) — работа продолжается **без** совета, и в чате это сказано прямо.
+        """
+        cohort = council.roles()
+        if not cohort:
+            return {"status": "done", "history": messages, "council_text": ""}
+        limit = council.max_roles(settings)
+        initial = max(2, budget.get("left", MAX_ROUNDS) - COUNCIL_RESERVE)
+        used = {"left": initial}
+
+        # 1) секретарь отбирает, кто нужен на задачу
+        triage = self._role_turn(
+            council.triage_prompt(task, cohort, limit),
+            [{"role": "user", "content": task}], [], cfg, 1, used)
+        if triage.get("status") != "done":
+            return {"status": "done", "history": messages, "council_text": ""}
+        wanted = council.parse_json(triage.get("text") or "").get("roles") or []
+        selected: list[dict[str, Any]] = []
+        for slug in wanted:
+            item = council.role(str(slug))
+            if item is None or str(item.get("kind")) == "executor":
+                continue        # исполнителей назначает судья, а не секретарь
+            if all(str(item.get("slug")) != str(slug) for item in selected):
+                selected.append(item)
+            if len(selected) >= limit:
+                break
+
+        # 2) обсуждение: каждый специалист — по своей роли и своими инструментами
+        opinions: list[dict[str, Any]] = []
+        for item in selected:
+            turn = self._role_turn(
+                council.role_prompt(item, task),
+                [{"role": "user", "content": task}],
+                item.get("tools") or [], cfg, council.ROLE_ROUNDS, used)
+            if turn.get("status") == "unavailable":
+                break
+            opinions.append({"slug": item.get("slug"),
+                             "title": item.get("title") or item.get("slug"),
+                             "text": (turn.get("text") or "").strip()
+                             [:council.ROLE_TEXT_LIMIT]})
+
+        # 3) решение судьи
+        judge = self._role_turn(
+            council.judge_prompt(cohort),
+            [{"role": "user", "content": council.judge_input(task, opinions)}],
+            [], cfg, council.JUDGE_ROUNDS, used)
+        decision = council.normalize_decision(
+            council.parse_json(judge.get("text") or ""),
+            [str(item.get("slug")) for item in council.executors()])
+        if not decision.get("to_do") and not decision.get("executors"):
+            return {"status": "done", "history": messages,
+                    "council_text": "Совет специалистов: решение не сложилось — "
+                                    "работаю без него."}
+
+        # 4) исполнители: у каждого своя часть и свои инструменты
+        outputs: list[dict[str, Any]] = []
+        for slug in decision.get("executors") or []:
+            item = council.role(slug)
+            if item is None:
+                continue
+            turn = self._role_turn(
+                council.executor_prompt(item, decision),
+                [{"role": "user",
+                  "content": council.executor_input(task, decision, outputs)}],
+                item.get("tools") or [], cfg, council.EXECUTOR_ROUNDS, used)
+            outputs.append({"slug": slug, "title": item.get("title") or slug,
+                            "text": (turn.get("text") or "").strip()
+                            [:council.ROLE_TEXT_LIMIT]})
+
+        consumed = initial - used.get("left", initial)
+        budget["left"] = max(2, budget.get("left", MAX_ROUNDS) - consumed)
+        context = council.context_block(decision, opinions, outputs)
+        return {"status": "done",
+                "history": list(messages) + [{"role": "user", "content": context}],
+                "council_text": council.format_discussion(opinions, decision),
+                "decision": decision}
 
     def _loop(self, messages: list[dict[str, Any]], cfg: dict[str, Any],
-              calls: list[dict[str, Any]]) -> dict[str, Any]:
-        system = system_prompt()
-        for _ in range(MAX_ROUNDS):
+              calls: list[dict[str, Any]],
+              system: str | None = None,
+              tools: list[dict[str, Any]] | None = None,
+              budget: dict[str, int] | None = None,
+              rounds: int | None = None) -> dict[str, Any]:
+        """Рабочий цикл: модель → инструменты → модель.
+
+        `system` и `tools` позволяют прогнать голос совета (свой промпт и
+        свой набор инструментов). `budget` — общий счётчик раундов задачи:
+        совет и работа считаются вместе, поэтому лимит `MAX_ROUNDS` на задачу
+        не превышается.
+        """
+        prompt = system if system is not None else system_prompt()
+        payload = self._tool_payload(tools)
+        allowed = {item["name"] for item in payload}
+        limit = int(rounds or MAX_ROUNDS)
+        for _ in range(limit):
+            if budget is not None and int(budget.get("left", 1)) <= 0:
+                return {"status": "done",
+                        "text": "достигнут лимит шагов (%d) — сузьте запрос: "
+                                "назови файл или конкретную функцию" % MAX_ROUNDS,
+                        "calls": calls, "history": messages}
+            if budget is not None:
+                budget["left"] = int(budget.get("left", 1)) - 1
             try:
-                raw = chat_completion(messages, system, self._tool_payload(), cfg)
+                raw = chat_completion(messages, prompt, payload, cfg)
             except ModelUnavailable as exc:
                 return {"status": "unavailable", "error": str(exc),
                         "calls": calls, "text": ""}
@@ -314,6 +459,11 @@ class Agent:
                 tool = self._tool_by_name(call["name"])
                 if tool is None:
                     result: Any = {"error": "неизвестный инструмент %s" % call["name"]}
+                elif tool["name"] not in allowed:
+                    # Голос совета работает со своим набором инструментов:
+                    # чужой инструмент он не вызывает (даже если выдумал его).
+                    result = {"error": "инструмент %s в этом ходе недоступен"
+                              % call["name"]}
                 else:
                     try:
                         result = self.dispatch(tool["command"], call["input"])
@@ -328,8 +478,10 @@ class Agent:
                 for call, result in results
             ]})
         return {"status": "done",
-                "text": "достигнут лимит шагов (%d) — сузьте запрос: назни файл "
-                        "или конкретную функцию" % MAX_ROUNDS,
+                "text": ("специалист не уложился в %d шагов — сузьте запрос"
+                         % limit) if rounds else
+                        ("достигнут лимит шагов (%d) — сузьте запрос: назни файл "
+                         "или конкретную функцию" % MAX_ROUNDS),
                 "calls": calls, "history": messages}
 
     def confirm(self, approved: bool, history: list[dict[str, Any]],

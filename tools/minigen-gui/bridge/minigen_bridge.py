@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -55,6 +56,7 @@ import minigen_agents as agents_mod    # noqa: E402
 import minigen_ingest as ingest        # noqa: E402
 import minigen_karman as karman_mod    # noqa: E402
 import minigen_prompts as prompts_mod  # noqa: E402
+import minigen_council as council_mod  # noqa: E402
 import minigen_repos as repos_mod      # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
@@ -340,6 +342,10 @@ class Bridge:
             "prompts.archive": self.cmd_prompts_archive,
             "prompts.mark": self.cmd_prompts_mark,
             "prompts.dispatch": self.cmd_prompts_dispatch,
+            # совет специалистов: роли, новый специалист, артефакт итога
+            "council.read": self.cmd_council_read,
+            "council.add_role": self.cmd_council_add_role,
+            "present.save": self.cmd_present_save,
             # заявки: зачитка владельца → заявка для другой нейросети (24.11)
             "ingest.draft": self.cmd_ingest_draft,
             "ingest.save": self.cmd_ingest_save,
@@ -1239,6 +1245,59 @@ class Bridge:
             self.core.log("ПРОМТЫ: промт %s отдан в область %s"
                           % (prompt_id, area_slug))
         return res
+
+    # ───────────────────────────────────────────── совет специалистов
+    def cmd_council_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Совет специалистов: кто в нём есть и что каждый оценивает.
+
+        Только чтение: реестр ролей лежит в репозитории программы, а
+        одобренные владельцем — в состоянии программы.
+        """
+        registry = council_mod.registry()
+        roles = []
+        for item in council_mod.roles():
+            roles.append({
+                "slug": item.get("slug"),
+                "title": item.get("title"),
+                "kind": item.get("kind"),
+                "tools": list(item.get("tools") or []),
+                "mandatory_when": item.get("mandatory_when") or "",
+                "brief": (council_mod.brief_of(item) or "")[:1500],
+            })
+        return {"title": registry.get("title") or "Совет специалистов",
+                "count": len(roles), "roles": roles}
+
+    def cmd_council_add_role(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Добавить роль в совет — только после решения владельца.
+
+        Роль попадает в состояние программы (не в репозиторий: правки кода —
+        только веткой и PR).
+        """
+        res = council_mod.add_role(str(args.get("slug") or ""),
+                                   str(args.get("title") or ""),
+                                   str(args.get("role") or ""),
+                                   str(args.get("why") or ""))
+        if res.get("ok"):
+            self.core.log("СОВЕТ: владелец добавил специалиста «%s»"
+                          % res.get("title"))
+        return res
+
+    def cmd_present_save(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Сохранить итог для владельца отдельным файлом (артефакт)."""
+        title = str(args.get("title") or "итог").strip()
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return {"ok": False, "error": "пустой текст"}
+        folder = state.GUI_HOME / "presentations"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            safe = re.sub(r"[^A-Za-z0-9._-]+", "-", title)[:60].strip("-") or "itog"
+            path = folder / ("%s-%s.md" % (time.strftime("%Y-%m-%d-%H%M%S"), safe))
+            path.write_text(text, encoding="utf-8")
+        except OSError as exc:
+            return {"ok": False, "error": "не сохранилось: %s" % exc}
+        self.core.log("СОВЕТ: итог сохранён (%s)" % path.name)
+        return {"ok": True, "path": str(path)}
 
     # ──────────────────────────────────────────────────────────── заявки
     def _known_projects(self) -> list[dict[str, Any]]:

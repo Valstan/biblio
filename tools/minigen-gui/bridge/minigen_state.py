@@ -83,6 +83,10 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "promptStore": "local",
     # раздавать ли промты рабочим областям без живого оператора
     "promptAutoDispatch": False,
+    # совет специалистов: обсуждать ли новое задание перед работой
+    "councilEnabled": True,
+    # сколько ролей совета реально отвечают на задачу (совет дорог)
+    "councilMaxRoles": 3,
 }
 
 

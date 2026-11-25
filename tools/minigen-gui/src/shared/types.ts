@@ -109,6 +109,10 @@ export interface Settings {
   promptStore: 'local' | 'karman'
   /** раздавать ли промты рабочим областям без живого оператора */
   promptAutoDispatch: boolean
+  /** совет специалистов: обсуждать ли новое задание перед работой */
+  councilEnabled: boolean
+  /** сколько ролей совета реально отвечают на задачу (совет дорог) */
+  councilMaxRoles: number
 }
 
 export interface ToolCall {

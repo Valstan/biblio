@@ -1,0 +1,273 @@
+"""Тесты совета специалистов «МиниГена» (заказ владельца 25.11, промт #132).
+
+Запуск:  python -m unittest discover -s bridge/tests -t . -v
+
+Что проверяем (по критериям приёмки из промта):
+
+1. **В репозитории лежат 5–6 ролей** с описанием, что оценивает каждая, и
+   реестр, из которого они читаются.
+2. **Задание проходит обсуждение советом** и заканчивается решением с
+   назначенными исполнителями.
+3. **Решение содержит**: что делать, что не делать, кто исполнитель, что
+   требует уточнения у владельца.
+4. **Работа распределяется между отдельными исполнителями**, а не делается
+   одним (у каждого — свой ход и свои инструменты).
+5. **Выход за рамки ролей**: совет это фиксирует и предлагает нового
+   специалиста; новая роль появляется в реестре **только после решения
+   владельца**.
+6. **Число раундов на задачу не выходит за `MAX_ROUNDS`**, а на простой
+   задаче обсуждение короткое.
+7. **Термины разведены**: «вердикт» — состояние сессии, решение совета так не
+   называется.
+
+⚠️ Модель в тестах не нужна: голоса совета подменяются (`FakeAgent`), поэтому
+проверяется логика конвейера, а не модель.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+BRIDGE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BRIDGE_DIR))
+
+import minigen_agent as agent_mod    # noqa: E402
+import minigen_council as council    # noqa: E402
+import minigen_tools as tools_mod    # noqa: E402
+
+TASK = "Сделай вкладку «Промты» в окне и проверь, что она открывается."
+
+TRIAGE_JSON = json.dumps({
+    "summary": "задание про вкладку",
+    "roles": ["ux", "designer", "coder"],
+    "why": "нужны UX и внешний вид",
+}, ensure_ascii=False)
+
+JUDGE_JSON = json.dumps({
+    "to_do": ["сделать вкладку", "покрыть тестом"],
+    "not_to_do": ["не переписывать мост"],
+    "executors": ["coder", "reviewer", "presenter"],
+    "ask_owner": [],
+    "summary": "вкладка и её приёмка",
+}, ensure_ascii=False)
+
+JUDGE_WITH_NEW_ROLE = json.dumps({
+    "to_do": ["проверить безопасность"],
+    "not_to_do": [],
+    "executors": ["coder"],
+    "ask_owner": ["нужно ли хранить ключи в репозитории"],
+    "new_role": {"title": "Специалист по безопасности",
+                 "role": "оценивает секреты и доступы",
+                 "why": "задача про ключи — своей роли нет"},
+}, ensure_ascii=False)
+
+
+class FakeAgent(agent_mod.Agent):
+    """Агент с подменёнными голосами совета — модель не нужна."""
+
+    def __init__(self, replies: dict[str, str]) -> None:
+        super().__init__(dispatch=lambda cmd, args: {}, tools=tools_mod.TOOLS)
+        self.replies = replies
+        self.turns: list[dict] = []
+
+    def _role_turn(self, system, messages, tool_names, cfg, rounds, budget):
+        self.turns.append({"system": system, "tools": list(tool_names),
+                           "rounds": rounds})
+        budget["left"] = max(0, int(budget.get("left", 1)) - rounds)
+        text = ""
+        for marker, value in self.replies.items():
+            if marker in system:
+                text = value
+                break
+        return {"status": "done", "text": text, "calls": [], "history": messages}
+
+
+def council_replies(judge: str = JUDGE_JSON) -> dict[str, str]:
+    return {
+        "секретарь": TRIAGE_JSON,
+        "судья": judge,
+        "UX": "Кнопки лучше собрать в одну группу.",
+        "Дизайнер": "Цвета совпадают с остальным окном.",
+    }
+
+
+# ───────────────────────────────────────────────────────── роли и реестр
+
+class RolesTest(unittest.TestCase):
+    """В репозитории программы лежат роли совета и реестр."""
+
+    def test_registry_has_five_or_six_roles(self) -> None:
+        roles = council.roles()
+        self.assertGreaterEqual(len(roles), 5, "в совете должно быть 5–6 ролей")
+        self.assertLessEqual(len(roles), 6, "в совете должно быть 5–6 ролей")
+
+    def test_every_role_has_a_brief_and_criteria(self) -> None:
+        for item in council.roles():
+            slug = str(item.get("slug") or "")
+            self.assertTrue(slug, "роль без slug")
+            self.assertTrue(item.get("title"), "роль %s без названия" % slug)
+            self.assertIn(str(item.get("kind")), ("advisor", "executor"))
+            brief = council.brief_of(item)
+            self.assertTrue(brief.strip(), "у роли %s нет брифа" % slug)
+            for section in ("Что оценивает", "Критерии",
+                            "Когда мнение обязательно"):
+                self.assertIn(section, brief,
+                              "в брифе роли %s нет раздела «%s»" % (slug, section))
+
+    def test_executors_are_separate_from_advisors(self) -> None:
+        """Исполнители — отдельные от советников (код, проверка, презентация)."""
+        executors = [str(item.get("slug")) for item in council.executors()]
+        self.assertIn("coder", executors)
+        self.assertIn("reviewer", executors)
+        self.assertIn("presenter", executors)
+        advisors = [str(item.get("slug")) for item in council.roles()
+                    if str(item.get("kind")) == "advisor"]
+        for slug in executors:
+            self.assertNotIn(slug, advisors)
+
+    def test_roles_limit_is_bounded(self) -> None:
+        self.assertEqual(council.max_roles({}), council.DEFAULT_MAX_ROLES)
+        self.assertLessEqual(council.max_roles({"councilMaxRoles": 99}), 6)
+        self.assertGreaterEqual(council.max_roles({"councilMaxRoles": 0}), 1)
+
+
+# ────────────────────────────────────────────────────── формат решения
+
+class DecisionTest(unittest.TestCase):
+    """Решение совета — четыре поля, исполнители из известных ролей."""
+
+    def test_decision_has_four_fields(self) -> None:
+        decision = council.normalize_decision(
+            json.loads(JUDGE_JSON), ["coder", "reviewer", "presenter"])
+        for field in council.DECISION_FIELDS:
+            self.assertIn(field, decision)
+        self.assertEqual(decision["to_do"], ["сделать вкладку", "покрыть тестом"])
+        self.assertEqual(decision["not_to_do"], ["не переписывать мост"])
+        self.assertEqual(decision["executors"], ["coder", "reviewer", "presenter"])
+        self.assertEqual(decision["ask_owner"], [])
+
+    def test_unknown_executor_is_dropped(self) -> None:
+        raw = {"to_do": ["x"], "executors": ["выдуманный", "coder"]}
+        decision = council.normalize_decision(raw, ["coder", "reviewer"])
+        self.assertEqual(decision["executors"], ["coder"])
+
+    def test_new_role_is_a_proposal(self) -> None:
+        raw = json.loads(JUDGE_WITH_NEW_ROLE)
+        decision = council.normalize_decision(raw, ["coder"])
+        self.assertIsNotNone(decision["new_role"])
+        self.assertEqual(decision["new_role"]["title"],
+                         "Специалист по безопасности")
+        self.assertEqual(decision["ask_owner"],
+                         ["нужно ли хранить ключи в репозитории"])
+
+    def test_decision_is_not_called_a_verdict(self) -> None:
+        """«Вердикт» — состояние сессии; решение совета так не называется."""
+        text = council.format_discussion(
+            [{"slug": "ux", "title": "UX", "text": "кнопки в одну группу"}],
+            council.normalize_decision(json.loads(JUDGE_JSON),
+                                       ["coder", "reviewer", "presenter"]))
+        self.assertIn("Решение совета", text)
+        self.assertNotIn("вердикт", text.lower())
+
+
+# ─────────────────────────────────────────────────────────── конвейер
+
+class PipelineTest(unittest.TestCase):
+    """Задание проходит обсуждение и заканчивается решением."""
+
+    def _run(self, replies: dict[str, str]) -> tuple[dict, FakeAgent]:
+        fake = FakeAgent(replies)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = fake._council([{"role": "user", "content": TASK}], {},
+                                budget, {}, TASK)
+        return outcome, fake
+
+    def test_task_goes_through_discussion_to_decision(self) -> None:
+        outcome, fake = self._run(council_replies())
+        decision = outcome.get("decision") or {}
+        self.assertEqual(decision.get("executors"), ["coder", "reviewer", "presenter"])
+        self.assertIn("Решение совета", outcome.get("council_text") or "")
+        self.assertIn("UX", outcome.get("council_text") or "")
+        # решения идут в контекст основного хода агента
+        context = outcome["history"][-1]["content"]
+        self.assertIn("Что делать", context)
+        self.assertIn("Кто исполнитель", context)
+
+    def test_executors_work_separately_with_their_own_tools(self) -> None:
+        """Работа распределяется между отдельными исполнителями."""
+        outcome, fake = self._run(council_replies())
+        executor_turns = [turn for turn in fake.turns
+                          if "ты — исполнитель" in turn["system"].lower()]
+        self.assertEqual(len(executor_turns), 3, "исполнителей должно быть три")
+        tool_sets = [set(turn["tools"]) for turn in executor_turns]
+        self.assertNotEqual(tool_sets[0], tool_sets[1],
+                            "у исполнителей должны быть свои инструменты")
+        self.assertIn("code.tests", tool_sets[1])   # у проверяющего есть проверки
+
+    def test_advisors_are_selected_by_the_secretary_and_capped(self) -> None:
+        outcome, fake = self._run(council_replies())
+        advisor_turns = [turn for turn in fake.turns
+                         if "ты — специалист совета" in turn["system"].lower()]
+        # исполнителя секретарь не зовёт — его назначает судья
+        self.assertEqual(len(advisor_turns), 2)
+
+    def test_rounds_stay_within_the_limit(self) -> None:
+        """Число раундов на задачу не выходит за MAX_ROUNDS."""
+        fake = FakeAgent(council_replies())
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        fake._council([{"role": "user", "content": TASK}], {}, budget, {}, TASK)
+        self.assertGreaterEqual(budget["left"], 2,
+                                "основному ходу должен остаться бюджет")
+        self.assertLessEqual(budget["left"], agent_mod.MAX_ROUNDS)
+
+    def test_council_can_be_switched_off(self) -> None:
+        self.assertTrue(council.enabled({}))
+        self.assertFalse(council.enabled({"councilEnabled": False}))
+
+    def test_continuation_is_not_a_new_task(self) -> None:
+        """«Продолжай» — это продолжение нитки, совету не нужно."""
+        self.assertTrue(council.is_continuation("Продолжай"))
+        self.assertTrue(council.is_continuation("да"))
+        self.assertFalse(council.is_continuation(TASK))
+
+
+# ────────────────────────────────────────────────────── новый специалист
+
+class NewSpecialistTest(unittest.TestCase):
+    """Роль появляется в совете только после решения владельца."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self._old_local = council.LOCAL_DIR
+        council.LOCAL_DIR = Path(self.tmp.name) / "council"
+
+    def tearDown(self) -> None:
+        council.LOCAL_DIR = self._old_local
+        self.tmp.cleanup()
+
+    def test_role_is_added_only_after_the_owner_agrees(self) -> None:
+        before = len(council.roles())
+        res = council.add_role("security", "Специалист по безопасности",
+                               "оценивает секреты и доступы", "нужна роль")
+        self.assertTrue(res["ok"], res)
+        after = council.roles()
+        self.assertEqual(len(after), before + 1)
+        added = next(item for item in after if item.get("slug") == "security")
+        self.assertIn("безопасност", (council.brief_of(added) or "").lower())
+        # в репозиторий роль не попала — репозиторий правит человек
+        repo = json.loads(council.REGISTRY_FILE.read_text(encoding="utf-8"))
+        self.assertNotIn("security", [str(item.get("slug"))
+                                       for item in repo.get("roles") or []])
+
+    def test_bad_slug_is_refused(self) -> None:
+        res = council.add_role("Плохое Имя", "Роль", "роль")
+        self.assertFalse(res["ok"])
+        self.assertIn("slug", res["error"])
+
+
+if __name__ == "__main__":
+    unittest.main()
