@@ -115,8 +115,15 @@ class ModeTest(_CopyTestCase):
             self.assertTrue(item["hint"])
 
     def test_mode_falls_back_to_the_state_of_the_machine(self) -> None:
-        # ничего не выбрано, клона нет ⇒ локальный режим (сети нет — не выдумываем)
+        # ничего не выбрано и следов нет ⇒ прежнее поведение (own), а не
+        # догадка «нет клона — значит локально» (живой случай 25.11, CI).
         self.assertEqual(copy_mod.stored_mode(), "")
+        self.assertEqual(copy_mod.mode(), "own")
+
+    def test_explicit_choice_of_the_copy_is_remembered(self) -> None:
+        data = lineage.instance()
+        data["copy_mode"] = "local"
+        lineage._write_json(lineage.INSTANCE_FILE, data)
         self.assertEqual(copy_mod.mode(), "local")
 
     def test_chosen_mode_wins(self) -> None:

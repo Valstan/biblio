@@ -138,16 +138,28 @@ def stored_mode() -> str:
 
 
 def derived_mode() -> str:
-    """Режим по состоянию машины (когда владелец ещё не выбирал)."""
+    """Режим по состоянию машины (когда владелец ещё не выбирал).
+
+    ⚠️ Живой случай 25.11 (CI): режим выводился из «есть ли клон на диске»,
+    и на чистой машине (клон ещё не взят) копия вдруг считалась локальной —
+    а это меняло поведение программы (пул, публикация генов, PR) в зависимости
+    от того, что уже настроено. Поэтому режим выводится только из **явных**
+    следов: что записал владелец или что завела сама копия. Нет следов —
+    прежнее поведение (`own`), а не догадка по наличию папки.
+    """
+    data = lineage.instance()
+    explicit = str(data.get("copy_mode") or "").strip()
+    if explicit in MODES:
+        return explicit
+    if data.get("copy_repo"):
+        return MODE_OWN
     try:
         import minigen_clone as clone_mod
-        clone_exists = (clone_mod.CLONE_DIR / ".git").is_dir()
+        if (clone_mod.CLONE_DIR / ".git").is_dir():
+            return MODE_SHARED
     except Exception:  # noqa: BLE001
-        clone_exists = False
-    if not clone_exists:
-        return MODE_LOCAL
-    data = lineage.instance()
-    return MODE_OWN if data.get("copy_repo") else MODE_SHARED
+        pass
+    return MODE_OWN
 
 
 def mode() -> str:
@@ -271,6 +283,16 @@ def _apply_mode(value: str) -> dict[str, Any]:
                       % MODE_LABELS.get(value, value)})
     except Exception as exc:  # noqa: BLE001
         steps.append({"what": "настройки", "ok": False, "why": str(exc)})
+    # Режим — в родословную копии: он виден и без настроек, и переживает их
+    # сброс (а настройки — как раз то, что владелец может снести).
+    try:
+        data = lineage.instance()
+        data["copy_mode"] = value
+        _write_instance(data)
+        steps.append({"what": "родословная копии", "ok": True,
+                      "why": "режим записан: %s" % MODE_LABELS.get(value, value)})
+    except Exception as exc:  # noqa: BLE001
+        steps.append({"what": "родословная копии", "ok": False, "why": str(exc)})
 
     if value == MODE_LOCAL:
         local = ensure_local_repo()
