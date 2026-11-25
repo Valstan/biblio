@@ -563,3 +563,77 @@ td.actions {
 .chat-input input {
   flex: 1;
 }
+
+/* ── вложения к чату «Управляющего» (промт #90) ─────────────────────────── */
+
+/* Зона приёма файлов — весь чат: подсветка при перетаскивании. */
+.chat {
+  position: relative;
+}
+
+.chat.drag-over {
+  outline: 2px dashed var(--accent);
+  outline-offset: -6px;
+}
+
+.drop-hint {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  background: rgba(16, 20, 24, 0.72);
+  border: 2px dashed var(--accent);
+  border-radius: var(--radius);
+  color: var(--text);
+  font-size: 15px;
+}
+
+/* Файлы в реплике переписки и чипы ожидающих отправки. */
+.attachments,
+.attach-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.attach-list {
+  margin-bottom: 8px;
+}
+
+.attachments {
+  margin-top: 6px;
+}
+
+.chip.file {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+}
+
+.chip.file .x {
+  padding: 0 4px;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+}
+
+.chip.file .x:hover {
+  color: var(--text);
+}
+
+/* Подпись о приватности — рядом с кнопкой и зоной приёма. */
+.attach-hint {
+  margin-top: 4px;
+}
+
+/* Честная пометка: путь файла получить не удалось. */
+.attach-note {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--warn);
+}

@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
-import { writeFileSync } from 'fs'
-import { join } from 'path'
+import { statSync, writeFileSync } from 'fs'
+import { basename, join } from 'path'
 import { Bridge } from './bridge'
 import { sendToWindow } from './window-events'
 import { clickTabScript, mapGeometryScript, parseSmokeTabs, shotName } from './smoke'
@@ -94,6 +94,24 @@ app.whenReady().then(() => {
   ipcMain.handle('minigen:open-external', async (_event, path: string) => {
     shell.openPath(path)
     return true
+  })
+
+  // Выбор файлов для чата (промт #90): диалог открывает главный процесс,
+  // окно получает настоящие пути и на диск само не ходит.
+  ipcMain.handle('minigen:pick-files', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openFile', 'multiSelections']
+    })
+    if (result.canceled) return []
+    return result.filePaths.map((path) => {
+      let size = 0
+      try {
+        size = statSync(path).size
+      } catch {
+        size = 0
+      }
+      return { path, name: basename(path), size }
+    })
   })
 
   // Перезапуск окна: раскатка меняет файлы на диске, а запущенное окно
