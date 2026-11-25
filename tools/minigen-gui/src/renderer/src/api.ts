@@ -5,6 +5,10 @@ import type {
   CloneStatus,
   CopyFirstRunSnapshot,
   CopyMode,
+  CopyTokenCheck,
+  CopyTokenIssue,
+  CopyTokenRequest,
+  CopyTokenStatus,
   DaemonStatus,
   GeneActionResult,
   GeneMap,
@@ -151,7 +155,30 @@ export const api = {
   copyFirstRun: () => call<CopyFirstRunSnapshot>('copy.first_run'),
   copyAnswer: (agree: boolean, mode?: CopyMode) =>
     call<GeneActionResult>('copy.answer', mode ? { agree, mode } : { agree }),
-  copyMode: (mode: CopyMode) => call<GeneActionResult>('copy.mode', { mode })
+  copyMode: (mode: CopyMode) => call<GeneActionResult>('copy.mode', { mode }),
+  // ── токен копии (25.11, #130) ────────────────────────────────────────────
+  copyTokenStatus: () => call<CopyTokenStatus>('copy.token_status'),
+  copyTokenRequest: (name?: string, section?: string) =>
+    call<GeneActionResult & { id?: string; instance_id?: string }>(
+      'copy.token_request',
+      { name, section }
+    ),
+  copyTokenRequests: (section?: string) =>
+    call<{ requests: CopyTokenRequest[] }>(
+      'copy.token_requests',
+      section ? { section } : {}
+    ),
+  copyTokenIssue: (args: { instance_id?: string; folder?: string; name?: string }) =>
+    call<CopyTokenIssue>('copy.token_issue', args),
+  copyTokenSet: (args: { token: string; instance_id?: string; folder?: string }) =>
+    call<CopyTokenStatus & { bound?: boolean }>('copy.token_set', args),
+  copyTokenCheck: (folder?: string) =>
+    call<CopyTokenCheck>('copy.token_check', folder ? { folder } : {}),
+  copyTokenTrust: (instance_id: string, key_id?: string) =>
+    call<{ ok?: boolean; why?: string; error?: string }>('copy.token_trust', {
+      instance_id,
+      key_id
+    })
 }
 
 /** Действия окна (не моста): перезапуск, метка сборки, состояние моста. */

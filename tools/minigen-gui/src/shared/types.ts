@@ -133,6 +133,72 @@ export interface GeneActionResult {
   error?: string
 }
 
+/**
+ * Токен копии (заказ владельца 25.11, промт #130): подтверждает право
+ * копии работать **со своей папкой**. Значения секрета в ответе нет —
+ * только путь, отпечаток и признак привязки.
+ */
+export interface CopyTokenStatus {
+  has_token: boolean
+  /** отпечаток токена (идентификатор) — секрета не раскрывает */
+  token_id: string
+  /** маска значения (видны только последние четыре знака) */
+  masked: string
+  /** где лежит токен: стор на машине, вне репозитория */
+  path: string
+  source?: string
+  instance_id: string
+  /** папка копии в общем репозитории: copies/<идентификатор копии>/ */
+  folder: string
+  issued_at: number
+  /** токен подтверждён под свою папку */
+  bound: boolean
+  reason: string
+}
+
+/** Заявка копии на токен — что пришло владельцу в «МиниГене». */
+export interface CopyTokenRequest {
+  id: string
+  instance_id: string
+  name: string
+  folder: string
+  family: string
+  generation: number
+  fork_commit: string
+  /** отпечаток подписи копии */
+  key_id: string
+  signed_at: number
+  signature: string
+  /** «своя копия» / «чужая копия» — по родословной и подписи */
+  relation: string
+  signature_state: string
+  created: string
+  archived: boolean
+}
+
+/** Результат выпуска токена: значение показывается один раз (владельцу). */
+export interface CopyTokenIssue {
+  ok?: boolean
+  token?: string
+  token_id?: string
+  proof?: string
+  instance_id?: string
+  folder?: string
+  issued_at?: number
+  path?: string
+  why?: string
+  error?: string
+}
+
+/** Проверка доступа копии (ответ моста `copy.token_check`). */
+export interface CopyTokenCheck {
+  ok: boolean
+  folder: string
+  token_id: string
+  reason: string
+}
+
+
 export interface AccountState {
   email?: string
   expires_at?: number | null
@@ -238,6 +304,12 @@ export interface Settings {
   modelApplyToAreas: boolean
   confirmDangerous: boolean
   statsWindow: number
+  /** где исходники программы (для правок и PR) */
+  codeRepo: string
+  /** реестр агентов «МиниГена» (репозиторий на GitHub) */
+  agentsRegistry: string
+  /** где живут рабочие репозитории агентов */
+  agentsWorkspace: string
   /** где лежат промты: в базе «МиниГена» или на внешнем ресурсе */
   promptStore: 'local' | 'karman'
   /** раздавать ли промты рабочим областям без живого оператора */
@@ -248,6 +320,16 @@ export interface Settings {
   councilMaxRoles: number
   /** режим копии: '' (не выбран), 'own', 'shared', 'local' */
   copyMode: CopyMode | ''
+  /** репозиторий копии (в режиме «свой репозиторий») */
+  copyRepo: string
+  /** где лежит токен копии (в сторе на машине, вне репозитория) */
+  copyTokenPath: string
+  /** отпечаток токена (секрета не раскрывает) */
+  copyTokenId: string
+  /** папка копии в общем репозитории: copies/<идентификатор копии>/ */
+  copyTokenFolder: string
+  /** раздел КАРМАНА, куда уходят заявки на токен */
+  copyRequestsSection: string
 }
 
 export interface ToolCall {
