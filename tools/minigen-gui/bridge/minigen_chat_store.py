@@ -67,11 +67,29 @@ def _clean(message: Any) -> dict[str, Any] | None:
                                 "args": call.get("args") or {},
                                 "result": call.get("result"),
                                 "approved": bool(call.get("approved"))})
-    if not text and not clean_calls:
+    # Вложения оператора (промт #90): имя, вид и размер — чтобы в переписке
+    # было видно, что приложено.
+    attachments = message.get("attachments")
+    clean_attachments = []
+    if isinstance(attachments, list):
+        for item in attachments:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            clean_attachments.append({"name": name,
+                                      "kind": str(item.get("kind") or ""),
+                                      "size": int(item.get("size") or 0),
+                                      "ok": bool(item.get("ok", True)),
+                                      "path": str(item.get("path") or "")})
+    if not text and not clean_calls and not clean_attachments:
         return None            # пустая реплика — не место в истории
     out: dict[str, Any] = {"role": role, "text": text}
     if clean_calls:
         out["calls"] = clean_calls
+    if clean_attachments:
+        out["attachments"] = clean_attachments
     at = message.get("at")
     out["at"] = int(at) if isinstance(at, (int, float)) else _now()
     return out
@@ -152,15 +170,26 @@ def agent_history(messages: list[dict[str, Any]],
     ⚠️ Восстанавливается **текст** реплик: подробности вызовов в память
     модели не возвращаются — она узнаёт состояние программы через свои
     инструменты, а не через чужой JSON (знания программы так и требуют).
+
+    ⚠️ Приложенные файлы (промт #90) в памяти отмечаются словами: модель
+    должна помнить, какие файлы оператор ей прислал.
     """
     out: list[dict[str, Any]] = []
     for message in messages or []:
         role = str(message.get("role") or "")
         text = str(message.get("text") or "").strip()
-        if not text:
+        attachments = message.get("attachments") or []
+        if not text and not attachments:
             continue
         if role == "user":
+            names = [str(item.get("name") or "") for item in attachments
+                     if isinstance(item, dict) and item.get("name")]
+            if names:
+                text = ("%s\n[оператор приложил: %s]" % (text, ", ".join(names))
+                        if text else "[оператор приложил: %s]" % ", ".join(names))
             out.append({"role": "user", "content": text})
         elif role == "assistant":
+            if not text:
+                continue
             out.append({"role": "assistant", "content": text})
     return out[-limit:]

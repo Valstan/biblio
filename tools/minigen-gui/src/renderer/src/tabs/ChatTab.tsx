@@ -1,5 +1,5 @@
-import { useEffect, useState, useSyncExternalStore } from 'react'
-import type { ChatReply, ModelCatalog, ModelEntry } from '@shared/types'
+import { useEffect, useRef, useState, useSyncExternalStore, type DragEvent } from 'react'
+import type { ChatAttachment, ChatReply, ModelCatalog, ModelEntry } from '@shared/types'
 import { api } from '../api'
 import * as chatStore from './chat-store'
 import {
@@ -9,6 +9,13 @@ import {
   callsSummary,
   restoreMessages
 } from './chat-view'
+import {
+  attachmentLabel,
+  collectFiles,
+  detectKind,
+  mergeAttachments,
+  visibleAttachments
+} from './attachments-view'
 
 /**
  * «Управляющий» — чат с встроенной нейросетью «МиниГена».
@@ -32,6 +39,12 @@ import {
  * берутся **из родного конфига платформы** (`contextWindowOptions`,
  * `thinking.effortOptions`), поэтому выбор выглядит как в родной среде и
  * останется верным, когда появится другая платформа.
+ *
+ * Оператор может **прикладывать файлы** к чату (промт #90): кнопкой рядом
+ * со строкой ввода или перетаскиванием в любое место окна чата. Окно знает
+ * только имя, вид и размер файла — **содержимое читает мост** и кладёт его
+ * в контекст хода. Приложенный файл уходит в модель (в вендор) — об этом
+ * окно предупреждает честно, а не молча.
  */
 export default function ChatTab() {
   // Переписка — из стора модуля: размонтирование вкладки её не стирает.
@@ -46,6 +59,15 @@ export default function ChatTab() {
   const [modelNote, setModelNote] = useState('')
   // Пока мост отвечает на историю — говорим честно, а не показываем пустоту.
   const [loadingHistory, setLoadingHistory] = useState(true)
+  // Файлы, приложенные оператором и ждущие отправки (промт #90).
+  const [attachments, setAttachments] = useState<ChatAttachment[]>([])
+  // Честная пометка оператору: «путь не получили» и подобное.
+  const [attachNote, setAttachNote] = useState('')
+  // Подсветка зоны приёма файлов, пока файл перетаскивают.
+  const [dragOver, setDragOver] = useState(false)
+  // Глубина вложенности при перетаскивании: без неё подсветка мигает над
+  // «детьми» зоны (счётчик растёт и падает на каждом элементе внутри).
+  const dragDepth = useRef(0)
 
   const loadCatalog = async () => {
     try {
@@ -88,6 +110,19 @@ export default function ChatTab() {
       void loadHistory()
     } else {
       setLoadingHistory(false)
+    }
+  }, [])
+
+  // Окно не должно уезжать на перетащенный файл (Chromium так умеет): пока
+  // открыта вкладка чата, перехватываем drop на уровне документа. Сама зона
+  // приёма — секция `.chat` (обработчик выше).
+  useEffect(() => {
+    const stop = (event: Event) => event.preventDefault()
+    document.addEventListener('dragover', stop)
+    document.addEventListener('drop', stop)
+    return () => {
+      document.removeEventListener('dragover', stop)
+      document.removeEventListener('drop', stop)
     }
   }, [])
 
@@ -134,15 +169,124 @@ export default function ChatTab() {
     setPending(reply.pending ?? undefined)
   }
 
+  /**
+   * Кнопка «Прикрепить файл»: диалог выбора открывает **главный процесс**,
+   * окно получает настоящие пути и само на диск не ходит.
+   */
+  const attachByDialog = async () => {
+    try {
+      const picked = (await window.minigen.pickFiles()) ?? []
+      // Пустой список — оператор отменил выбор: молчим, это не ошибка.
+      if (picked.length === 0) return
+      const added: ChatAttachment[] = []
+      const blind: string[] = []
+      for (const item of picked) {
+        if (!item?.path) {
+          blind.push(item?.name || 'файл')
+          continue
+        }
+        added.push({
+          name: item.name,
+          path: item.path,
+          size: item.size ?? 0,
+          kind: detectKind(item.name)
+        })
+      }
+      if (added.length > 0) {
+        setAttachments((current) => mergeAttachments(current, added))
+      }
+      setAttachNote(
+        blind.length > 0
+          ? `путь файла получить не удалось — выберите файл кнопкой ещё раз (${blind.join(', ')})`
+          : ''
+      )
+    } catch (err) {
+      setAttachNote(`файлы не выбраны: ${(err as Error).message}`)
+    }
+  }
+
+  /**
+   * Перетащенные файлы → вложения.
+   *
+   * ⚠️ Electron 32 не отдаёт путь файла сам: настоящий путь берёт главный
+   * процесс (`getPathForFile`). Если пути нет — говорим оператору честно и
+   * предлагаем кнопку, а не игнорируем файл молча.
+   */
+  const attachDropped = (files: File[]) => {
+    if (files.length === 0) return
+    const added: ChatAttachment[] = []
+    const blind: string[] = []
+    for (const file of files) {
+      const path = window.minigen.getPathForFile(file)
+      if (!path) {
+        blind.push(file.name)
+        continue
+      }
+      added.push({
+        name: file.name,
+        path,
+        size: file.size,
+        kind: detectKind(file.name)
+      })
+    }
+    if (added.length > 0) {
+      setAttachments((current) => mergeAttachments(current, added))
+      setAttachNote('')
+    }
+    if (blind.length > 0) {
+      setAttachNote(blindNote(blind))
+    }
+  }
+
+  /** Снять вложение (чип с «×»). */
+  const removeAttachment = (path: string | undefined) => {
+    setAttachments((current) => current.filter((item) => item.path !== path))
+  }
+
+  /** Зона приёма файлов: подсветка и «отпустите файл». */
+  const onDragEnter = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault()
+    dragDepth.current += 1
+    setDragOver(true)
+  }
+
+  const onDragOver = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault()
+    setDragOver(true)
+  }
+
+  const onDragLeave = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault()
+    dragDepth.current = Math.max(0, dragDepth.current - 1)
+    if (dragDepth.current === 0) setDragOver(false)
+  }
+
+  const onDrop = (event: DragEvent<HTMLElement>) => {
+    event.preventDefault()
+    dragDepth.current = 0
+    setDragOver(false)
+    attachDropped(collectFiles(event.dataTransfer?.files ?? null))
+  }
+
   const send = async () => {
     const text = input.trim()
-    if (!text || busy) return
+    const files = attachments
+    // Отправить можно и без текста: задачу сформулирует мост (промт #90).
+    if ((!text && files.length === 0) || busy) return
     setInput('')
+    setAttachments([])
     // Реплика владельца попадает в переписку сразу — не дожидаясь моста.
-    chatStore.setMessages(appendMessage(chatStore.getMessages(), { role: 'user', text }))
+    // Вложения — вместе с ней, чтобы в логе сразу было видно, что приложено.
+    chatStore.setMessages(
+      appendMessage(chatStore.getMessages(), {
+        role: 'user',
+        text,
+        attachments: files.length > 0 ? visibleAttachments(files) : undefined
+      })
+    )
     setBusy(true)
     try {
-      applyReply(await api.chatSend(text))
+      applyReply(await api.chatSend(text, files.length > 0 ? files : undefined))
     } catch (err) {
       chatStore.setMessages(
         appendMessage(chatStore.getMessages(), {
@@ -182,7 +326,14 @@ export default function ChatTab() {
   }
 
   return (
-    <section className="chat">
+    <section
+      className={`chat${dragOver ? ' drag-over' : ''}`}
+      onDragEnter={onDragEnter}
+      onDragOver={onDragOver}
+      onDragLeave={onDragLeave}
+      onDrop={onDrop}
+    >
+      {dragOver && <div className="drop-hint">Отпустите файл — прикреплю к чату</div>}
       <div className="row head">
         <h2>Управляющий</h2>
         <button className="ghost" onClick={clear}>
@@ -242,6 +393,15 @@ export default function ChatTab() {
         {messages.map((message, index) => (
           <div key={index} className={`bubble ${message.role}`}>
             {message.text && <div className="text">{message.text}</div>}
+            {message.attachments && message.attachments.length > 0 && (
+              <div className="attachments">
+                {message.attachments.map((item, itemIndex) => (
+                  <span key={itemIndex} className="chip file">
+                    {attachmentLabel(item)}
+                  </span>
+                ))}
+              </div>
+            )}
             {message.calls && message.calls.length > 0 && (
               <details className="calls">
                 <summary>{callsSummary(message.calls)}</summary>
@@ -278,7 +438,32 @@ export default function ChatTab() {
         </div>
       )}
 
+      {attachments.length > 0 && (
+        <div className="chips attach-list">
+          {attachments.map((item, index) => (
+            <span key={item.path || index} className="chip file">
+              {attachmentLabel(item)}
+              <button
+                className="x"
+                title="Снять вложение"
+                aria-label="Снять вложение"
+                onClick={() => removeAttachment(item.path)}
+              >
+                ×
+              </button>
+            </span>
+          ))}
+        </div>
+      )}
+
       <div className="row chat-input">
+        <button
+          className="ghost attach-btn"
+          onClick={() => void attachByDialog()}
+          title="Прикрепить файл к чату"
+        >
+          Прикрепить файл
+        </button>
         <input
           value={input}
           placeholder="Например: проверь интернет у всех областей"
@@ -290,10 +475,26 @@ export default function ChatTab() {
             }
           }}
         />
-        <button className="primary" onClick={() => void send()} disabled={busy || !input.trim()}>
+        <button
+          className="primary"
+          onClick={() => void send()}
+          disabled={busy || (!input.trim() && attachments.length === 0)}
+        >
           Отправить
         </button>
       </div>
+      <div className="muted small attach-hint">
+        Файлы, приложенные к чату, уходят в модель (в вендор) — вместе с содержимым.
+      </div>
+      {attachNote && <div className="attach-note">{attachNote}</div>}
     </section>
   )
+}
+
+/**
+ * Честная пометка оператору: путь файла получить не удалось (Electron его не
+ * дал) — предлагаем кнопку, а не молча игнорируем файл.
+ */
+function blindNote(names: string[]): string {
+  return `путь файла получить не удалось — прикрепите файл кнопкой (${names.join(', ')})`
 }

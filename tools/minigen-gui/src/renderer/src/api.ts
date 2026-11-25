@@ -1,6 +1,7 @@
 import type {
   Area,
   AgentsSnapshot,
+  ChatAttachment,
   ChatMessage,
   ChatReply,
   CloneStatus,
@@ -35,6 +36,10 @@ declare global {
       call(cmd: string, args?: Record<string, unknown>): Promise<unknown>
       openExternal(path: string): Promise<boolean>
       saveText(name: string, content: string): Promise<{ ok: boolean; path: string; error?: string }>
+      /** выбрать файлы для чата (диалог в главном процессе) */
+      pickFiles(): Promise<{ path: string; name: string; size: number }[]>
+      /** настоящий путь перетащенного файла (пусто — не удалось) */
+      getPathForFile(file: File): string
       relaunch(): Promise<boolean>
       buildInfo(): Promise<{ commit: string }>
       bridgeStatus(): Promise<{ alive: boolean; message: string }>
@@ -73,7 +78,8 @@ export const api = {
   stats: (days: number) => call<Stats>('stats.summary', { days }),
   settings: () => call<Settings>('settings.get'),
   saveSettings: (patch: Partial<Settings>) => call<Settings>('settings.set', patch),
-  chatSend: (text: string) => call<ChatReply>('chat.send', { text }),
+  chatSend: (text: string, attachments?: ChatAttachment[]) =>
+    call<ChatReply>('chat.send', { text, attachments }),
   chatConfirm: (approved: boolean) => call<ChatReply>('chat.confirm', { approved }),
   // История чата с диска машины: переписка не теряется при перезапуске окна.
   chatHistory: () => call<{ messages: ChatMessage[]; path?: string }>('chat.history'),

@@ -278,7 +278,7 @@ class Agent:
     # ── основной ход ──
     def ask(self, history: list[dict[str, Any]], user_text: str,
             area_slug: str = "minigen", model: str = "",
-            note: str = "") -> dict[str, Any]:
+            note: str = "", blocks: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         """Обработать реплику владельца. Возвращает ответ и ход работы.
 
         Новое задание сначала обсуждает **совет специалистов** (промт #132):
@@ -292,10 +292,18 @@ class Agent:
         сообщений: отчёты сторожей — не реплики владельца, и в переписке им
         не место (промт #129). В историю попадают только слова владельца и
         ответы модели.
+
+        ⚠️ `blocks` — файлы, приложенные оператором (промт #90): они уходят в
+        сообщение **блоками** (текст документа или картинка), а не строкой.
+        Протокол вендора блоки уже умеет — менять ничего не пришлось.
         """
         cfg = self._model_config(area_slug, model)
         messages = list(history)
-        messages.append({"role": "user", "content": user_text})
+        if blocks:
+            content: Any = [{"type": "text", "text": user_text}] + list(blocks)
+        else:
+            content = user_text
+        messages.append({"role": "user", "content": content})
         budget = {"left": MAX_ROUNDS}
         settings = self.settings_provider() if self.settings_provider else {}
         # Совет включается **настройкой программы**: агент без провайдера

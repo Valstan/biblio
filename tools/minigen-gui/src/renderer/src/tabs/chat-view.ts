@@ -94,11 +94,12 @@ export function appendAssistant(messages: ChatMessage[], reply: ChatReply): Chat
   return next
 }
 
-/** Реплика видна, если в ней есть текст или вызовы инструментов. */
+/** Реплика видна, если в ней есть текст, вызовы или приложенные файлы. */
 function isVisible(message: ChatMessage): boolean {
   if (!message) return false
   if ((message.text ?? '').trim()) return true
-  return (message.calls?.length ?? 0) > 0
+  if ((message.calls?.length ?? 0) > 0) return true
+  return (message.attachments?.length ?? 0) > 0
 }
 
 /**

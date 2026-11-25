@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, webUtils } from 'electron'
 import type { BridgeEvent } from '../shared/types'
 
 /**
@@ -9,6 +9,29 @@ const api = {
   /** Вызвать команду программы (тот же реестр, что у встроенной нейросети). */
   call(cmd: string, args: Record<string, unknown> = {}): Promise<unknown> {
     return ipcRenderer.invoke('minigen:call', cmd, args)
+  },
+  /**
+   * Выбрать файлы для чата (промт #90).
+   *
+   * Диалог открывает **главный процесс** — окно получает настоящие пути и
+   * само на диск не ходит. Пустой список — оператор отменил выбор.
+   */
+  pickFiles(): Promise<{ path: string; name: string; size: number }[]> {
+    return ipcRenderer.invoke('minigen:pick-files')
+  },
+  /**
+   * Настоящий путь перетащенного файла.
+   *
+   * ⚠️ Electron 32 убрал `File.path` — путь берётся через `webUtils`.
+   * Если путь получить не удалось, возвращается пустая строка: окно честно
+   * скажет об этом и предложит кнопку «Прикрепить файл».
+   */
+  getPathForFile(file: File): string {
+    try {
+      return webUtils.getPathForFile(file)
+    } catch {
+      return ''
+    }
   },
   /** Открыть папку в проводнике. */
   openExternal(path: string): Promise<boolean> {

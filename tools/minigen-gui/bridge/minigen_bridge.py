@@ -49,6 +49,7 @@ import minigen_genes as genes_mod      # noqa: E402
 import minigen_copy as copy_mod        # noqa: E402
 import minigen_token as token_mod      # noqa: E402
 import minigen_chat_store as chat_store  # noqa: E402
+import minigen_files as files_mod      # noqa: E402
 import minigen_map as map_mod          # noqa: E402
 import minigen_update as update_mod    # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
@@ -294,6 +295,8 @@ class Bridge:
             # видимая история чата с диска (промт #129): переписка не теряется
             # при перезапуске окна
             "chat.history": self.cmd_chat_history,
+            # файлы оператора: чтение файла, приложенного к чату (промт #90)
+            "files.read": self.cmd_files_read,
             "app.open_folder": self.cmd_open_folder,
             # самообновление программы
             "code.list": self.cmd_code_list,
@@ -1026,7 +1029,9 @@ class Bridge:
     # ──────────────────────────────────────────────────────────────── чат
     def cmd_chat_send(self, args: dict[str, Any]) -> dict[str, Any]:
         text = str(args.get("text") or "").strip()
-        if not text:
+        attachments = [item for item in (args.get("attachments") or [])
+                       if isinstance(item, dict)]
+        if not text and not attachments:
             return {"status": "error", "error": "пустой запрос"}
         settings = state.read_settings()
         area_slug = str(args.get("area") or settings.get("modelArea") or "minigen")
@@ -1034,17 +1039,24 @@ class Bridge:
         # Прокси-переменные живут в реестре, а процесс мог устареть ⇒ перечитываем
         # их перед запросом (иначе модель «недоступна» при живом интернете).
         self.core.refresh_env()
+        # Файлы оператора читает мост (окно на диск не ходит). Содержимое уходит
+        # в контекст хода **блоками** — документ текстом, картинка картинкой
+        # (промт #90).
+        blocks, notes = self._read_attachments(attachments)
         # Реплика владельца — в историю сразу: даже если модель недоступна,
         # вопрос остаётся в переписке (промт #129).
-        chat_store.append({"role": "user", "text": text})
+        chat_store.append({"role": "user", "text": text, "attachments": notes})
         # Свежие отчёты программы — в контекст хода (заказ владельца 24.11):
         # нейросеть знает, что сторож и инструменты сделали, пока её не
         # спрашивали. ⚠️ Это **подсказка хода**, а не реплика: отчёты сторожей
         # в историю переписки не попадают (промт #129).
         feed = self._unread_reports()
+        # Если оператор приложил файлы, но ничего не написал, модели надо
+        # сказать, что делать: без текста задача пустая.
+        task = text or self._attachment_task(notes)
         try:
-            result = self.agent.ask(list(self.chat_history), text, area_slug,
-                                    model, note=feed)
+            result = self.agent.ask(list(self.chat_history), task, area_slug,
+                                    model, note=feed, blocks=blocks)
         except ModelUnavailable as exc:
             chat_store.append({"role": "system", "text": str(exc)})
             return {"status": "unavailable", "error": str(exc),
@@ -1052,6 +1064,114 @@ class Bridge:
         if result.get("status") == "done":
             self.chat_history = self._trim_history(result.get("history") or [])
         return state.jsonable(self._remember_reply(result))
+
+    @staticmethod
+    def _attachment_task(notes: list[dict[str, Any]]) -> str:
+        """Что сказать модели, когда оператор приложил файлы, но не написал."""
+        names = ", ".join(str(note.get("name") or "") for note in notes
+                          if note.get("name"))
+        return ("Оператор приложил файл(ы) к чату: %s. "
+                "Посмотри их и ответь по делу." % names) if names else \
+            "Оператор приложил файл(ы) к чату. Посмотри их и ответь по делу."
+
+    @staticmethod
+    def _read_attachments(attachments: list[dict[str, Any]]
+                          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Файлы оператора → блоки контекста модели + список для видимой реплики.
+
+        Возвращает `(blocks, notes)`:
+        - `blocks` — что уходит вендору (текст документа / картинка);
+        - `notes` — что видит владелец в переписке (имя, вид, размер).
+        """
+        blocks: list[dict[str, Any]] = []
+        notes: list[dict[str, Any]] = []
+        for item in attachments:
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+            name = str(item.get("name") or Path(path).name)
+            read = files_mod.read_for_context(path)
+            kind = str(read.get("kind") or "")
+            size = int(read.get("size") or 0)
+            # Файл запоминаем: нейросеть сможет перечитать именно его и не
+            # сможет залезть в чужие файлы на диске.
+            files_mod.register_attached(path, name=name, kind=kind, size=size)
+            notes.append({"name": name, "kind": kind, "size": size,
+                          "ok": bool(read.get("ok")), "path": path})
+            if not read.get("ok"):
+                blocks.append({"type": "text",
+                               "text": "Файл «%s» не прочитан: %s"
+                                       % (name, read.get("error")
+                                          or "неизвестная причина")})
+                continue
+            if kind == "image":
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64",
+                               "media_type": str(read.get("media_type")
+                                                or "image/png"),
+                               "data": str(read.get("image") or "")},
+                })
+                continue
+            warnings = [str(item) for item in (read.get("warnings") or [])]
+            header = "Файл «%s» (%s, %s):" % (name, kind,
+                                             files_mod.human_size(size))
+            tail = ("\n[предупреждения при чтении: %s]" % "; ".join(warnings)
+                    if warnings else "")
+            blocks.append({"type": "text",
+                           "text": "%s\n%s%s" % (header, read.get("text") or "",
+                                                 tail)})
+        return blocks, notes
+
+    def cmd_files_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Прочитать файл, приложенный оператором (инструмент нейросети).
+
+        ⚠️ Только то, что оператор приложил к чату: произвольные файлы с
+        диска нейросеть не читает (иначе она могла бы утянуть в переписку
+        ключи — D-038).
+        """
+        path = str(args.get("path") or "").strip()
+        if not path:
+            return {"ok": False, "error": "путь к файлу не указан"}
+        if not files_mod.is_attached(path) and not self._attached_before(path):
+            return {"ok": False, "path": path,
+                    "error": "этот файл оператор не прикладывал — читать "
+                             "произвольные файлы с диска нейросети нельзя"}
+        out = dict(files_mod.read_for_context(path))
+        if out.get("image"):
+            # ⚠️ Картинка уже в контексте хода: в ответе инструмента её
+            # повторять не надо (это мегабайты base64 в переписке).
+            out["image"] = ""
+            out["warnings"] = list(out.get("warnings") or []) + [
+                "картинка уже в контексте хода — полные данные не повторяются"]
+        return state.jsonable(out)
+
+    @staticmethod
+    def _attached_before(path: str) -> bool:
+        """Прикладывал ли оператор этот файл раньше (по видимой истории).
+
+        ⚠️ Реестр приложенных файлов живёт в памяти моста и после перезапуска
+        программы пуст. Но в видимой переписке вложения остались — значит,
+        файл оператор приложил, и модель может его перечитать.
+        """
+        try:
+            target = str(Path(path).expanduser().resolve())
+        except OSError:
+            target = str(path)
+        for message in chat_store.load():
+            for item in message.get("attachments") or []:
+                if not isinstance(item, dict):
+                    continue
+                value = str(item.get("path") or "")
+                if not value:
+                    continue
+                try:
+                    same = str(Path(value).expanduser().resolve()) == target
+                except OSError:
+                    same = value == str(path)
+                if same:
+                    return True
+        return False
 
     def _remember_reply(self, result: dict[str, Any]) -> dict[str, Any]:
         """Ответ модели — в видимую историю (на диске) и в ответ окну.
