@@ -544,6 +544,22 @@ td.actions {
   word-break: break-all;
 }
 
+/* Вызовы инструментов свёрнуты: «Что сделано: N действий», детали — по клику */
+.calls > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Аргументы и результат вызова — целиком, без обрезки */
+.call pre {
+  margin: 4px 0 0;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+}
+
 .chat-input input {
   flex: 1;
 }
