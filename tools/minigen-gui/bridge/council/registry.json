@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "title": "Совет специалистов «МиниГена»",
+  "roles": [
+    {
+      "slug": "super-programmer",
+      "title": "Супер-программист",
+      "kind": "advisor",
+      "brief": "roles/super-programmer.md",
+      "tools": ["code.read", "code.search", "journal.read"],
+      "mandatory_when": "задача меняет код программы, мост или окно — или задевает архитектуру слоёв и правила программы"
+    },
+    {
+      "slug": "designer",
+      "title": "Дизайнер",
+      "kind": "advisor",
+      "brief": "roles/designer.md",
+      "tools": ["code.read", "code.search", "journal.read"],
+      "mandatory_when": "задача меняет внешний вид окна: вёрстку, цвета, отступы, вкладки, стили"
+    },
+    {
+      "slug": "ux",
+      "title": "UX/антропогенез",
+      "kind": "advisor",
+      "brief": "roles/ux.md",
+      "tools": ["code.read", "code.search", "journal.read"],
+      "mandatory_when": "задача меняет порядок действий владельца в окне, добавляет действие, подтверждение или состояние"
+    },
+    {
+      "slug": "coder",
+      "title": "Специалист по написанию кода",
+      "kind": "executor",
+      "brief": "roles/coder.md",
+      "tools": ["code.read", "code.search", "code.diff"],
+      "mandatory_when": "нужен конкретный код: какой файл и место меняются и как именно выглядит правка"
+    },
+    {
+      "slug": "reviewer",
+      "title": "Специалист по проверке кода",
+      "kind": "executor",
+      "brief": "roles/reviewer.md",
+      "tools": ["code.read", "code.search", "code.diff", "code.tests"],
+      "mandatory_when": "правка уже есть или будет: что запустить, что должно быть зелёным и где риск поломки"
+    },
+    {
+      "slug": "presenter",
+      "title": "Специалист по презентациям",
+      "kind": "executor",
+      "brief": "roles/presenter.md",
+      "tools": ["code.read", "code.search", "present.save"],
+      "mandatory_when": "работа сделана и владельцу нужен итог: что сделано, где, что осталось за ним"
+    }
+  ]
+}

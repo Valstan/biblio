@@ -273,6 +273,37 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
         </p>
       </div>
 
+      <div className="card">
+        <h3>Совет специалистов</h3>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={form.councilEnabled}
+            onChange={(e) => setForm({ ...form, councilEnabled: e.target.checked })}
+          />
+          Новое задание сначала обсуждает совет, потом решается
+        </label>
+        <div className="grid2">
+          <label>
+            Сколько ролей отвечают на задачу
+            <input
+              type="number"
+              min={1}
+              max={6}
+              value={form.councilMaxRoles}
+              onChange={(e) =>
+                setForm({ ...form, councilMaxRoles: Number(e.target.value) })
+              }
+            />
+          </label>
+        </div>
+        <p className="muted small">
+          Каждый голос совета — это вызов модели: совет дорог и медленен, поэтому
+          ролей по умолчанию немного. Решение совета не пересиливает прямую
+          просьбу владельца — при конфликте приоритет у владельца.
+        </p>
+      </div>
+
       {snapshot && (
         <div className="card">
           <h3>Пути</h3>
