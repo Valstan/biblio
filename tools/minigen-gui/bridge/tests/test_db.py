@@ -50,9 +50,14 @@ class DbBase(unittest.TestCase):
         self.db = self.root / "minigen.db"
         self._old_db = state.DB_FILE
         state.DB_FILE = self.db
+        # Старая база — тоже временная: проверка не должна открывать файл
+        # настоящей программы на машине владельца.
+        self._old_legacy = prompts.LEGACY_DB
+        prompts.LEGACY_DB = self.root / "prompts.db"
 
     def tearDown(self) -> None:
         state.DB_FILE = self._old_db
+        prompts.LEGACY_DB = self._old_legacy
         self.tmp.cleanup()
 
     def put(self, kind: str, key: str, payload: dict) -> None:
@@ -452,6 +457,28 @@ class LegacyStoreTest(DbBase):
         self.assertTrue(legacy.is_file())
         self.assertEqual(legacy.read_bytes(), before)
 
+    def test_migration_repeats_if_the_legacy_file_changed(self) -> None:
+        """Старый файл изменился (вернулись к старой программе) — перенос повторяется."""
+        legacy = self._legacy_db()
+        first = prompts.migrate_legacy_store(legacy, self.db)
+        self.assertEqual(first["migrated"], 3)
+
+        con = sqlite3.connect(str(legacy))
+        try:
+            con.execute(
+                "insert into records (id, project, title, body, kind, archived,"
+                " created_at) values (?,?,?,?,?,?,?)",
+                ("a3", "MiniGen", "Новый", "текст", "prompt", 0, 1700000001000))
+            con.commit()
+        finally:
+            con.close()
+
+        second = prompts.migrate_legacy_store(legacy, self.db)
+        self.assertEqual(second["migrated"], 1)
+        store = prompts.LocalPromptStore(self.db)
+        titles = sorted(item["title"] for item in store.list_prompts("MiniGen"))
+        self.assertEqual(titles, ["Новый", "План: шаги", "Промт"])
+
     def test_prompt_store_reads_the_universal_base(self) -> None:
         """Хранилище промтов читает универсальную базу."""
         store = prompts.LocalPromptStore(self.db)
@@ -466,6 +493,31 @@ class LegacyStoreTest(DbBase):
             self.assertIsNotNone(db.get_record(con, "prompt", res["id"]))
         finally:
             con.close()
+
+    def test_store_constructor_does_not_touch_the_disk(self) -> None:
+        """Хранилище, собранное «просто так», диска не трогает.
+
+        ⚠️ Живой случай 26.11: проверка собрала хранилище с настоящим путём
+        — и перенос старой базы прошёл на машине владельца. Конструктор
+        ничего не должен делать: перенос зовёт мост при старте программы.
+        """
+        target = self.root / "не_существует.db"
+        prompts.LocalPromptStore(target)
+        self.assertFalse(target.exists())
+
+    def test_migration_is_not_run_by_the_store(self) -> None:
+        """Перенос — отдельное действие, а не побочный эффект сборки."""
+        legacy = self._legacy_db()
+        store = prompts.LocalPromptStore(self.db)
+        self.assertTrue(legacy.is_file())
+        self.assertFalse(prompts.migration_state(self.db)["migrated"])
+        # а после явного переноса — отметка на месте
+        prompts.migrate_legacy_store(legacy, self.db)
+        state_of = prompts.migration_state(self.db)
+        self.assertTrue(state_of["migrated"])
+        self.assertEqual(state_of["count"], 3)
+        titles = sorted(item["title"] for item in store.list_prompts("MiniGen"))
+        self.assertEqual(titles, ["План: шаги", "Промт"])
 
     def test_prompts_survive_an_export_and_import(self) -> None:
         """Промты уезжают в файл выгрузки и возвращаются в другой базе."""

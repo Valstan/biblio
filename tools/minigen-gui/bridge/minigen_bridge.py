@@ -204,8 +204,32 @@ class Bridge:
         self._prompt_stop = threading.Event()
         self._prompt_thread: threading.Thread | None = None
         self.handlers = self._build_handlers()
+        self.migrate_legacy_prompts()
         self.start_daemon_supervision()
         self.start_prompt_dispatch()
+
+    def migrate_legacy_prompts(self) -> None:
+        """Перенести старую базу хранилища промтов в универсальную базу.
+
+        ⚠️ Перенос — **одноразовый** (отметка в `schema_meta`), а старый файл
+        остаётся на месте запасной копией. Делается тут, при старте программы:
+        хранилище само по себе диском не трогает — иначе любая проверка,
+        собрав его, задела бы настоящую базу на машине владельца.
+        """
+        try:
+            res = prompts_mod.migrate_legacy_store()
+        except Exception as exc:  # noqa: BLE001 — перенос не роняет программу
+            try:
+                self.core.log("БАЗА: перенос из старой базы не прошёл: %s" % exc)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if res.get("migrated"):
+            try:
+                self.core.log("БАЗА: перенесено записей из старой базы: %d"
+                              % int(res["migrated"]))
+            except Exception:  # noqa: BLE001
+                pass
 
     def start_prompt_dispatch(self) -> None:
         """Раздавать промты рабочим областям без живого оператора.

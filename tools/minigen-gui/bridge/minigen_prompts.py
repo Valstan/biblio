@@ -96,14 +96,20 @@ def now_ms() -> int:
 
 
 def iso_stamp(value: Any) -> str:
-    """Метка времени — строкой ISO (так же, как у внешнего ресурса)."""
+    """Метка времени — строкой ISO (так же, как у внешнего ресурса).
+
+    ⚠️ С **миллисекундами**: записи сортируются по этой метке, и без них два
+    промта, сохранённые в одну секунду, вставали в случайном порядке (план
+    мог обогнать промт, с которым он идёт в паре — живой случай 26.11).
+    """
     try:
         ms = int(value or 0)
     except (TypeError, ValueError):
         return str(value or "")
     if ms <= 0:
         return ""
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ms / 1000.0))
+    stamp = time.gmtime(ms / 1000.0)
+    return "%s.%03dZ" % (time.strftime("%Y-%m-%dT%H:%M:%S", stamp), ms % 1000)
 
 
 # ───────────────────────────────────────────────────────────── вид записи
@@ -273,8 +279,9 @@ def migrate_legacy_store(legacy_path: Path | None = None,
     (`prompt`, `plan`, `prompt-mark`, `prompt-dispatch`) — и потому её можно
     выгрузить в один файл и залить в другую копию «МиниГена» (промт #92).
 
-    Перенос **одноразовый** (помечаем в `schema_meta`) и **не трогает** старый
-    файл: тот остаётся запасной копией.
+    Перенос **безопасен и повторяем**: он идёт при каждом старте программы, но
+    переносит только то, чего в новой базе ещё нет. Старый файл при этом **не
+    трогается** — он остаётся запасной копией.
     """
     source = Path(legacy_path or LEGACY_DB)
     target = Path(universal_path or LOCAL_DB)
@@ -296,11 +303,6 @@ def migrate_legacy_store(legacy_path: Path | None = None,
                 "why": "новая база не открылась: %s" % exc}
     try:
         marker = "legacy_prompts_migrated"
-        row = con.execute("select value from schema_meta where key=?",
-                          (marker,)).fetchone()
-        if row:
-            out["why"] = "старая база уже перенесена"
-            return out
         try:
             old = legacy_connect(source)
         except sqlite3.Error as exc:
@@ -309,6 +311,7 @@ def migrate_legacy_store(legacy_path: Path | None = None,
         try:
             tables = _legacy_tables(old)
             moved = 0
+            total = 0
             if "records" in tables:
                 for row in old.execute(
                         "select id, project, title, body, kind, archived,"
@@ -316,6 +319,12 @@ def migrate_legacy_store(legacy_path: Path | None = None,
                     kind = str(row["kind"] or KIND_PROMPT)
                     if kind not in (KIND_PROMPT, KIND_PLAN):
                         kind = KIND_PROMPT
+                    ident = str(row["id"])
+                    total += 1
+                    # уже есть в новой базе — не переносим (перенос идёт при
+                    # каждом старте и должен быть безопасным)
+                    if minigen_db.get_record(con, kind, ident) is not None:
+                        continue
                     payload = {
                         "project": str(row["project"] or ""),
                         "title": str(row["title"] or ""),
@@ -324,15 +333,18 @@ def migrate_legacy_store(legacy_path: Path | None = None,
                         "kind": kind,
                         "createdAt": iso_stamp(row["created_at"]),
                     }
-                    minigen_db.put_record(con, kind, str(row["id"]), payload,
+                    minigen_db.put_record(con, kind, ident, payload,
                                           created_at=payload["createdAt"])
                     moved += 1
             if "marks" in tables:
                 for row in old.execute(
                         "select source, project, id, auto, at from marks").fetchall():
+                    ident = _mark_key(row["source"], row["project"], row["id"])
+                    total += 1
+                    if minigen_db.get_record(con, KIND_MARK, ident) is not None:
+                        continue
                     minigen_db.put_record(
-                        con, KIND_MARK,
-                        _mark_key(row["source"], row["project"], row["id"]),
+                        con, KIND_MARK, ident,
                         {"auto": bool(row["auto"]), "at": int(row["at"] or 0),
                          "source": str(row["source"] or ""),
                          "project": str(row["project"] or ""),
@@ -342,9 +354,12 @@ def migrate_legacy_store(legacy_path: Path | None = None,
                 for row in old.execute(
                         "select source, project, id, area, at"
                         " from dispatched").fetchall():
+                    ident = _mark_key(row["source"], row["project"], row["id"])
+                    total += 1
+                    if minigen_db.get_record(con, KIND_DISPATCH, ident) is not None:
+                        continue
                     minigen_db.put_record(
-                        con, KIND_DISPATCH,
-                        _mark_key(row["source"], row["project"], row["id"]),
+                        con, KIND_DISPATCH, ident,
                         {"area": str(row["area"] or ""), "at": int(row["at"] or 0),
                          "source": str(row["source"] or ""),
                          "project": str(row["project"] or ""),
@@ -354,14 +369,46 @@ def migrate_legacy_store(legacy_path: Path | None = None,
             old.close()
         con.execute("insert into schema_meta(key,value) values(?,?)"
                     " on conflict(key) do update set value=excluded.value",
-                    (marker, minigen_db.now_iso()))
+                    (marker, "%s|%d" % (minigen_db.now_iso(), total)))
         con.commit()
         out["migrated"] = moved
-        out["why"] = "перенесено записей из старой базы: %d" % moved
+        out["total"] = total
+        out["why"] = ("перенесено записей из старой базы: %d (в старой базе: %d)"
+                      % (moved, total))
     except sqlite3.Error as exc:
         return {"ok": False, "migrated": 0, "why": "перенос не прошёл: %s" % exc}
     finally:
         con.close()
+    return out
+
+
+def migration_state(db_path: Path | None = None) -> dict[str, Any]:
+    """Состояние переноса из старой базы — по отметке в `schema_meta`.
+
+    Отметка хранит время переноса и число перенесённых записей.
+    """
+    out: dict[str, Any] = {"migrated": False, "at": "", "count": 0}
+    try:
+        con = minigen_db.connect(Path(db_path) if db_path else LOCAL_DB)
+    except sqlite3.Error:
+        return out
+    try:
+        row = con.execute("select value from schema_meta where key=?",
+                          ("legacy_prompts_migrated",)).fetchone()
+    except sqlite3.Error:
+        return out
+    finally:
+        con.close()
+    if not row:
+        return out
+    raw = str(row["value"] or "")
+    parts = raw.split("|")
+    out["migrated"] = True
+    out["at"] = parts[0] if parts else ""
+    try:
+        out["count"] = int(parts[1]) if len(parts) > 1 else 0
+    except (TypeError, ValueError):
+        out["count"] = 0
     return out
 
 
@@ -381,16 +428,11 @@ class LocalPromptStore:
         self.db_path = Path(db_path or LOCAL_DB)
         self.legacy_path = Path(LEGACY_DB)
         self._legacy_cache: list[dict[str, Any]] | None = None
-        self.migration: dict[str, Any] = {"ok": True, "migrated": 0, "why": ""}
-        # Перенос из старой базы — **только в настоящей базе программы**:
-        # подменённый путь (тесты, чужой каталог) чужую базу не трогает.
-        if self._is_program_db():
-            try:
-                self.migration = migrate_legacy_store(self.legacy_path,
-                                                      self.db_path)
-            except Exception as exc:  # noqa: BLE001 — перенос не роняет программу
-                self.migration = {"ok": False, "migrated": 0,
-                                  "why": "перенос не прошёл: %s" % exc}
+        # ⚠️ Конструктор **ничего не делает с диском**: ни базу не открывает,
+        # ни старую не трогает. Перенос из старой базы — отдельное действие
+        # (`migrate_legacy_store`), его зовёт мост при старте программы.
+        # Иначе любой, кто собрал хранилище (даже проверка в тестах), задел бы
+        # настоящую базу на машине владельца.
 
     def _is_program_db(self) -> bool:
         """Это настоящая база программы (а не подменённый путь)?"""
@@ -403,11 +445,16 @@ class LocalPromptStore:
         return str(self.db_path)
 
     def _legacy_records(self) -> list[dict[str, Any]]:
-        """Записи из старой базы — запасной путь, если перенос не прошёл."""
+        """Записи из старой базы — запасной путь, если перенос не прошёл.
+
+        ⚠️ Старая база — **собственность программы**: её читает только
+        настоящая база программы. Подменённый путь (проверка, чужой каталог)
+        чужой файл не открывает.
+        """
         if self._legacy_cache is not None:
             return self._legacy_cache
         out: list[dict[str, Any]] = []
-        if self.legacy_path.is_file():
+        if self._is_program_db() and self.legacy_path.is_file():
             try:
                 old = legacy_connect(self.legacy_path)
             except sqlite3.Error:
@@ -443,7 +490,7 @@ class LocalPromptStore:
         con = connect(self.db_path)
         try:
             rows = con.execute(
-                "select key, payload, created_at from records"
+                "select id, key, payload, created_at from records"
                 " where kind in (?,?) and deleted_at is null",
                 (KIND_PROMPT, KIND_PLAN)).fetchall()
         finally:
@@ -463,14 +510,18 @@ class LocalPromptStore:
                 "archived": bool(payload.get("archived")),
                 "createdAt": str(payload.get("createdAt")
                                  or iso_stamp(row["created_at"])),
+                # порядок вставки — чтобы сортировка была **однозначной**, даже
+                # когда две записи сохранились в одну миллисекунду
+                "_order": int(row["id"] or 0),
             })
         for item in self._legacy_records():
             if item["id"] in seen:
                 continue
             seen.add(item["id"])
+            item["_order"] = 0
             out.append(item)
         out.sort(key=lambda item: (str(item.get("createdAt") or ""),
-                                    str(item.get("id") or "")), reverse=True)
+                                    int(item.get("_order") or 0)), reverse=True)
         return out
 
     def sections(self) -> list[str]:
@@ -542,9 +593,10 @@ class LocalPromptStore:
         out = {"ok": True,
                "reason": "в базе «МиниГена» живых промтов: %d" % count,
                "sections": self.sections()}
-        if self.migration.get("migrated"):
+        state_of_migration = migration_state(self.db_path)
+        if state_of_migration.get("migrated") and state_of_migration.get("count"):
             out["reason"] += " (перенесено из старой базы: %d)" % int(
-                self.migration["migrated"])
+                state_of_migration["count"])
         return out
 
 
