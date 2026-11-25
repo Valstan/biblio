@@ -105,6 +105,10 @@ export interface Settings {
   modelApplyToAreas: boolean
   confirmDangerous: boolean
   statsWindow: number
+  /** где лежат промты: в базе «МиниГена» или на внешнем ресурсе */
+  promptStore: 'local' | 'karman'
+  /** раздавать ли промты рабочим областям без живого оператора */
+  promptAutoDispatch: boolean
 }
 
 export interface ToolCall {
@@ -400,4 +404,54 @@ export interface KarmanChannel {
   ok: boolean
   sections: string[]
   reason: string
+}
+
+/**
+ * «Хранилище промтов» (заказ владельца 24.11): где лежат промты и планы —
+ * в базе «МиниГена» или на внешнем ресурсе (Карман со своим хранилищем).
+ */
+export type PromptStoreKind = 'local' | 'karman'
+
+/** Запись хранилища: промт или план (план идёт рядом с промтом). */
+export interface PromptRecord {
+  id: string
+  project: string
+  title: string
+  body: string
+  kind: 'prompt' | 'plan'
+  archived: boolean
+  createdAt: string
+  source: PromptStoreKind
+  /** владелец пометил промт как «раздавать автоматически» */
+  auto?: boolean
+}
+
+/** Место хранения — что окно показывает сверху вкладки. */
+export interface PromptStoreInfo {
+  kind: PromptStoreKind
+  /** «в базе МиниГена» / «на внешнем ресурсе» */
+  label: string
+  /** адрес внешнего ресурса (пусто у локальной базы) */
+  location: string
+  ok: boolean
+  reason: string
+  sections: string[]
+}
+
+/** Область, которой можно отдать промт (раздел промта = проект области). */
+export interface PromptTarget {
+  slug: string
+  title: string
+  section: string
+  /** в области уже есть живая сессия */
+  busy: boolean
+}
+
+/** Снимок хранилища (ответ моста `prompts.list`). */
+export interface PromptsSnapshot {
+  store: PromptStoreInfo
+  prompts: PromptRecord[]
+  targets: PromptTarget[]
+  /** автораздача без живого оператора включена ли */
+  auto_dispatch: boolean
 }

@@ -243,6 +243,36 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
         </label>
       </div>
 
+      <div className="card">
+        <h3>Хранилище промтов</h3>
+        <div className="grid2">
+          <label>
+            Где хранить промты
+            <select
+              value={form.promptStore}
+              onChange={(e) =>
+                setForm({ ...form, promptStore: e.target.value as Settings['promptStore'] })
+              }
+            >
+              <option value="local">В базе «МиниГена»</option>
+              <option value="karman">На внешнем ресурсе (Карман)</option>
+            </select>
+          </label>
+        </div>
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={form.promptAutoDispatch}
+            onChange={(e) => setForm({ ...form, promptAutoDispatch: e.target.checked })}
+          />
+          Раздавать промты рабочим областям без живого оператора
+        </label>
+        <p className="muted small">
+          Автораздача идёт только для промтов, помеченных владельцем как «авто»,
+          и только в область своего проекта: раздел промта — это проект области.
+        </p>
+      </div>
+
       {snapshot && (
         <div className="card">
           <h3>Пути</h3>

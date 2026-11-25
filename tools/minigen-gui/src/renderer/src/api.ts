@@ -10,6 +10,7 @@ import type {
   ModelCatalog,
   NetworkState,
   ProgramVersion,
+  PromptsSnapshot,
   Settings,
   Snapshot,
   Stats,
@@ -107,7 +108,18 @@ export const api = {
     if (result?.error) throw new Error(result.error)
     return result
   },
-  karmanStatus: () => call<KarmanChannel>('karman.status')
+  karmanStatus: () => call<KarmanChannel>('karman.status'),
+  // ── «Хранилище промтов» (вкладка «Промты», 25.11) ────────────────────────
+  promptsList: (project?: string) =>
+    call<PromptsSnapshot>('prompts.list', project ? { project } : {}),
+  promptsSave: (payload: { project: string; title: string; body: string }) =>
+    call<{ ok: boolean; error?: string; id?: string }>('prompts.save', payload),
+  promptsArchive: (payload: { id: string; project?: string }) =>
+    call<{ ok: boolean; error?: string }>('prompts.archive', payload),
+  promptsMark: (payload: { id: string; project?: string; auto: boolean }) =>
+    call<{ ok: boolean; error?: string }>('prompts.mark', payload),
+  promptsDispatch: (payload: { id: string; project?: string; area: string }) =>
+    call<{ ok: boolean; error?: string; why?: string }>('prompts.dispatch', payload)
 }
 
 /** Действия окна (не моста): перезапуск, метка сборки, состояние моста. */
