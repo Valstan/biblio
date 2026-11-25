@@ -281,6 +281,7 @@ class Bridge:
             "agents.state": self.cmd_agents_state,
             "agents.create": self.cmd_agents_create,
             "agents.apply": self.cmd_agents_apply,
+            "agents.registry_restore": self.cmd_agents_registry_restore,
             # заявки: зачитка владельца → заявка для другой нейросети (24.11)
             "ingest.draft": self.cmd_ingest_draft,
             "ingest.save": self.cmd_ingest_save,
@@ -1002,6 +1003,22 @@ class Bridge:
                 again = agents_mod.install_skills(area_slug, Path(result["repo_path"]))
                 result["skills_installed"] = again.get("installed") or []
         return result
+
+    def cmd_agents_registry_restore(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Вернуть локальный клон реестра к состоянию GitHub.
+
+        ⚠️ Локальные правки клона при этом теряются — поэтому действие
+        опасное (спрашивает подтверждения). Источник правды — реестр на
+        GitHub: локальная копия, разошедшаяся с ним, показывает не то
+        (живой случай 24.11: манифест агента «Идеи» обрезался — окно
+        показало агента без названия и области).
+        """
+        restored = agents_mod.restore_registry()
+        if restored.get("error"):
+            return restored
+        state = agents_mod.agent_state()
+        restored["agents"] = state.get("agents") or []
+        return restored
 
     # ──────────────────────────────────────────────────────────── заявки
     def _known_projects(self) -> list[dict[str, Any]]:

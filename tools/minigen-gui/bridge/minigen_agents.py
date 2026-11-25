@@ -176,6 +176,84 @@ def ensure_registry(create: bool = True) -> dict[str, Any]:
     return {"ok": True, "path": str(target), "repo": slug, "created": True}
 
 
+# ──────────────────────────────────────────────── состояние локального клона
+
+def registry_state() -> dict[str, Any]:
+    """Состояние локального клона реестра: есть ли он и совпадает ли с GitHub.
+
+    Реестр — **источник правды** (он на GitHub). Локальный клон — рабочая
+    копия: если в ней правки, она разошлась с источником, и программа
+    показывает не то (живой случай 24.11: тест моста обрезал манифест
+    агента «Идеи» — окно показало агента без названия и области).
+
+    Ничего не меняем — только честно говорим, что разошлось.
+    """
+    target = registry_dir()
+    out: dict[str, Any] = {
+        "registry": registry_slug(),
+        "path": str(target),
+        "cloned": (target / ".git").is_dir(),
+        "dirty": False,
+        "files": [],
+        "why": "",
+    }
+    if not out["cloned"]:
+        out["why"] = "реестр не склонирован на этой машине"
+        return out
+    # Список расхождений — двумя командами, а не `status --porcelain`:
+    # у того обрезается пробел в первой строке, и путь читается неверно.
+    names: list[str] = []
+    for args in (["diff", "--name-only", "HEAD"],
+                 ["ls-files", "--others", "--exclude-standard"]):
+        result = _git(args, target)
+        if not result.get("ok"):
+            continue
+        for line in str(result.get("out") or "").splitlines():
+            name = line.strip()
+            if name:
+                names.append(name)
+    files = sorted(set(names))
+    out["files"] = files
+    out["dirty"] = bool(files)
+    if files:
+        out["why"] = ("локальная копия реестра отличается от GitHub: %s"
+                      % ", ".join(files[:5]))
+    return out
+
+
+def restore_registry() -> dict[str, Any]:
+    """Вернуть локальный клон реестра к состоянию GitHub (источник правды).
+
+    ⚠️ Локальные правки клона при этом **теряются** — поэтому действие
+    опасное и спрашивает подтверждения.
+
+    Сначала ветка с GitHub (`origin/master`), потом рабочее дерево
+    возвращается к ней. История не переписывается: `git restore` меняет
+    только файлы, а не коммиты.
+    """
+    before = registry_state()
+    if not before.get("cloned"):
+        return {"ok": False, "error": "реестр не склонирован на этой машине"}
+    target = registry_dir()
+    _git(["fetch", "origin", "master"], target)
+    restored = _git(["restore", "--source=origin/master", "--worktree", "--",
+                     "."], target)
+    if not restored.get("ok"):
+        # ветки `origin/master` может не быть (реестр только что создан) —
+        # тогда возвращаем рабочее дерево к текущему HEAD
+        restored = _git(["restore", "--source=HEAD", "--worktree", "--", "."], target)
+    if not restored.get("ok"):
+        return {"ok": False, "error": restored.get("err") or "реестр не восстановлен"}
+    # Ветку тоже подтягиваем вперёд (fast-forward): копия должна совпадать с
+    # GitHub не только файлами, но и историей.
+    _git(["merge", "--ff-only", "origin/master"], target)
+    after = registry_state()
+    return {"ok": not after.get("dirty"), "before": before.get("files") or [],
+            "after": after.get("files") or [], "path": str(target),
+            "error": "" if not after.get("dirty")
+                     else ("остались правки: %s" % ", ".join(after.get("files") or []))}
+
+
 # ──────────────────────────────────────────────────────────── манифест
 
 def agent_dir(slug: str) -> Path:
@@ -772,6 +850,7 @@ def agent_state() -> dict[str, Any]:
         "registry": registry_slug(),
         "registry_path": str(registry_dir()),
         "registry_cloned": (registry_dir() / ".git").is_dir(),
+        "registry_state": registry_state(),
         "workspace": str(workspace_home()),
         "agents": list_agents(),
         "templates": templates,

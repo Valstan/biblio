@@ -161,6 +161,13 @@ def main() -> int:
     karman = load_bridge_module("minigen_karman")
     repos = load_bridge_module("minigen_repos")
 
+    # Контрольный снимок **живого** реестра: приёмка не должна его трогать
+    # (живой случай 24.11 — манифест агента «Идеи» обрезался до двух строк).
+    live_manifest = (agents.REGISTRY_HOME
+                     / agents.DEFAULT_REGISTRY.split("/")[-1]
+                     / "agents" / "ideas" / "agent.yaml")
+    live_before = live_manifest.read_bytes() if live_manifest.is_file() else None
+
     print("2) шаблоны агента на месте (конституция и скилл)")
     templates = BRIDGE / "agent-templates"
     check((templates / "default" / "AGENTS.md").is_file(),
@@ -222,12 +229,16 @@ def main() -> int:
         return {"ok": True, "pr": "1"}
 
     agents.publish_pr = fake_publish_pr  # type: ignore[assignment]
-    agents.write_manifest("ideas", {"slug": "ideas", "title": "Идеи",
-                                    "repo": "Valstan/ideas", "area": "p-ideas"})
+    # ⚠️ Подмена пути — **до** записи манифеста. Иначе манифест уходит в
+    # живой реестр программы и обрезает его (живой случай 24.11: у агента
+    # «Идеи» остались только `slug` и `repo` — окно показывало агента без
+    # названия и области).
     old_dir = agents.registry_dir
     old_home = agents.workspace_home
     agents.registry_dir = lambda: registry
     agents.workspace_home = lambda: workspace
+    agents.write_manifest("ideas", {"slug": "ideas", "title": "Идеи",
+                                    "repo": "Valstan/ideas", "area": "p-ideas"})
     try:
         saved = agents.save_request("ideas", "sarafan", "2026-11-24-sarafan.md", text)
         check(saved.get("ok"), "заявка не сохранилась: %s" % saved)
@@ -377,6 +388,11 @@ def main() -> int:
         if name in by_name:
             check(not by_name[name]["dangerous"],
                   "инструмент %s помечен опасным зря" % name)
+
+    print("11) живой реестр агентов не тронут")
+    live_after = live_manifest.read_bytes() if live_manifest.is_file() else None
+    check(live_after == live_before,
+          "приёмка тронула живой реестр агентов (%s)" % live_manifest)
 
     if failures:
         print("❌ приёмка экосистемы агентов: FAIL (%d)" % len(failures))
