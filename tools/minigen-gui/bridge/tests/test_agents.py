@@ -185,11 +185,14 @@ class RequestTest(unittest.TestCase):
         agents.publish_pr = fake_publish_pr  # type: ignore[assignment]
         self.registry = root / "registry"
         self.registry.mkdir(parents=True, exist_ok=True)
-        agents.write_manifest("ideas", {"slug": "ideas", "repo": "Valstan/ideas"})
+        # ⚠️ Подмена пути — **до** записи манифеста. Иначе манифест уходит в
+        # живой реестр программы и обрезает его (живой случай 24.11: агент
+        # «Идеи» остался без названия и области).
         self._old_dir = agents.registry_dir
         self._old_home = agents.workspace_home
         agents.registry_dir = lambda: self.registry     # type: ignore[assignment]
         agents.workspace_home = lambda: self.workspace  # type: ignore[assignment]
+        agents.write_manifest("ideas", {"slug": "ideas", "repo": "Valstan/ideas"})
 
     def tearDown(self) -> None:
         agents.publish_pr = self._old_pr   # type: ignore[assignment]
@@ -270,6 +273,96 @@ class ReposReadTest(unittest.TestCase):
         profile = repos.profile("project")
         self.assertEqual(profile.get("readme"), "README.md")
         self.assertIn("Проект", profile.get("readme_head", ""))
+
+
+class RegistryStateTest(unittest.TestCase):
+    """Локальная копия реестра: совпадает ли с GitHub и как её вернуть.
+
+    Реестр — источник правды, и его локальная копия иногда расходится с ним
+    (живой случай 24.11: манифест агента «Идеи» обрезался — окно показало
+    агента без названия и области). Программа должна это **заметить** и
+    уметь вернуть копию к источнику.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.registry = Path(self.tmp.name) / "minigen-agents"
+        (self.registry / "agents" / "ideas").mkdir(parents=True)
+        _git(["init"], self.registry)
+        _git(["config", "user.email", "test@example.com"], self.registry)
+        _git(["config", "user.name", "Test"], self.registry)
+        (self.registry / "agents" / "ideas" / "agent.yaml").write_text(
+            "slug: ideas\ntitle: Идеи\n", encoding="utf-8")
+        _git(["add", "-A"], self.registry)
+        _git(["commit", "-m", "манифест"], self.registry)
+        self._old = agents.registry_dir
+        agents.registry_dir = lambda: self.registry  # type: ignore[assignment]
+
+    def tearDown(self) -> None:
+        agents.registry_dir = self._old   # type: ignore[assignment]
+        self.tmp.cleanup()
+
+    @property
+    def manifest(self) -> Path:
+        return self.registry / "agents" / "ideas" / "agent.yaml"
+
+    def test_clean_registry_is_not_dirty(self) -> None:
+        state = agents.registry_state()
+        self.assertTrue(state["cloned"])
+        self.assertFalse(state["dirty"], state)
+        self.assertEqual(state["files"], [])
+
+    def test_changed_manifest_is_seen(self) -> None:
+        self.manifest.write_text("slug: ideas\n", encoding="utf-8")
+        state = agents.registry_state()
+        self.assertTrue(state["dirty"], state)
+        self.assertIn("agents/ideas/agent.yaml", state["files"])
+        self.assertIn("отличается", state["why"])
+
+    def test_restore_returns_the_registry_to_the_source(self) -> None:
+        self.manifest.write_text("slug: ideas\n", encoding="utf-8")
+        restored = agents.restore_registry()
+        self.assertTrue(restored.get("ok"), restored)
+        self.assertIn("title: Идеи", self.manifest.read_text(encoding="utf-8"))
+        self.assertFalse(agents.registry_state()["dirty"])
+
+    def test_restore_without_a_clone_is_an_error(self) -> None:
+        agents.registry_dir = lambda: Path(self.tmp.name) / "нет-такого"  # type: ignore[assignment]
+        restored = agents.restore_registry()
+        self.assertFalse(restored.get("ok"))
+        self.assertIn("не склонирован", str(restored.get("error")))
+
+
+class LiveRegistryGuardTest(unittest.TestCase):
+    """Живой реестр агентов тесты не трогают (живой случай 24.11).
+
+    Тест, который пишет манифест в настоящий реестр, ломает программу
+    владельца: манифест агента «Идеи» обрезался до двух строк (`slug` и
+    `repo`), и окно показывало агента без названия и области, а
+    восстановление агента на другой машине поехало бы не по тому
+    манифесту. Страховка — временный реестр на весь сеанс тестов
+    (`bridge/tests/__init__.py`).
+    """
+
+    def test_registry_is_temporary(self) -> None:
+        live = agents.REGISTRY_HOME / agents.DEFAULT_REGISTRY.split("/")[-1]
+        current = Path(agents.registry_dir())
+        self.assertNotEqual(current, live, "тесты работают с живым реестром")
+        self.assertIn(str(Path(tempfile.gettempdir())), str(current))
+
+    def test_workspace_is_temporary(self) -> None:
+        live = agents.DEFAULT_WORKSPACE
+        current = Path(agents.workspace_home())
+        self.assertNotEqual(current, live, "тесты работают с живым рабочим местом")
+        self.assertIn(str(Path(tempfile.gettempdir())), str(current))
+
+    def test_writing_a_manifest_does_not_touch_the_live_registry(self) -> None:
+        live = agents.REGISTRY_HOME / agents.DEFAULT_REGISTRY.split("/")[-1]
+        manifest = live / "agents" / "ideas" / "agent.yaml"
+        before = manifest.read_bytes() if manifest.is_file() else None
+        agents.write_manifest("ideas", {"slug": "ideas", "title": "Проверка"})
+        after = manifest.read_bytes() if manifest.is_file() else None
+        self.assertEqual(before, after, "тест тронул живой реестр агентов")
 
 
 class BridgeCommandTest(unittest.TestCase):
