@@ -6,7 +6,10 @@
 Проверяем то, что может навредить:
 
 - **обновление не затирает чужую работу**: незакоммиченные правки в
-  исходниках ⇒ обновление останавливается и говорит почему;
+  исходниках ⇒ обновление останавливается и говорит почему; а *новые*
+  файлы (которых обновление не трогает) — не повод останавливаться
+  (живой случай 25.11: служебные файлы агента блокировали кнопку
+  «Обновить программу»);
 - **версии сравниваются честно**: что стоит на диске, что есть в
   репозитории, сколько коммитов новых;
 - **исходники берутся правильные**: тот репозиторий, который записан в
@@ -134,6 +137,42 @@ class UpdateTest(unittest.TestCase):
         self.assertFalse(last.get("ok"))
         self.assertIn("незакоммиченные", last.get("why", ""))
         self.assertTrue(any(step["status"] == "error" for step in steps))
+
+    def test_update_ignores_untracked_files(self) -> None:
+        """Новые незакоммиченные файлы ⇒ обновление НЕ останавливается.
+
+        Живой случай 25.11: в корне исходников лежали служебные файлы агента
+        (тела PR и тексты коммитов). `git status --porcelain` показывает их как
+        `??`, и обновление из окна останавливалось с «в исходниках есть
+        незакоммиченные правки» — владелец не мог обновить программу одной
+        кнопкой из-за файлов, которых обновление не трогает.
+        """
+        seen: list[list[str]] = []
+
+        def fake_git(args, cwd, timeout=120):
+            if args and args[0] == "status":
+                seen.append(list(args))
+                # Так ведёт себя настоящий git: с `--untracked-files=no` новых
+                # файлов в ответе нет, без флага — есть.
+                if "--untracked-files=no" in args:
+                    return 0, "", ""
+                return 0, "?? .pr-body.md", ""
+            if args[:3] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+                return 0, "master", ""
+            if args and args[0] == "remote":
+                return 0, "origin", ""
+            return 0, "aaaaaaa", ""
+
+        update._git = fake_git
+        update._stream = lambda args, cwd, step: 0
+        update._run()
+        self.assertTrue(seen, "обновление не спросило состояние исходников")
+        self.assertIn("--untracked-files=no", seen[0])
+        with update._lock:
+            last = dict(update._last)
+        # Чужие новые файлы — не повод останавливаться: дальше обновление
+        # упирается в отсутствие node_modules (тестовый репозиторий).
+        self.assertNotIn("незакоммиченные", last.get("why", ""))
 
     def test_update_stops_without_node_modules(self) -> None:
         def fake_git(args, cwd, timeout=120):
