@@ -194,6 +194,17 @@ class ChatFilesTest(unittest.TestCase):
         # реплика владельца всё равно в переписке
         self.assertEqual(store.load()[0]["role"], "user")
 
+    def test_the_error_message_names_the_full_path(self) -> None:
+        """Приёмка #6: сообщение о поломке — с полным путём файла."""
+        folder = self.root / "папка"
+        folder.mkdir()
+        path = folder / "битый.xlsx"
+        path.write_bytes(b"PK\x03\x04" + "не архив".encode("utf-8"))
+        self.bridge.cmd_chat_send({"text": "посмотри",
+                                   "attachments": [{"path": str(path)}]})
+        block = self.bridge.agent.blocks[0]
+        self.assertIn(str(path), block["text"])
+
     def test_a_file_without_a_word_still_makes_a_task(self) -> None:
         path = self._write("заметка.txt", "текст".encode("utf-8"))
         self.bridge.cmd_chat_send({"text": "",

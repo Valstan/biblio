@@ -231,6 +231,32 @@ class FilesTest(unittest.TestCase):
         self.assertIn("Товар", out["text"])
         self.assertTrue(any("содержимому" in w for w in out["warnings"]))
 
+    # ── формат по содержимому ──────────────────────────────────────────
+    def test_text_without_extension_is_read(self) -> None:
+        """Файл без расширения (`README`, `Makefile`) — обычное дело."""
+        path = self._write("README", "Текст без расширения".encode("utf-8"))
+        out = files.read_for_context(str(path))
+        self.assertTrue(out["ok"], out.get("error"))
+        self.assertEqual(out["kind"], "text")
+        self.assertIn("Текст без расширения", out["text"])
+
+    def test_binary_without_extension_is_refused(self) -> None:
+        """Мусор без расширения — честный отказ, а не текст из мусора."""
+        path = self._write("blob", b"\x00\x01\x02\x03\xff\xfe")
+        out = files.read_for_context(str(path))
+        self.assertFalse(out["ok"])
+        self.assertIn("не поддерживается", out["error"])
+
+    def test_image_with_a_wrong_extension_stays_an_image(self) -> None:
+        """Картинка, переименованная в `.txt`, должна уйти картинкой."""
+        path = self._write("переименованная.txt", PNG)
+        out = files.read_for_context(str(path))
+        self.assertTrue(out["ok"], out.get("error"))
+        self.assertEqual(out["kind"], "image")
+        self.assertEqual(out["media_type"], "image/png")
+        self.assertEqual(base64.b64decode(out["image"]), PNG)
+        self.assertEqual(out["text"], "", "картинка — не текст")
+
     # ── честные ошибки ──────────────────────────────────────────────────
     def test_missing_file_is_an_honest_error(self) -> None:
         out = files.read_for_context(str(self.root / "нет.txt"))
@@ -274,6 +300,65 @@ class FilesTest(unittest.TestCase):
         self.assertTrue(out["ok"], out.get("error"))
         self.assertEqual(len(out["text"]), files.MAX_TEXT_CHARS)
         self.assertTrue(any("обрезан" in w for w in out["warnings"]))
+
+    def test_zip_bomb_is_refused_instead_of_hanging(self) -> None:
+        """200 КБ архива, раздувающегося в сотни мегабайт, — честный отказ.
+
+        ⚠️ Живой случай (26.11): без потолка на распакованный объём чтение
+        вешало мост на минуты.
+        """
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("xl/worksheets/sheet1.xml",
+                             "x" * (files.MAX_UNPACKED_BYTES + 1024))
+            archive.writestr("xl/sharedStrings.xml", "<sst/>")
+        path = self._write("бомба.xlsx", buffer.getvalue())
+        out = files.read_for_context(str(path))
+        self.assertFalse(out["ok"])
+        self.assertIn("больше", out["error"])
+        self.assertEqual(out["text"], "")
+
+    def test_pdf_bomb_is_refused_instead_of_hanging(self) -> None:
+        """PDF-поток, раздувающийся в сотни мегабайт, — честный отказ."""
+        body = zlib.compress(b"(" + b"A" * (files.MAX_UNPACKED_BYTES + 1024) + b")")
+        pdf = (b"%PDF-1.4\n1 0 obj\n<< /Length " + str(len(body)).encode("ascii")
+               + b" /Filter /FlateDecode >>\nstream\n" + body
+               + b"\nendstream\nendobj\ntrailer\n<< /Root 1 0 R >>\n%%EOF\n")
+        path = self._write("бомба.pdf", pdf)
+        out = files.read_for_context(str(path))
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["text"], "")
+
+    def test_reading_time_is_capped(self) -> None:
+        """Потолок времени: файл сложнее — честный отказ, а не зависание."""
+        path = self._write("сложный.rtf", RTF_BYTES)
+        saved = getattr(files._LOCAL, "budget", None)
+        # Лимит отрицательный — истёк всегда: так проверка не зависит от
+        # разрешения часов (`monotonic` на Windows грубый).
+        files._LOCAL.budget = files._Budget(-1.0)
+        try:
+            with self.assertRaises(files.FileError) as caught:
+                files._read_rtf(path.read_bytes())
+            self.assertIn("секунд", str(caught.exception))
+        finally:
+            files._LOCAL.budget = saved
+
+    def test_rows_limit_covers_the_whole_book(self) -> None:
+        """Потолок строк — на всю книгу, а не на каждый лист."""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for index in range(1, 6):
+                rows = "".join(
+                    '<row r="%d"><c r="A%d" t="inlineStr"><is><t>v</t></is></c></row>'
+                    % (number, number) for number in range(1, 1001)
+                )
+                archive.writestr(
+                    "xl/worksheets/sheet%d.xml" % index,
+                    "<worksheet><sheetData>%s</sheetData></worksheet>" % rows)
+        path = self._write("много.xlsx", buffer.getvalue())
+        out = files.read_for_context(str(path))
+        self.assertTrue(out["ok"], out.get("error"))
+        self.assertLessEqual(out["text"].count("\n"), files.MAX_ROWS + 10)
 
     # ── ничего не пишется ───────────────────────────────────────────────
     def test_nothing_is_written_to_the_folder(self) -> None:

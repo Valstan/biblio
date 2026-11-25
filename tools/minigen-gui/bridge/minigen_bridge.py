@@ -1108,8 +1108,11 @@ class Bridge:
             notes.append({"name": name, "kind": kind, "size": size,
                           "ok": bool(read.get("ok")), "path": path})
             if not read.get("ok"):
-                message = ("Файл «%s» не прочитан: %s"
-                           % (name, read.get("error") or "неизвестная причина"))
+                # ⚠️ С **полным путём**: оператор должен видеть, какой именно
+                # файл не прочитан (приёмка #6 промта #90).
+                message = ("Файл «%s» не прочитан: %s\nПуть: %s"
+                           % (name, read.get("error") or "неизвестная причина",
+                              path))
                 blocks.append({"type": "text", "text": message})
                 council_lines.append(message)
                 continue

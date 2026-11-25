@@ -23,7 +23,9 @@ XML, XLS, DOC и так далее, все самые популярные фо�
 | семейство | что происходит |
 |---|---|
 | текст (txt, md, csv, json, xml, код и прочие) | как есть, с потолком длины |
+| текст без расширения (`README`, `Makefile`) | определяется по содержимому — и читается |
 | картинки (png, jpg, gif, bmp, webp) | **блок изображения** (base64), а не текст |
+| картинка с чужим расширением (`.txt`) | определяется по содержимому — и всё равно картинка |
 | xlsx / xlsm | zip + разбор XML: разделители и общие строки |
 | docx / docm | zip + `word/document.xml`: абзацы |
 | pptx / pptm | zip + слайды: строки |
@@ -35,6 +37,13 @@ XML, XLS, DOC и так далее, все самые популярные фо�
 ⚠️ Старые `.doc`/`.xls` читаются «как получится»: если разбор не идёт — честное
 сообщение с подсказкой (сохранить в `.docx`/`.xlsx`), а не мусор в контексте
 модели.
+
+⚠️ **Потолки обязательны** (живая проба 26.11): без них файл-«бомба» — 200 КБ
+на диске, раздувающийся в сотни мегабайт, — вешал чтение дольше 10 минут.
+Поэтому у чтения есть потолки: размер файла, размер картинки, длина текста,
+число строк (**на всю книгу**), **распакованный** объём (zip и PDF) и
+**время** чтения. Превышение ⇒ честное сообщение оператору **с полным путём**,
+а не зависание и не молчание.
 """
 
 from __future__ import annotations
@@ -42,6 +51,8 @@ from __future__ import annotations
 import base64
 import io
 import re
+import threading
+import time
 import zipfile
 import zlib
 from pathlib import Path
@@ -85,10 +96,54 @@ MAX_TEXT_CHARS = 200_000
 MAX_ROWS = 5_000
 #: Потолок символов, извлечённых из одного документа.
 MAX_DOC_CHARS = 200_000
+#: Потолок **распакованного** объёма (байт): zip-архив и PDF-поток могут
+#: раздуться в сотни раз (200 КБ на диске → сотни мегабайт в памяти). Без
+#: этого потолка чтение «бомбы» вешает мост на минуты.
+MAX_UNPACKED_BYTES = 50 * 1024 * 1024
+#: Потолок времени чтения одного файла (секунд).
+MAX_READ_SECONDS = 20
 
 
 class FileError(Exception):
     """Файл не прочитан — сообщение оператору честное, с путём."""
+
+
+# ─────────────────────────────────────────────── потолок времени чтения
+#
+# Чтение «бомбы» (zip или PDF, который раздувается в сотни раз) занимает
+# минуты и вешает мост. Поэтому у чтения есть **время**: истекло — честное
+# сообщение оператору, а не зависание. Счётчик живёт в потоке: чтения бывают
+# параллельными.
+
+class _Budget:
+    """Потолок времени чтения одного файла."""
+
+    def __init__(self, seconds: float = MAX_READ_SECONDS) -> None:
+        self.limit = float(seconds)
+        self.started = time.monotonic()
+
+    @property
+    def expired(self) -> bool:
+        return (time.monotonic() - self.started) > self.limit
+
+
+_LOCAL = threading.local()
+
+
+def _budget() -> _Budget:
+    """Потолок времени текущего чтения (для потока)."""
+    current = getattr(_LOCAL, "budget", None)
+    if current is None:
+        current = _Budget()
+        _LOCAL.budget = current
+    return current
+
+
+def _check_time() -> None:
+    """Истёкло ли время чтения — тогда честно останавливаемся."""
+    if _budget().expired:
+        raise FileError("чтение заняло больше %d секунд — файл слишком сложный"
+                        % int(MAX_READ_SECONDS))
 
 
 # ─────────────────────────────────────── приложенные оператором файлы
@@ -152,6 +207,74 @@ def classify(path: str) -> tuple[str, str]:
     return "unknown", ""
 
 
+def image_media_by_content(head: bytes) -> str:
+    """Тип содержимого картинки по её первым байтам ('' — это не картинка).
+
+    ⚠️ Расширение может врать: картинка, переименованная в `.txt`, должна
+    уйти модели **картинкой**, а не текстом-мусором.
+    """
+    if head.startswith(b"\x89PNG"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"GIF8"):
+        return "image/gif"
+    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
+        return "image/webp"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    return ""
+
+
+def looks_like_text(data: bytes) -> bool:
+    """Похоже ли содержимое на текст (а не на мусор).
+
+    Текст без расширения (`README`, `Makefile`, `.gitignore`) — обычное дело:
+    оператор прислал файл, а модель должна его прочитать, а не отказать.
+    """
+    if not data:
+        return False
+    head = data[:4096]
+    if b"\x00" in head:
+        return False                      # текст с нулями — это не текст
+    try:
+        head.decode("utf-8")
+        return True
+    except UnicodeDecodeError:
+        pass
+    try:
+        head.decode("cp1251")
+        return True
+    except UnicodeDecodeError:
+        return False
+
+
+def _kind_by_content(target: Path) -> tuple[str, str]:
+    """Формат без расширения — по первым байтам."""
+    try:
+        head = target.read_bytes()[:16]
+    except OSError:
+        return "unknown", ""
+    media = image_media_by_content(head)
+    if media:
+        return "image", media
+    if head.startswith(b"%PDF"):
+        return "document", ""
+    if head.startswith(b"PK\x03\x04"):
+        return "document", ""
+    if head.startswith(b"{\\rtf"):
+        return "document", ""
+    if head.startswith(b"\xd0\xcf\x11\xe0"):
+        return "document", ""
+    try:
+        sample = target.read_bytes()[:4096]
+    except OSError:
+        return "unknown", ""
+    if looks_like_text(sample):
+        return "text", ""
+    return "unknown", ""
+
+
 def human_size(size: int) -> str:
     """Размер по-человечески: «12 КБ», «3 МБ»."""
     value = float(size)
@@ -208,9 +331,6 @@ def read_for_context(path: str) -> dict[str, Any]:
         return result
     result["size"] = size
     kind, media = classify(raw_path)
-    if kind == "unknown":
-        kind, media = _kind_by_content(target)
-        result["kind"] = kind
     result["kind"] = kind
     result["media_type"] = media
     if kind == "image":
@@ -227,6 +347,23 @@ def read_for_context(path: str) -> dict[str, Any]:
         result["ok"] = True
         return result
     if kind == "unknown":
+        kind, media = _kind_by_content(target)
+        result["kind"] = kind
+        result["media_type"] = media
+        if kind == "image":
+            if size > MAX_IMAGE_BYTES:
+                result["error"] = ("картинка больше %s — вендор такие не принимает"
+                                   % human_size(MAX_IMAGE_BYTES))
+                return result
+            try:
+                data = target.read_bytes()
+            except OSError as exc:
+                result["error"] = "не читается: %s" % exc
+                return result
+            result["image"] = base64.b64encode(data).decode("ascii")
+            result["ok"] = True
+            return result
+    if kind == "unknown":
         result["error"] = ("формат не поддерживается: %s"
                            % (Path(raw_path).suffix or "без расширения"))
         return result
@@ -239,9 +376,28 @@ def read_for_context(path: str) -> dict[str, Any]:
     except OSError as exc:
         result["error"] = "не читается: %s" % exc
         return result
+    # Потолок времени чтения: «бомба» (zip или PDF, раздувающийся в сотни
+    # раз) иначе вешает мост на минуты.
+    _LOCAL.budget = _Budget()
     try:
         if kind == "text":
+            # ⚠️ Содержимое важнее расширения: картинка, переименованная в
+            # `.txt`, должна уйти модели **картинкой**, а не текстом-мусором.
+            image_media = image_media_by_content(data[:16])
             magic = _magic_document(data)
+            if image_media:
+                result["kind"] = "image"
+                result["media_type"] = image_media
+                if size > MAX_IMAGE_BYTES:
+                    result["error"] = ("картинка больше %s — вендор такие "
+                                       "не принимает"
+                                       % human_size(MAX_IMAGE_BYTES))
+                    return result
+                result["image"] = base64.b64encode(data).decode("ascii")
+                result["warnings"] = ["формат определён по содержимому, "
+                                      "а не по расширению"]
+                result["ok"] = True
+                return result
             if magic:
                 text, warnings = _read_document(data, magic)
                 warnings.append("формат определён по содержимому, а не по расширению")
@@ -255,45 +411,16 @@ def read_for_context(path: str) -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001 — читаемость не должна ронять чат
         result["error"] = "не разобрался: %s" % exc
         return result
-    if len(text) > MAX_TEXT_CHARS:
-        text = text[:MAX_TEXT_CHARS]
-        warnings.append("файл обрезан: показаны первые %s символов"
-                        % MAX_TEXT_CHARS)
+    finally:
+        _LOCAL.budget = None
+    limit = MAX_DOC_CHARS if kind == "document" else MAX_TEXT_CHARS
+    if len(text) > limit:
+        text = text[:limit]
+        warnings.append("файл обрезан: показаны первые %s символов" % limit)
     result["text"] = text
     result["warnings"] = warnings
     result["ok"] = True
     return result
-
-
-def _kind_by_content(target: Path) -> tuple[str, str]:
-    """Формат без расширения — по первым байтам."""
-    try:
-        head = target.read_bytes()[:16]
-    except OSError:
-        return "unknown", ""
-    if head.startswith(b"\x89PNG"):
-        return "image", "image/png"
-    if head.startswith(b"\xff\xd8\xff"):
-        return "image", "image/jpeg"
-    if head.startswith(b"GIF8"):
-        return "image", "image/gif"
-    if head.startswith(b"RIFF") and head[8:12] == b"WEBP":
-        return "image", "image/webp"
-    if head.startswith(b"BM"):
-        return "image", "image/bmp"
-    if head.startswith(b"%PDF"):
-        return "document", ""
-    if head.startswith(b"PK\x03\x04"):
-        return "document", ""
-    if head.startswith(b"{\\rtf"):
-        return "document", ""
-    if head.startswith(b"\xd0\xcf\x11\xe0"):
-        return "document", ""
-    try:
-        target.read_bytes()[:4096].decode("utf-8")
-    except (OSError, UnicodeDecodeError):
-        return "unknown", ""
-    return "unknown", ""
 
 
 def _magic_document(data: bytes) -> str:
@@ -400,6 +527,28 @@ def _read_zip_document(data: bytes) -> tuple[str, list[str]]:
                     "документ, презентация)")
 
 
+def _zip_open(data: bytes) -> zipfile.ZipFile:
+    """Открыть zip-архив с потолком на распакованный объём.
+
+    ⚠️ «Бомба» — 200 КБ архива, который распаковывается в сотни мегабайт:
+    без потолка чтение вешает мост на минуты (живая проба 26.11: PDF-бомба
+    читалась дольше 10 минут). Потолок считаем по **объявленным** размерам
+    членов архива — распаковывать их до проверки нельзя.
+    """
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(data))
+    except (zipfile.BadZipFile, OSError) as exc:
+        raise FileError("архив не открывается: %s" % exc)
+    total = 0
+    for info in archive.infolist():
+        total += int(info.file_size)
+        if total > MAX_UNPACKED_BYTES:
+            archive.close()
+            raise FileError("в архиве больше %s данных — читать не буду"
+                            % human_size(MAX_UNPACKED_BYTES))
+    return archive
+
+
 def _local(tag: str) -> str:
     """Имя элемента без пространства имён: `{ns}row` → `row`."""
     return tag.rsplit("}", 1)[-1]
@@ -409,7 +558,7 @@ def _read_xlsx(data: bytes) -> tuple[str, list[str]]:
     """Книга Excel: строки таблицы через разделитель табуляцией."""
     import xml.etree.ElementTree as ET
 
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+    with _zip_open(data) as archive:
         names = archive.namelist()
         shared: list[str] = []
         if "xl/sharedStrings.xml" in names:
@@ -425,6 +574,7 @@ def _read_xlsx(data: bytes) -> tuple[str, list[str]]:
             raise FileError("в книге нет листов")
         lines: list[str] = []
         for name in sheets:
+            _check_time()
             root = ET.fromstring(archive.read(name))
             lines.append("--- %s ---" % name.rsplit("/", 1)[-1])
             for row in root.iter():
@@ -456,6 +606,10 @@ def _read_xlsx(data: bytes) -> tuple[str, list[str]]:
                 if len(lines) >= MAX_ROWS:
                     lines.append("… таблица обрезана на %d строках" % MAX_ROWS)
                     break
+            if len(lines) >= MAX_ROWS:
+                # Потолок строк — на **всю книгу**, а не на каждый лист: иначе
+                # книга из 100 листов по 5000 строк дала бы полмиллиона строк.
+                break
     return "\n".join(lines), []
 
 
@@ -463,7 +617,7 @@ def _read_docx(data: bytes) -> tuple[str, list[str]]:
     """Документ Word: абзацы."""
     import xml.etree.ElementTree as ET
 
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+    with _zip_open(data) as archive:
         if "word/document.xml" not in archive.namelist():
             raise FileError("в документе нет текста")
         root = ET.fromstring(archive.read("word/document.xml"))
@@ -471,6 +625,7 @@ def _read_docx(data: bytes) -> tuple[str, list[str]]:
     for node in root.iter():
         if _local(node.tag) != "p":
             continue
+        _check_time()
         parts: list[str] = []
         for item in node.iter():
             name = _local(item.tag)
@@ -488,13 +643,14 @@ def _read_pptx(data: bytes) -> tuple[str, list[str]]:
     """Презентация: строки слайдов."""
     import xml.etree.ElementTree as ET
 
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+    with _zip_open(data) as archive:
         slides = sorted(name for name in archive.namelist()
                         if re.fullmatch(r"ppt/slides/slide\d+\.xml", name))
         if not slides:
             raise FileError("в презентации нет слайдов")
         lines: list[str] = []
         for name in slides:
+            _check_time()
             root = ET.fromstring(archive.read(name))
             lines.append("--- %s ---" % name.rsplit("/", 1)[-1])
             for node in root.iter():
@@ -511,13 +667,14 @@ def _read_odf(data: bytes) -> tuple[str, list[str]]:
     """Документ ODF (odt/ods/odp): абзацы."""
     import xml.etree.ElementTree as ET
 
-    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+    with _zip_open(data) as archive:
         if "content.xml" not in archive.namelist():
             raise FileError("в документе нет содержимого")
         root = ET.fromstring(archive.read("content.xml"))
     lines: list[str] = []
     for node in root.iter():
         if _local(node.tag) in ("p", "h"):
+            _check_time()
             text = "".join(node.itertext())
             if text.strip():
                 lines.append(text)
@@ -549,6 +706,7 @@ def _read_rtf(data: bytes) -> tuple[str, list[str]]:
     length = len(text)
     skip = 1                     # сколько знаков пропускать после \\u
     while position < length:
+        _check_time()
         char = text[position]
         if char == "\\":
             control = _RTF_CONTROL.match(text, position)
@@ -610,9 +768,16 @@ def _read_pdf(data: bytes) -> tuple[str, list[str]]:
 
 
 def _pdf_streams(data: bytes) -> list[bytes]:
-    """Потоки содержимого PDF: пробуем распаковать (FlateDecode)."""
+    """Потоки содержимого PDF: пробуем распаковать (FlateDecode).
+
+    ⚠️ Потолок на **распакованный** объём: PDF-бомба (200 КБ на диске →
+    сотни мегабайт в памяти) без потолка читалась дольше 10 минут и вешала
+    мост (живая проба 26.11). Распаковываем по частям и следим за объёмом.
+    """
     out: list[bytes] = []
+    unpacked = 0
     for match in re.finditer(rb"stream\r?\n", data):
+        _check_time()
         start = match.end()
         end = data.find(b"endstream", start)
         if end == -1:
@@ -621,17 +786,43 @@ def _pdf_streams(data: bytes) -> list[bytes]:
         if not blob:
             continue
         try:
-            out.append(zlib.decompress(blob))
-            continue
+            chunk = _inflate_limited(blob)
+        except FileError:
+            raise
         except zlib.error:
-            pass
-        try:
-            out.append(zlib.decompressobj().decompress(blob))
-            continue
-        except zlib.error:
-            pass
-        out.append(blob)
+            chunk = None
+        if chunk is None:
+            chunk = blob
+        unpacked += len(chunk)
+        if unpacked > MAX_UNPACKED_BYTES:
+            raise FileError("в PDF больше %s данных — читать не буду"
+                            % human_size(MAX_UNPACKED_BYTES))
+        out.append(chunk)
     return out
+
+
+def _inflate_limited(blob: bytes) -> bytes:
+    """Распаковать поток, но не больше потолка (иначе — честный отказ)."""
+    decompressor = zlib.decompressobj()
+    out = bytearray()
+    step = 256 * 1024
+    try:
+        pending = blob
+        while pending:
+            _check_time()
+            piece = decompressor.decompress(pending, step)
+            out += piece
+            if len(out) > MAX_UNPACKED_BYTES:
+                raise FileError("поток PDF раздувается больше %s — читать не буду"
+                                % human_size(MAX_UNPACKED_BYTES))
+            pending = decompressor.unconsumed_tail
+            if not pending:
+                break
+    except zlib.error:
+        if out:
+            return bytes(out)
+        return None
+    return bytes(out)
 
 
 def _pdf_decode_string(raw: bytes) -> str:
@@ -701,6 +892,7 @@ def _ole_streams(data: bytes) -> dict[str, bytes]:
     """Потоки составного файла (OLE2): имя → содержимое."""
     if not data.startswith(_OLE_MAGIC) or len(data) < 512:
         return {}
+    _check_time()
     try:
         sector_shift = int.from_bytes(data[0x1E:0x20], "little")
         mini_shift = int.from_bytes(data[0x20:0x22], "little")
