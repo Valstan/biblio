@@ -111,10 +111,15 @@ def main() -> int:
           "в ветке нет отката на ротацию")
     check('state.setdefault("reset", {})' in branch, "нет отметки времени сброса")
 
-    print("4) порог по умолчанию — половина окна (рантайм сожмёт контекст вовремя)")
+    print("4) порог компактизации — постоянные 0.9 (решение владельца 24.11)")
     check(0 < float(getattr(watcher, "COMPACTION_TRIGGER", 0)) <= 1,
           "порог компактизации вне разумного диапазона: %s"
           % getattr(watcher, "COMPACTION_TRIGGER", None))
+    check(float(getattr(watcher, "COMPACTION_TRIGGER", 0)) == 0.9,
+          "порог компактизации не 0.9, а %s — решение владельца 24.11"
+          % getattr(watcher, "COMPACTION_TRIGGER", None))
+    check("COMPACTION_TRIGGER = 0.9" in src,
+          "в коде сторожа порог не равен 0.9")
 
     if failures:
         print("❌ приёмка сброса на месте: FAIL (%d)" % len(failures))
