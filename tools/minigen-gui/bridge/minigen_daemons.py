@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import threading
 import time
@@ -51,6 +52,12 @@ DAEMONS = (
 RESPAWN_EVERY = 60          # как часто проверять, что демоны живы
 GRACE = 20                  # пауза перед подъёмом: демон мог подняться сам
 START_TIMEOUT = 20          # сколько ждём появления процесса
+
+#: Запрос WMI: процессы Python с их командными строками.
+#: Формат строки — «pid <TAB> командная строка»; разбор — в `daemon_pids`.
+PS_PROCESS_TABLE = (
+    "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+    "ForEach-Object { \"{0}`t{1}\" -f $_.ProcessId, $_.CommandLine }")
 
 
 def _bin() -> Path:
@@ -72,6 +79,23 @@ def _ps(cmd: str, timeout: int = 30) -> str:
         return ""
 
 
+def is_daemon_command(command_line: str, script: str) -> bool:
+    """Командная строка — это запуск демона (без аргументов)?
+
+    ⚠️ Правило программы: «демон» — процесс, чья командная строка
+    **ЗАКАНЧИВАЕТСЯ** именем скрипта. Разовые вызовы (`--send`, `--list`,
+    `--new`) идут с аргументами и демоном не являются.
+
+    Почему это важно: иначе «демон жив» — правда, пока его нет, а
+    «поднять демона» отвечает «уже работает» и не поднимает ничего
+    (демоны молчат, а окно показывает «демоны 3/3»).
+    """
+    if not command_line or not script:
+        return False
+    return bool(re.search(re.escape(script) + r"\"?\s*$",
+                          command_line.strip(), re.IGNORECASE))
+
+
 def daemon_pids(spec: dict[str, str]) -> list[int]:
     """PID'ы процессов демона (по имени скрипта в командной строке).
 
@@ -79,15 +103,26 @@ def daemon_pids(spec: dict[str, str]) -> list[int]:
     запускается без аргументов, а разовые вызовы (`--send`, `--list`) идут
     с аргументами и не должны считаться «живым демоном» — иначе «демон жив»
     окажется правдой, пока самого демона нет.
+
+    ⚠️ Живой случай 25.11: условие было только в словах — в запросе WMI
+    стояло «командная строка СОДЕРЖИТ имя скрипта» (`-like '*скрипт.py'`),
+    и разовый вызов (`--list`, `--send`) считался живым демоном. Теперь
+    список процессов с их командными строками разбираем сами и отбираем
+    те, у которых имя скрипта — В КОНЦЕ строки.
     """
-    out = _ps(
-        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*%s' } | ForEach-Object { $_.ProcessId }"
-        % spec["script"])
-    pids = []
-    for token in out.split():
-        if token.strip().isdigit():
-            pids.append(int(token.strip()))
+    out = _ps(PS_PROCESS_TABLE)
+    pids: list[int] = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_text, _, command_line = line.partition("\t")
+        pid_text = pid_text.strip()
+        if not pid_text.isdigit():
+            continue
+        if not is_daemon_command(command_line, spec.get("script") or ""):
+            continue
+        pids.append(int(pid_text))
     return pids
 
 

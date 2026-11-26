@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -67,14 +68,47 @@ class DaemonMatchingTest(unittest.TestCase):
             self.assertTrue(item["alive"])
 
     def test_pids_pattern_ignores_arguments(self) -> None:
-        """Разовая команда с аргументом — не демон."""
-        import re
-        pattern = re.compile(r"(minimax-(?:netwatch|sessionwatch|autheal)\.py)\s*$")
+        """Разовая команда с аргументом — не демон (правило программы).
+
+        ⚠️ Прежде здесь был шаблон, составленный в самом тесте: он
+        проверял себя, а не код программы. Теперь проверяем то, что
+        программа решает на самом деле.
+        """
         daemon_line = r"python C:\Users\valstan\bin\minimax-sessionwatch.py"
         one_shot = ('"python.exe" C:\\Users\\valstan\\bin\\minimax-sessionwatch.py '
                     '--send brain mvs_123 "текст"')
-        self.assertTrue(pattern.search(daemon_line))
-        self.assertIsNone(pattern.search(one_shot))
+        self.assertTrue(daemons.is_daemon_command(
+            daemon_line, "minimax-sessionwatch.py"))
+        self.assertFalse(daemons.is_daemon_command(
+            one_shot, "minimax-sessionwatch.py"))
+
+    def test_daemon_pids_skips_one_shot_calls(self) -> None:
+        """Процесс с аргументами — не демон: «демон жив» не должно врать."""
+        original = daemons._ps
+        daemons._ps = lambda cmd, timeout=30: (
+            "4242\tpython C:\\Users\\valstan\\bin\\minimax-sessionwatch.py\r\n"
+            "5150\tpython C:\\Users\\valstan\\bin\\minimax-sessionwatch.py --list\r\n")
+        try:
+            pids = daemons.daemon_pids({"script": "minimax-sessionwatch.py"})
+        finally:
+            daemons._ps = original
+        self.assertEqual(pids, [4242],
+                         "разовый вызов (--list) — не демон")
+
+    @unittest.skipUnless(os.name == "nt", "живая проверка — только на Windows")
+    def test_ps_query_gives_pid_and_command_line(self) -> None:
+        """Запрос процессов отдаёт «pid + командная строка» — иначе отбор не работает."""
+        out = daemons._ps(daemons.PS_PROCESS_TABLE)
+        self.assertTrue(out.strip(), "запрос процессов не ответил")
+        found_python = False
+        for line in out.splitlines():
+            pid_text, tab, command_line = line.partition("\t")
+            self.assertTrue(tab, "нет разделителя в строке: %r" % line)
+            self.assertTrue(pid_text.strip().isdigit(), "не pid: %r" % line)
+            if "python" in command_line.lower():
+                found_python = True
+        self.assertTrue(found_python,
+                        "в списке процессов нет ни одного python.exe")
 
 
 class SupervisorViewTest(unittest.TestCase):
