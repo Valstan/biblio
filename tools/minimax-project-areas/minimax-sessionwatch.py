@@ -1061,11 +1061,13 @@ def git_branch(folder: str) -> str:
     """Ветка в папке (пусто — не git или не папка)."""
     if not folder or not Path(folder).is_dir():
         return ""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         proc = subprocess.run(["git", "-C", folder, "rev-parse",
                                "--abbrev-ref", "HEAD"],
                               capture_output=True, text=True, timeout=10,
-                              encoding="utf-8", errors="replace")
+                              encoding="utf-8", errors="replace",
+                              creationflags=flags)
     except (OSError, subprocess.SubprocessError):
         return ""
     if proc.returncode != 0:

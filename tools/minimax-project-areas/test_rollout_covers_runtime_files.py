@@ -58,9 +58,11 @@ def runtime_files() -> set[str]:
         # `BIN / "minimax-switch.py"`, `core.BIN / "..."`, `ORPHANS = BIN / "..."`,
         # а также PowerShell-скрипты, которые демоны зовут (`BIN / "mcode-....ps1"`)
         found |= set(re.findall(r'BIN\s*/\s*"([^"]+\.(?:py|ps1))"', text))
-        # `import minigen_core as core`
-        if re.search(r"^\s*import\s+minigen_core\b", text, re.M):
-            found.add("minigen_core.py")
+        # `import minigen_core as core` (и любой другой модуль ядра: без него
+        # файл на боевом месте не поднимется — живой случай 26.11:
+        # `minigen_time.py` в проверку не попадал)
+        for name in re.findall(r"^\s*import\s+(minigen_\w+)\b", text, re.M):
+            found.add(name + ".py")
     return found
 
 

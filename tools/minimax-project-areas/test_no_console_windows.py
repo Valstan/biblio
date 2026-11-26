@@ -43,8 +43,11 @@ from pathlib import Path
 HERE = pathlib.Path(__file__).resolve().parent
 
 # Боевые демоны и ядро. `archive/` — не боевой код, `test_*` — тесты.
+# ⚠️ `minigen_passport.py` — тоже боевой файл (26.11, промт #172): паспорт
+# нитки едет на машину вместе с демонами и зовёт `git`/`gh` — значит, окна
+# консоли касается его в первую очередь.
 DAEMON_FILES = ("minimax-netwatch.py", "minimax-switch.py", "minimax-autheal.py",
-                "minimax-sessionwatch.py", "minigen_core.py")
+                "minimax-sessionwatch.py", "minigen_core.py", "minigen_passport.py")
 SPAWN_METHODS = ("run", "Popen", "call", "check_call", "check_output")
 
 

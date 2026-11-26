@@ -189,14 +189,20 @@ def read_handoff(folder: str | Path) -> str:
 # ────────────────────────────────────────────────────────── git и PR
 
 def _git(folder: str | Path, args: list[str], timeout: int = 10) -> str:
-    """`git` в папке — молча и быстро (никогда не роняет сторож)."""
+    """`git` в папке — молча и быстро (никогда не роняет сторож).
+
+    ⚠️ `creationflags` — обязателен: демон идёт без консоли, и дочерний
+    `git` без флага **мигает окном** на экране владельца (приёмка «без
+    мигающих окон»).
+    """
     base = str(folder or "")
     if not base or not Path(base).is_dir():
         return ""
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         proc = subprocess.run(["git", "-C", base] + args, capture_output=True,
                               text=True, timeout=timeout, encoding="utf-8",
-                              errors="replace")
+                              errors="replace", creationflags=flags)
     except (OSError, subprocess.SubprocessError):
         return ""
     if proc.returncode != 0:
@@ -242,11 +248,13 @@ def open_prs(folder: str | Path, branch: str) -> list[str]:
     base = str(folder or "")
     if not base or not Path(base).is_dir():
         return []
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
         proc = subprocess.run(["gh", "pr", "list", "--head", branch, "--state", "open",
                                "--json", "number,title,url", "--limit", "10"],
                               capture_output=True, text=True, timeout=20,
-                              encoding="utf-8", errors="replace", cwd=base)
+                              encoding="utf-8", errors="replace", cwd=base,
+                              creationflags=flags)
     except (OSError, subprocess.SubprocessError):
         return []
     if proc.returncode != 0:
