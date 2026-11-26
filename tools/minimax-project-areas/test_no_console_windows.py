@@ -43,8 +43,11 @@ from pathlib import Path
 HERE = pathlib.Path(__file__).resolve().parent
 
 # Боевые демоны и ядро. `archive/` — не боевой код, `test_*` — тесты.
+# ⚠️ Список — **все** модули, что демоны грузят в рантайме: забытый здесь
+# модуль открывает окна консоли без флага, и приёмка молчит (26.11: паспорт
+# нитки, промт #172, — `git`/`gh` из демона).
 DAEMON_FILES = ("minimax-netwatch.py", "minimax-switch.py", "minimax-autheal.py",
-                "minimax-sessionwatch.py", "minigen_core.py")
+                "minimax-sessionwatch.py", "minigen_core.py", "minigen_thread.py")
 SPAWN_METHODS = ("run", "Popen", "call", "check_call", "check_output")
 
 

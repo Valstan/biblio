@@ -146,13 +146,20 @@ def thread_id_of(repo: str, branch: str) -> str:
 # ─────────────────────────────────────────────────────────────── факты git
 
 def _git(folder: str, *args: str, timeout: int = 20) -> str:
-    """`git` в рабочей папке (пустая строка — git не ответил)."""
+    """`git` в рабочей папке (пустая строка — git не ответил).
+
+    ⚠️ `CREATE_NO_WINDOW` обязателен: демон запущен **отсоединённо** (у него
+    нет консоли), и любой дочерний консольный процесс без флага получает
+    **свою** консоль — на экране мигает окно, которое тут же закрывается
+    (жалоба владельца 23.11, приёмка `test_no_console_windows.py`).
+    """
     if not folder:
         return ""
     try:
         proc = subprocess.run(["git", "-C", str(folder)] + list(args),
                               capture_output=True, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL)
+                              stdin=subprocess.DEVNULL,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         return ""
     if proc.returncode != 0:
@@ -275,7 +282,8 @@ def open_prs(folder: str, branch: str) -> list[dict[str, Any]]:
             ["gh", "pr", "list", "--head", str(branch), "--state", "open",
              "--json", "number,title,url,headRefName,isDraft"],
             capture_output=True, text=True, timeout=25, env=env,
-            stdin=subprocess.DEVNULL, cwd=str(folder))
+            stdin=subprocess.DEVNULL, cwd=str(folder),
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         return []
     if proc.returncode != 0:
