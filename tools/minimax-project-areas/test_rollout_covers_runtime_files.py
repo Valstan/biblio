@@ -35,7 +35,13 @@ DAEMON_SOURCES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatc
 def rollout_files() -> set[str]:
     """Список файлов, которые раскатка везёт на боевое место."""
     text = (HERE / "minigen_rollout.py").read_text(encoding="utf-8-sig")
-    match = re.search(r"^FILES\s*=\s*\((.*?)\)", text, re.S | re.M)
+    # ⚠️ Комментарии убираем **до** разбора: в списке раскатки есть пояснения
+    # со скобками («(UTC+3)», «(D-190, промт #100)»), а разбор по первому `)`
+    # обрезал бы список — и файлы из его конца выпадали бы из проверки молча
+    # (живой случай 26.11: `minigen_time.py` в проверку не попадал).
+    code = "\n".join(line for line in text.splitlines()
+                     if not line.lstrip().startswith("#"))
+    match = re.search(r"^FILES\s*=\s*\((.*?)\)", code, re.S | re.M)
     if not match:
         return set()
     return set(re.findall(r'"([^"]+\.(?:py|ps1))"', match.group(1)))
