@@ -32,7 +32,9 @@
 
 from __future__ import annotations
 
+import copy
 import os
+import re
 import subprocess
 import threading
 import time
@@ -51,6 +53,27 @@ DAEMONS = (
 RESPAWN_EVERY = 60          # как часто проверять, что демоны живы
 GRACE = 20                  # пауза перед подъёмом: демон мог подняться сам
 START_TIMEOUT = 20          # сколько ждём появления процесса
+
+#: Демон опознаётся по командной строке, которая **ЗАКАНЧИВАЕТСЯ** именем
+#: скрипта: демон запускается без аргументов, а разовые вызовы (`--send`,
+#: `--list`, `--status`) идут с аргументами и демоном не являются — иначе
+#: «демон жив» окажется правдой, пока самого демона нет.
+DAEMON_CMD_RE = re.compile(r"(minimax-(?:netwatch|sessionwatch|autheal)\.py)\s*$")
+
+#: Сколько живёт ответ «кто из демонов жив» (сек).
+#:
+#: ⚠️ 26.11 (живой замер на установленной программе): окно спрашивает снимок
+#: состояния каждые 5 с, а снимок стоил **12,6–28,2 с** — из-за трёх вызовов
+#: PowerShell (WMI) по одному на демона. Ответы копились, мост отвечал по
+#: очереди, и окно голодало («мост не ответил»).
+#:
+#: Кэш — **только здесь** (путь отображения). `start`/`stop`/`supervise_loop`
+#: спрашивают процессы напрямую (`daemon_pids`) и должны видеть их СВЕЖИМИ:
+#: устаревший ответ ⇒ «уже работает» ⇒ демон не поднимется, либо наоборот
+#: поднимется второй (урок 22.11: две копии лечащего брали аккаунты дважды).
+STATUS_TTL = 10.0        # ≈ два интервала опроса окна по умолчанию
+
+_STATUS_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
 
 
 def _bin() -> Path:
@@ -72,6 +95,35 @@ def _ps(cmd: str, timeout: int = 30) -> str:
         return ""
 
 
+def daemon_pids_all() -> dict[str, list[int]]:
+    """PID'ы всех демонов — ОДНИМ вызовом PowerShell.
+
+    ⚠️ 26.11: раньше на каждого демона уходил свой вызов
+    (`Get-CimInstance Win32_Process` — 0,7–1,3 с каждый, живой замер), а на
+    один снимок состояния окна — три: **2,8 с**, и под нагрузкой — десятки
+    секунд. Теперь список процессов читается **один раз**, а разбор делает
+    Python.
+
+    ⚠️ Кэша тут нет намеренно: этот ответ решает, поднимать ли второго
+    демона (урок 22.11). Свежесть важнее скорости — скорость обеспечивает
+    кэш в `status()` (см. `STATUS_TTL`).
+    """
+    out = _ps(
+        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
+        "ForEach-Object { \"$($_.ProcessId)|$($_.CommandLine)\" }")
+    found: dict[str, list[int]] = {}
+    for line in (out or "").splitlines():
+        pid_text, _, command = line.partition("|")
+        pid_text = pid_text.strip()
+        if not pid_text.isdigit():
+            continue
+        match = DAEMON_CMD_RE.search(command or "")
+        if not match:
+            continue
+        found.setdefault(match.group(1), []).append(int(pid_text))
+    return found
+
+
 def daemon_pids(spec: dict[str, str]) -> list[int]:
     """PID'ы процессов демона (по имени скрипта в командной строке).
 
@@ -80,15 +132,7 @@ def daemon_pids(spec: dict[str, str]) -> list[int]:
     с аргументами и не должны считаться «живым демоном» — иначе «демон жив»
     окажется правдой, пока самого демона нет.
     """
-    out = _ps(
-        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*%s' } | ForEach-Object { $_.ProcessId }"
-        % spec["script"])
-    pids = []
-    for token in out.split():
-        if token.strip().isdigit():
-            pids.append(int(token.strip()))
-    return pids
+    return list(daemon_pids_all().get(str(spec.get("script") or ""), []))
 
 
 def _supervisor_info() -> dict[str, Any] | None:
@@ -155,6 +199,19 @@ def status() -> dict[str, Any]:
     демонов, поднятых с повышенными правами, не читает (WMI отдаёт пустоту)
     ⇒ окно показывало «демоны 0/3» при живых демонах (живой случай 24.11).
     """
+    now = time.time()
+    cached = _STATUS_CACHE.get("value")
+    if cached is not None and now - float(_STATUS_CACHE.get("at") or 0.0) < STATUS_TTL:
+        # Ответ свежий — отдаём его и не идём в WMI (см. `STATUS_TTL`).
+        return copy.deepcopy(cached)
+    result = _status_fresh()
+    _STATUS_CACHE["at"] = now
+    _STATUS_CACHE["value"] = result
+    return copy.deepcopy(result)
+
+
+def _status_fresh() -> dict[str, Any]:
+    """Статус демонов — без кэша (кэш — в `status()`)."""
     remote = supervisor_view()
     if remote:
         out = dict(remote)
@@ -165,9 +222,10 @@ def status() -> dict[str, Any]:
             supervisor["is_self"] = int(supervisor.get("pid") or 0) == os.getpid()
             out["supervisor"] = supervisor
         return out
+    found = daemon_pids_all()          # ОДИН вызов PowerShell на всех демонов
     out = []
     for spec in DAEMONS:
-        pids = daemon_pids(spec)
+        pids = list(found.get(str(spec.get("script") or ""), []))
         path = script_path(spec)
         out.append({
             "name": spec["name"],
