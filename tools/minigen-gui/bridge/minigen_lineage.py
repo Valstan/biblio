@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -37,6 +38,8 @@ INSTANCE_FILE = LOCAL / "instance.json"
 LEDGER_FILE = LOCAL / "lineage.jsonl"
 
 FAMILY = "minigen"
+#: Корень папок копий в общем репозитории программы.
+COPIES_FOLDER = "copies"
 
 
 def _now_ms() -> int:
@@ -90,6 +93,36 @@ def instance() -> dict[str, Any]:
     record("born", commit=data["fork_of"].get("commit") or "",
            note="копия создана на версии %s" % (data["fork_of"].get("commit") or "?"))
     return data
+
+
+def safe_ident(value: str) -> str:
+    """Идентификатор копии, пригодный для пути (папка, имя файла).
+
+    ⚠️ Идентификатор приходит из заявки (то есть из общего раздела), а он
+    кладётся и в путь (`copies/<идентификатор>/`), и в имя файла ⇒ путь
+    должен быть безопасным: оставляем только буквы, цифры, «-», «_», «.»,
+    а пустое и «..» заменяем отпечатком.
+
+    Здесь, в родословной, — **единственное** место, где этот путь
+    строится: и клон, и токен берут папку отсюда, иначе доказательство
+    привязки токена считалось бы от другой строки.
+    """
+    raw = "".join(ch for ch in str(value or "")
+                  if ch.isalnum() or ch in "-_.").strip()
+    if not raw or raw in (".", "..") or ".." in raw:
+        return "copy-%s" % hashlib.sha256(
+            str(value or "").encode("utf-8")).hexdigest()[:12]
+    return raw
+
+
+def copies_folder(instance_id: str = "") -> str:
+    """Папка копии в общем репозитории программы: `copies/<идентификатор>/`.
+
+    Папка — по родословной: идентификатор копии не выводится из имени
+    машины, наружу уходит только он (D-038).
+    """
+    ident = safe_ident(instance_id or str(instance().get("instance_id") or "copy"))
+    return "%s/%s/" % (COPIES_FOLDER, ident)
 
 
 def record(event: str, **fields: Any) -> None:

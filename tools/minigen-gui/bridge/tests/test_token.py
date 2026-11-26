@@ -33,6 +33,7 @@ if str(BRIDGE_DIR) not in sys.path:
 import minigen_clone as clone_mod   # noqa: E402
 import minigen_karman as karman     # noqa: E402
 import minigen_lineage as lineage   # noqa: E402
+import minigen_state as state       # noqa: E402
 import minigen_token as token_mod   # noqa: E402
 
 
@@ -59,6 +60,7 @@ class _TokenTestCase(unittest.TestCase):
             "karman_call": karman.call,
             "karman_project": karman.ensure_project,
             "karman_publish": karman.publish,
+            "settings": state.SETTINGS_FILE,
         }
         token_mod.TOKEN_FILE = self.token_file
         token_mod.META_FILE = self.meta_file
@@ -66,6 +68,10 @@ class _TokenTestCase(unittest.TestCase):
         token_mod.LOCAL = root
         token_mod.ISSUED_DIR = self.issued_dir
         token_mod._trust_file = lambda: self.trust_file
+        # ⚠️ Настройки программы — живой файл: подменяем на временный, иначе
+        # тест дописал бы путь токена в настройки боевой программы.
+        self.settings_file = root / "settings.json"
+        state.SETTINGS_FILE = self.settings_file
         lineage.instance = lambda: {"instance_id": "mg-11111111", "family": "minigen",
                                     "generation": 2,
                                     "fork_of": {"commit": "abc1234"}}
@@ -82,7 +88,21 @@ class _TokenTestCase(unittest.TestCase):
         karman.call = self._saved["karman_call"]
         karman.ensure_project = self._saved["karman_project"]
         karman.publish = self._saved["karman_publish"]
+        state.SETTINGS_FILE = self._saved["settings"]
         self.tmp.cleanup()
+
+    def settings(self) -> dict:
+        """Настройки программы — как их видит мост."""
+        try:
+            return json.loads(self.settings_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def as_copy(self, instance_id: str) -> None:
+        """Машина притворяется другой копией (своя родословная)."""
+        lineage.instance = lambda: {"instance_id": instance_id, "family": "minigen",
+                                    "generation": 1,
+                                    "fork_of": {"commit": "abc1234"}}
 
     def fake_channel(self, prompts: list[dict]) -> None:
         """Канал КАРМАНА отдаёт заданные промты."""
@@ -186,12 +206,6 @@ class TokenScopeTest(_TokenTestCase):
 class TransferTest(_TokenTestCase):
     """Передача токена от владельца копии — главный путь заказа #130."""
 
-    def as_copy(self, instance_id: str) -> None:
-        """Машина притворяется другой копией (своя родословная)."""
-        lineage.instance = lambda: {"instance_id": instance_id, "family": "minigen",
-                                    "generation": 1,
-                                    "fork_of": {"commit": "abc1234"}}
-
     def test_code_from_issue_is_accepted_by_its_copy(self) -> None:
         issued = token_mod.issue(instance_id="mg-22222222",
                                  folder="copies/mg-22222222/")
@@ -264,6 +278,81 @@ class SafeIdentTest(_TokenTestCase):
         self.assertEqual(record.parent, token_mod.ISSUED_DIR)
         self.assertTrue(str(record).startswith(str(self.credentials)))
 
+    def test_folder_is_the_same_in_the_lineage_and_in_the_token(self) -> None:
+        """Папка копии — одна на всех: иначе доказательство не сошлось бы.
+
+        ⚠️ Токен привязан к строке папки (HMAC считается от неё). Если клон
+        и токен посчитают папку по-разному, выпущенный токен окажется
+        «чужим» для своей же копии.
+        """
+        self.assertEqual(token_mod.instance_folder(),
+                         lineage.copies_folder("mg-11111111"))
+        self.assertEqual(token_mod.instance_folder(), "copies/mg-11111111/")
+
+    def test_the_clone_registers_the_very_same_folder(self) -> None:
+        """Папка, которую заводит клон, — та же, под которую выпущен токен."""
+        folder = clone_mod._safe_ident("mg-11111111")
+        self.assertEqual("copies/%s" % folder,
+                         token_mod.instance_folder().rstrip("/"))
+
+
+class SettingsPublicationTest(_TokenTestCase):
+    """В настройках программы — путь и отпечаток токена, но не сам токен.
+
+    Заказ владельца (25.11, задание 2): «токен не попадает в репозиторий, а
+    хранится в сторе на машине копии; в программе — только путь и
+    идентификатор токена».
+    """
+
+    def test_settings_carry_the_path_and_the_fingerprint(self) -> None:
+        token_mod.issue()
+        settings = self.settings()
+        self.assertEqual(settings.get("copyTokenPath"), str(self.token_file))
+        self.assertEqual(settings.get("copyTokenId"),
+                         token_mod.token_id(self.token_file.read_text(
+                             encoding="utf-8").strip()))
+        self.assertEqual(settings.get("copyTokenFolder"), "copies/mg-11111111/")
+
+    def test_the_secret_never_reaches_the_settings(self) -> None:
+        issued = token_mod.issue()
+        secret = self.token_file.read_text(encoding="utf-8").strip()
+        text = self.settings_file.read_text(encoding="utf-8")
+        self.assertNotIn(secret, text)
+        self.assertNotIn(issued["token"], text)
+
+    def test_the_settings_are_written_when_the_copy_accepts_a_token(self) -> None:
+        """Копия получила токен от владельца — путь и отпечаток в настройках."""
+        issued = token_mod.issue(instance_id="mg-22222222",
+                                 folder="copies/mg-22222222/")
+        self.as_copy("mg-22222222")
+        res = token_mod.set_token(issued["token"])
+        self.assertTrue(res["ok"], res)
+        settings = self.settings()
+        self.assertEqual(settings.get("copyTokenId"), issued["token_id"])
+        self.assertEqual(settings.get("copyTokenFolder"), "copies/mg-22222222/")
+
+    def test_clearing_the_token_clears_the_fingerprint(self) -> None:
+        token_mod.issue()
+        token_mod.clear_token()
+        settings = self.settings()
+        self.assertEqual(settings.get("copyTokenId"), "")
+        self.assertEqual(settings.get("copyTokenPath"), str(self.token_file))
+
+    def test_status_restores_the_settings_after_they_are_wiped(self) -> None:
+        """После обновления программы путь и отпечаток в настройках есть.
+
+        ⚠️ Копия могла получить токен **до** обновления программы: токен в
+        сторе есть, а в настройках — пусто. Программа должна это увидеть и
+        привести настройки в соответствие, а не молчать.
+        """
+        token_mod.issue()
+        self.settings_file.unlink()
+        state.write_settings({})          # файл снова есть, но без токена
+        token_mod.status()
+        settings = self.settings()
+        self.assertEqual(settings.get("copyTokenPath"), str(self.token_file))
+        self.assertTrue(settings.get("copyTokenId"))
+
 
 class RequestTest(_TokenTestCase):
     def test_request_carries_lineage_but_no_secret(self) -> None:
@@ -313,6 +402,25 @@ class RequestTest(_TokenTestCase):
             self.request_body(instance_id="mg-22222222", key_id="key-bbbbbb"))}])
         items = token_mod.requests()
         self.assertIn("возможна подделка", items[0]["relation"])
+
+    def test_section_name_is_escaped_in_the_query(self) -> None:
+        """Кириллица в имени раздела не должна ронять запрос.
+
+        ⚠️ Живой случай 26.11 (в разделе промтов): имя раздела ушло в адрес
+        без экранирования, кириллица роняла запрос (UnicodeEncodeError), а
+        владелец видел пустой список заявок и думал, что их нет.
+        """
+        asked: list[str] = []
+
+        def fake_call(method: str, path: str, body=None, token: str = ""):
+            asked.append(path)
+            return 200, {"prompts": []}
+        karman.call = fake_call
+        token_mod.requests(section="Заявки МиниГена")
+        self.assertTrue(asked, "раздел должен запрашиваться")
+        self.assertNotIn(" ", asked[0])
+        self.assertNotIn("Заявки", asked[0])
+        self.assertIn("%D0%97%D0%B0%D1%8F%D0%B2%D0%BA%D0%B8", asked[0])
 
 
 class CloneFolderTest(_TokenTestCase):
