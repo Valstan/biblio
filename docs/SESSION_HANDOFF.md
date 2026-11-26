@@ -92,7 +92,8 @@ Updated: 2026-11-26 (двадцать восьмая смена: промт #98 
 Своя полоса: `tools/minigen-gui/bridge/minigen_clone.py` (механика копий —
 PR #183), `tools/minigen-gui/bridge/tests/test_clone_lifecycle.py` (регрессия
 — PR #183), `tools/minigen-gui/docs/RUNBOOK.md` (§«Вторая копия на другом
-компьютере») и `docs/SESSION_HANDOFF.md` (этот блок) — этот PR. Репозиторий
+компьютере»), `tools/minigen-gui/docs/knowledge-pack.md` (знание программы о
+себе) и `docs/SESSION_HANDOFF.md` (этот блок) — PR #184. Репозиторий
 программы и его `master` не изменяются: копия пишет в свою ветку
 `copies/<идентификатор копии>`; чужие деревья и чужие ветки не тронуты.
 Аккаунты и комнаты КАРМАНА не тронуты: вторая копия не требует выпуска новых
