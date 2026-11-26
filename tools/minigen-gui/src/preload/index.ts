@@ -37,6 +37,16 @@ const api = {
   openExternal(path: string): Promise<boolean> {
     return ipcRenderer.invoke('minigen:open-external', path)
   },
+  /**
+   * Положить текст в буфер обмена.
+   *
+   * ⚠️ Буфер живёт в **главном процессе**: окно только отдаёт текст. Так
+   * инструкцию по установке можно вставить в письмо знакомому прямо из
+   * окна (заказ владельца 26.11).
+   */
+  copyText(text: string): Promise<boolean> {
+    return ipcRenderer.invoke('minigen:copy-text', text)
+  },
   /** Сохранить текст в файл (диалог выбора пути — в главном процессе). */
   saveText(name: string, content: string): Promise<{ ok: boolean; path: string; error?: string }> {
     return ipcRenderer.invoke('minigen:save-text', name, content)
