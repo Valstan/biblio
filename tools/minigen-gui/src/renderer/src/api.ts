@@ -20,6 +20,7 @@ import type {
   GeneMap,
   GeneRecord,
   GeneSuggestions,
+  InstallGuide,
   JournalLine,
   KarmanChannel,
   LineageInfo,
@@ -40,6 +41,7 @@ declare global {
     minigen: {
       call(cmd: string, args?: Record<string, unknown>): Promise<unknown>
       openExternal(path: string): Promise<boolean>
+      copyText(text: string): Promise<boolean>
       saveText(name: string, content: string): Promise<{ ok: boolean; path: string; error?: string }>
       /** выбрать файлы для чата (диалог в главном процессе) */
       pickFiles(): Promise<{ path: string; name: string; size: number }[]>
@@ -211,7 +213,9 @@ export const api = {
   dbImport: (path: string, decisions?: Record<string, string>) =>
     call<DbImportReport>('db.import', { path, decisions }),
   /** Выбор файла выгрузки — диалог открывает главный процесс. */
-  dbPickFile: () => call<{ ok: boolean; path?: string; canceled?: boolean }>('db.pick')
+  dbPickFile: () => call<{ ok: boolean; path?: string; canceled?: boolean }>('db.pick'),
+  // ── «Черенки»: инструкция по установке копии другому (26.11) ───────────
+  installGuide: () => call<InstallGuide>('install.guide')
 }
 
 /** Действия окна (не моста): перезапуск, метка сборки, состояние моста. */

@@ -110,6 +110,11 @@ foreach ($pair in @(@("out", "out"), @("bridge", "bridge"))) {
 New-Item -ItemType Directory -Force -Path (Join-Path $appDir "docs") | Out-Null
 Copy-Item (Join-Path $PSScriptRoot "docs\knowledge-pack.md") `
           (Join-Path $appDir "docs\knowledge-pack.md") -Force -ErrorAction SilentlyContinue
+# ⚠️ Инструкция по установке едет вместе с программой: в окне есть вкладка
+# «Черенки» (заказ владельца 26.11 — «что мне отправить знакомому»), и она
+# показывает этот файл. Без него вкладка сказала бы «инструкции нет».
+Copy-Item (Join-Path $PSScriptRoot "docs\INSTALL.md") `
+          (Join-Path $appDir "docs\INSTALL.md") -Force -ErrorAction SilentlyContinue
 Copy-Item (Join-Path $PSScriptRoot "package.json") (Join-Path $appDir "package.json") -Force
 
 # Запускалки в установленном месте (ASCII, без BOM — их читает cmd).

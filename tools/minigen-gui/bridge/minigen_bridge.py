@@ -62,6 +62,7 @@ import minigen_ingest as ingest        # noqa: E402
 import minigen_karman as karman_mod    # noqa: E402
 import minigen_prompts as prompts_mod  # noqa: E402
 import minigen_council as council_mod  # noqa: E402
+import minigen_install as install_mod  # noqa: E402
 import minigen_repos as repos_mod      # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
@@ -364,6 +365,8 @@ class Bridge:
             # файлы оператора: чтение файла, приложенного к чату (промт #90)
             "files.read": self.cmd_files_read,
             "app.open_folder": self.cmd_open_folder,
+            # инструкция по установке на другой компьютер (заказ владельца 26.11)
+            "install.guide": self.cmd_install_guide,
             # самообновление программы
             "code.list": self.cmd_code_list,
             "code.read": self.cmd_code_read,
@@ -2017,6 +2020,15 @@ class Bridge:
         return state.jsonable(daemons.restart_all())
 
     # ────────────────────────────────────────────────────────────── прочее
+    def cmd_install_guide(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Инструкция по установке «МиниГена» на другой компьютер.
+
+        ⚠️ Заказ владельца (26.11): «не могу понять что мне отправить
+        знакомому». Отдаём окну **текст инструкции**, путь к файлу и путь к
+        установщику — чтобы отправлять было что, а не искать по диску.
+        """
+        return install_mod.read_guide()
+
     def cmd_open_folder(self, args: dict[str, Any]) -> dict[str, Any]:
         path = str(args.get("path") or "")
         if not path or not Path(path).exists():
