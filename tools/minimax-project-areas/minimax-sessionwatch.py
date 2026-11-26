@@ -44,6 +44,26 @@
        python minimax-sessionwatch.py --new <область> "задача"
        python minimax-sessionwatch.py --rotate <область> <session_id>
 
+⚠️ Промт КАРМАНА #172 — «лечение сессий: решение принимает “Управляющий”,
+нитку переносим, а не теряем»:
+
+- **без отчёта о выполнении завершать нельзя.** Отсутствие отчёта — не повод
+  требовать завершения: сессия получает команду **продолжить работу** по
+  нитке, а не «заверши правильно / напечатай сводку / остановись». Завершение
+  или ротация — только при наличии отчёта либо по решению «Управляющего»;
+- **решение принимает встроенная модель программы** («Управляющий», та же
+  нейросеть, что отвечает в чате): на вход — факты о ситуации, на выход —
+  ровно одно из трёх действий (продолжать / завершать / новая сессия с
+  продолжением нитки) + инструкция обслуживаемому агенту + причина. Если
+  модель недоступна — работает **предсказуемое правило-фолбэк**, и оно тоже
+  не требует завершения без отчёта;
+- **перенос нитки — с паспортом**: что делалось, что осталось, репозиторий,
+  ветка/worktree, открытые PR, критерии приёмки. Паспорт лежит на диске
+  машины (вне репозитория, D-038) и переживает перезапуск окна;
+- **параллельные нитки одного репозитория не путаются**: паспорт различает
+  нитки по репозиторию/ветке/worktree, чужие деревья не трогаются
+  (ADR-0011 — один пишущий агент — одно дерево).
+
 Границы:
 - **незапущенные области не трогаем** (то же правило, что у лечащего);
 - **готовую работу не продолжаем** — это главный заказ владельца;
@@ -59,11 +79,21 @@ import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import minigen_core as core  # noqa: E402
+
+#: Паспорт нитки (промт #172). Модуль лежит рядом — на машине его раскатывает
+#: `minigen_rollout.py`. Если его нет (старая раскатка) — сторож работает, но
+#: перенос нитки делается по-старому (без паспорта) и говорит об этом.
+try:
+    import minigen_passport as passport_mod  # noqa: E402
+except ImportError:  # noqa: BLE001 — паспорта нет ⇒ работаем без него
+    passport_mod = None
 
 BALANCE_CODE = 50110
 # Код провайдера «соединение с моделью оборвалось» (21.11: `50113`,
@@ -127,6 +157,31 @@ COMPACTION_AREA = "minigen"  # решение владельца касаетс�
                           # — дефолт рантайма ~95 %). В чужих областях сброс
                           # конфиг НЕ трогает: «очистку» делает сам рантайм —
                           # сессия уже перешла порог, сжатие случится само.
+
+# ────────────────────────────────────── решение лечения (промт КАРМАНА #172)
+
+#: Адрес встроенной модели «Управляющий»: программа «МиниГен» держит локальный
+#: API, и в том же процессе живёт модель ⇒ сторож на машине спрашивает решение
+#: **той же** нейросети, что отвечает в чате.
+MANAGER_URL = "http://127.0.0.1:8097/manager-decision"
+#: Сколько ждём ответа программы (сек).
+MANAGER_TIMEOUT = 120
+#: Не чаще раза в `DECISION_COOLDOWN` на сессию спрашиваем решение: решение
+#: лечения тратит очки аккаунта, а спрашивать его на каждом проходе сторожа
+#: нельзя — только когда вердикт требует действия (как сейчас `RESET_COOLDOWN`).
+DECISION_COOLDOWN = 7200
+#: Предел «продолжать» без отчёта (часов): столько сессия может молчать, а
+#: потом нитка переносится в новую сессию.
+#:
+#: ⚠️ Это **решение владельца**, и значение здесь НЕ выбрано: 0 = предел
+#: выключен (сессия продолжается, пока владелец не скажет иначе). Промт #172:
+#: «нужен предел (например, N часов без отчёта ⇒ перенос нитки) — это решение
+#: владельца, вынеси его явно и не выбирай сам». Чтобы включить — поставь
+#: число часов (например 6) и перескажи владельцу.
+STUCK_LIMIT_HOURS = 0
+#: Куда класть паспорта ниток: диск машины, вне репозитория (D-038).
+PASSPORT_DIR = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                / "minigen-gui" / "passports")
 
 
 # ────────────────────────────────────────────────────────── чтение рантайма
@@ -254,6 +309,39 @@ def looks_finished(text: str) -> bool:
     return any(m in head for m in FINAL_MARKERS)
 
 
+def final_answer(con, session_id: str, turn_id: str = "") -> dict:
+    """Финальный ответ хода (`msg_type=1`) — **текущего** хода.
+
+    Ответ из прошлого хода сводкой этого хода не считаем (22.11: ложное
+    «Продолжай» в живую сессию).
+    """
+    legacy_final = last_message(con, session_id, final_only=True)
+    if not legacy_final.get("turn_id") or (turn_id and legacy_final.get("turn_id") == turn_id):
+        return legacy_final
+    return {}
+
+
+def has_report(con, session_id: str, turn_id: str = "") -> bool:
+    """Есть ли отчёт о выполнении (промт #172).
+
+    ⚠️ Что считаем отчётом — решение владельца, зафиксировано здесь
+    (промт #172: «финальный ответ рантайма (`msg_type=1`) или только текст со
+    словами “готово/закрыто”? … зафиксируй оба случая в коде»):
+
+    - **финальный ответ хода** (`msg_type=1`) — рантайм сам помечает им
+      завершённый ход;
+    - **текст со словами закрытия** («готово», «закрыто», «итоговая сводка»…) —
+      `looks_finished()`.
+
+    Оба случая — отчёт. Отсутствие отчёта — **не** повод требовать завершения:
+    лечение такой сессии = «продолжать» (D-249 ⑤).
+    """
+    if final_answer(con, session_id, turn_id):
+        return True
+    last = last_message(con, session_id)
+    return looks_finished(last.get("text") or "")
+
+
 def asks_owner(text: str) -> bool:
     """Ждёт ли сессия решения владельца (короткий вопрос без ответа)."""
     low = (text or "").strip()
@@ -341,10 +429,8 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
     # это финальный ответ хода, и он привязан к turnId. Ответ из ПРОШЛОГО хода
     # сводкой этого хода не считаем (22.11: ложное «Продолжай» в живую сессию —
     # отчёт без слов «готово/закрыто» считался брошенной ниткой).
-    legacy_final = last_message(con, sid, final_only=True)
     turn_id = turn.get("turn_id") or ""
-    final_msg = legacy_final if (not legacy_final.get("turn_id")
-                                  or legacy_final.get("turn_id") == turn_id) else {}
+    final_msg = final_answer(con, sid, turn_id)
     fill = context_fill(con, sid, sess.get("extra") or {})
     kids = broken_subagents(con, sid)
 
@@ -354,6 +440,9 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
         "reason": "", "fill": fill.get("fill"), "turn_status": turn.get("status"),
         "updated_at_ms": sess["updated_at_ms"], "broken_kids": len(kids),
         "last_text": (last_msg.get("text") or "")[:400],
+        # ⚠️ Отчёт о выполнении (промт #172): есть он или нет — от этого
+        # зависит лечение. Без отчёта сессию **нельзя** требовать завершать.
+        "has_report": has_report(con, sid, turn_id),
     }
     if sess["archived"]:
         v["verdict"] = "готова"
@@ -568,11 +657,14 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
     return {"ok": bool(proc and proc.returncode == 0), "why": out[-400:]}
 
 
-def new_session(area: dict, prompt: str, force: bool = False) -> dict:
+def new_session(area: dict, prompt: str, force: bool = False, cwd: str = "") -> dict:
     """Открыть НОВУЮ сессию в области с начальной командой.
 
     В области Управляющего — только если там нет живой сессии (один
     Управляющий на область, G679); `force` обходит запрет.
+
+    ⚠️ `cwd` — папка нитки: при переносе (промт #172) новая сессия должна
+    продолжить **свою** ветку/worktree, а не чужое дерево (ADR-0011).
     """
     # Прокси-переменные — из реестра (22.11, находка Управляющего): сетевой
     # сторож мог починить мёртвый прокси, а вызывающий процесс держит старые
@@ -584,7 +676,7 @@ def new_session(area: dict, prompt: str, force: bool = False) -> dict:
         if busy:
             return {"ok": False, "why": "в области уже живая сессия Управляющего %s — "
                                         "вторая не открывается (один Управляющий на область)" % busy[:12]}
-    folder = area.get("folder") or ""
+    folder = cwd or area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
         return {"ok": False, "why": "папка проекта недоступна: %s" % folder}
     logs = core.LOCAL / "sessionwatch-sends.log"
@@ -758,6 +850,11 @@ def rotate_session(area: dict, sess: dict, brief: str = "") -> dict:
     Порядок именно такой (заказ владельца 21.11): сначала сессия сама
     доходит до конца и печатает сводку, потом архивируем, потом открываем
     новую с начальной командой — чтобы нитка не потеряла контекст.
+
+    ⚠️ Промт #172: перед переносом снимается **паспорт нитки** (что делалось,
+    что осталось, репозиторий, ветка/worktree, PR, критерии приёмки) — он
+    лежит на диске машины (вне репозитория) и переживает перезапуск окна.
+    Новая сессия открывается в **своей** ветке/worktree (ADR-0011).
     """
     report = {"session_id": sess["session_id"], "steps": []}
     if probe_of(area, sess):
@@ -768,6 +865,17 @@ def rotate_session(area: dict, sess: dict, brief: str = "") -> dict:
     core.log("СЕССИИ: ротация %s (%s)" % (sess["session_id"][:12], sess["title"][:50]))
     core.report("warn", "session", "ротация сессии %s: %s"
                 % (sess["session_id"][:12], sess["title"][:50]))
+    # 0) паспорт нитки — до всего остального (нить не теряется)
+    passport = {}
+    if passport_mod is not None:
+        con = core.connect(core.area_db(area["dir"]))
+        try:
+            _, passport = thread_facts(area, sess, {"verdict": "ротация"}, con)
+        finally:
+            if con:
+                con.close()
+        path = passport_mod.save(passport)
+        report["steps"].append({"passport": path})
     res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
     report["steps"].append({"close_command": res})
     if not res.get("ok"):
@@ -786,8 +894,11 @@ def rotate_session(area: dict, sess: dict, brief: str = "") -> dict:
         report["ok"] = False
         report["why"] = "не архивировалась: %s" % arc.get("why")
         return report
-    text = brief or continuation_brief(area, sess)
-    opened = new_session(area, text)
+    text = brief or (passport_mod.as_brief(passport)
+                     if passport_mod is not None and passport
+                     else continuation_brief(area, sess))
+    cwd = str((passport or {}).get("worktree") or area.get("folder") or "")
+    opened = new_session(area, text, cwd=cwd)
     report["steps"].append({"new_session": opened})
     report["ok"] = bool(opened.get("ok"))
     report["why"] = opened.get("why")
@@ -851,6 +962,368 @@ REVIVE_PROMPT = (
 )
 
 
+# ────────────────────────────── решение лечения: «Управляющий» (промт #172)
+
+#: Ровно три действия (промт #172).
+ACTION_CONTINUE = "continue"
+ACTION_FINISH = "finish"
+ACTION_ROTATE = "rotate"
+ACTION_LABELS = {
+    ACTION_CONTINUE: "продолжать",
+    ACTION_FINISH: "завершать",
+    ACTION_ROTATE: "новая сессия с продолжением нитки",
+}
+
+
+def bridge_token() -> str:
+    """Токен локального API программы (его же читает сетевой сторож)."""
+    try:
+        path = (Path(os.environ.get("LOCALAPPDATA", str(Path.home())))
+                / "minigen-gui" / "bridge-token.txt")
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def ask_manager(facts: dict) -> dict:
+    """Спросить решение у встроенной модели «Управляющий» (через программу).
+
+    Канал — локальный API программы «МиниГен» (`:8097`): сервер живёт в том
+    же процессе, что и встроенная модель, поэтому решение принимает **та же**
+    нейросеть, что отвечает в чате.
+
+    Ответ: `{"ok": True, "action": "continue|finish|rotate", "instruction": ...,
+    "reason": ...}` либо `{"ok": False, "error": ...}` — тогда решает
+    правило-фолбэк.
+    """
+    token = bridge_token()
+    if not token:
+        return {"ok": False, "error": "нет токена программы «МиниГен»"}
+    body = json.dumps(facts, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(MANAGER_URL, data=body, method="POST")
+    req.add_header("Content-Type", "application/json; charset=utf-8")
+    req.add_header("X-MiniGen-Token", token)
+    try:
+        with urllib.request.urlopen(req, timeout=MANAGER_TIMEOUT) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "error": "программа ответила %s" % exc.code}
+    except Exception as exc:  # noqa: BLE001 — программа не запущена или лежит
+        return {"ok": False, "error": "программа не ответила: %s" % exc}
+    if not isinstance(data, dict):
+        return {"ok": False, "error": "ответ программы не разобран"}
+    return data
+
+
+def fallback_decision(facts: dict) -> dict:
+    """Правило-фолбэк: предсказуемое и безопасное (промт #172).
+
+    - отчёт о выполнении **есть** → работа закончена ⇒ «завершать»;
+    - отчёта **нет** → «продолжать» — завершать без отчёта нельзя (D-249 ⑤);
+    - предел простоя (`STUCK_LIMIT_HOURS`, решение владельца) → перенос нитки.
+
+    ⚠️ Правило **не требует** завершения сессии без отчёта — это прямое
+    требование критерия приёмки промта #172.
+    """
+    if facts.get("has_report"):
+        return {"action": ACTION_FINISH, "instruction": "",
+                "reason": "работа закончена: есть отчёт о выполнении",
+                "finish_old": False, "source": "правило-фолбэк"}
+    reason = "отчёта о выполнении нет — завершать нельзя, продолжаем нитку"
+    action = ACTION_CONTINUE
+    idle = int(facts.get("idle_minutes") or 0)
+    if STUCK_LIMIT_HOURS and idle >= STUCK_LIMIT_HOURS * 60:
+        action = ACTION_ROTATE
+        reason = ("сессия молчит %d ч (предел владельца %d ч) — переносим нитку"
+                  % (idle // 60, STUCK_LIMIT_HOURS))
+    return {"action": action, "instruction": "", "reason": reason,
+            "finish_old": False, "source": "правило-фолбэк"}
+
+
+def treatment_decision(facts: dict) -> dict:
+    """Решение о лечении: спросить «Управляющего», иначе — правило-фолбэк."""
+    answer = ask_manager(facts)
+    action = str((answer or {}).get("action") or "")
+    if (answer or {}).get("ok") and action in (ACTION_CONTINUE, ACTION_FINISH,
+                                                ACTION_ROTATE):
+        return {"action": action,
+                "instruction": str(answer.get("instruction") or ""),
+                "reason": str(answer.get("reason") or ""),
+                "finish_old": bool(answer.get("finish_old")),
+                "source": "модель «Управляющий»"}
+    decision = fallback_decision(facts)
+    decision["error"] = str((answer or {}).get("error")
+                            or "встроенная модель недоступна")
+    return decision
+
+
+def git_branch(folder: str) -> str:
+    """Ветка в папке (пусто — не git или не папка)."""
+    if not folder or not Path(folder).is_dir():
+        return ""
+    try:
+        proc = subprocess.run(["git", "-C", folder, "rev-parse",
+                               "--abbrev-ref", "HEAD"],
+                              capture_output=True, text=True, timeout=10,
+                              encoding="utf-8", errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def parallel_sessions(area: dict, sess: dict) -> list:
+    """Параллельные сессии того же репозитория (ADR-0011: чужие — не трогать)."""
+    out: list = []
+    mine = str(sess.get("workspace_dir") or area.get("folder") or "")
+    try:
+        others = sessions_of(area["dir"])
+    except Exception:  # noqa: BLE001 — база недоступна ⇒ пусто
+        return out
+    for other in others:
+        if other["session_id"] == sess.get("session_id"):
+            continue
+        if other["archived"] or other["kind"] != "conversation":
+            continue
+        folder = other.get("workspace_dir") or ""
+        if folder and mine:
+            try:
+                if Path(folder).resolve() == Path(mine).resolve():
+                    continue          # та же папка — не чужое дерево
+            except OSError:
+                pass
+        item = {"session_id": other["session_id"], "title": other["title"][:60],
+                "worktree": folder,
+                "updated_at": core.fmt_ms(other["updated_at_ms"])}
+        branch = git_branch(folder)
+        if branch:
+            item["branch"] = branch
+        out.append(item)
+    return out[:10]
+
+
+def thread_facts(area: dict, sess: dict, v: dict, con) -> tuple:
+    """Факты о ситуации и паспорт нитки — для решения «Управляющего».
+
+    На вход модели идут **факты**, а не простыня логов: вердикт сторожа, есть
+    ли отчёт о выполнении, событие сжатия контекста, заполнение контекста,
+    когда последний раз был ход, репозиторий/ветка/worktree нитки, список
+    параллельных сессий того же репозитория.
+    """
+    turn = last_turn(con, sess["session_id"]) if con is not None else {}
+    final = (final_answer(con, sess["session_id"], turn.get("turn_id") or "")
+             if con is not None else {})
+    last = last_message(con, sess["session_id"]) if con is not None else {}
+    report_text = (final.get("text") or last.get("text") or "").strip()
+    stamp = (turn.get("completed_at_ms") or turn.get("accepted_at_ms")
+             or sess.get("updated_at_ms") or 0)
+    idle_ms = max(0, core.now_ms() - (stamp or core.now_ms()))
+    facts = {
+        "area": area.get("slug") or "",
+        "session_id": sess.get("session_id") or "",
+        "title": sess.get("title") or "",
+        "verdict": v.get("verdict") or "",
+        "reason": v.get("reason") or "",
+        "turn_status": turn.get("status") or "",
+        "has_report": bool(v.get("has_report")),
+        "report_excerpt": report_text[:1500],
+        "last_words": (last.get("text") or "")[:1500],
+        # событие сжатия контекста (его рантайм и оставляет в журнале)
+        "compacted": v.get("verdict") == "скомпактилась",
+        "compacted_at": core.fmt_ms(int(v.get("compacted_at_ms") or 0))
+        if v.get("compacted_at_ms") else "",
+        "context_fill": v.get("fill"),
+        "peak_fill": v.get("peak_fill"),
+        "last_turn_at": core.fmt_ms(stamp),
+        "idle_minutes": idle_ms // 60000,
+        "note": ("Отчёт о выполнении — главный факт: без него сессию "
+                 "завершать нельзя, её лечение = «продолжать»."),
+    }
+    passport: dict = {}
+    if passport_mod is not None:
+        passport = passport_mod.build(area, sess, facts)
+        facts["repo"] = passport.get("repo") or ""
+        facts["branch"] = passport.get("branch") or ""
+        facts["worktree"] = passport.get("worktree") or ""
+        facts["prs"] = passport.get("prs") or []
+        facts["done"] = passport.get("done") or []
+        facts["todo"] = passport.get("todo") or []
+        facts["acceptance"] = passport.get("acceptance") or []
+        facts["files"] = passport.get("files") or []
+    facts["parallel_sessions"] = parallel_sessions(area, sess)
+    return facts, passport
+
+
+def continue_instruction(passport: dict, decision: dict) -> str:
+    """Инструкция обслуживаемому агенту: что делать дальше (из паспорта).
+
+    ⚠️ Инструкция должна **называть**, что делать дальше (из паспорта нитки),
+    а не просто «продолжай» — иначе агент её проигнорирует (риск из
+    промта #172).
+    """
+    text = str(decision.get("instruction") or "").strip()
+    parts = [text or "Продолжай работу по нитке."]
+    step = ""
+    if passport_mod is not None:
+        step = passport_mod.next_step(passport or {})
+    if step and step.lower() not in parts[0].lower():
+        parts.append("Что делать дальше: %s" % step)
+    place = []
+    if (passport or {}).get("branch"):
+        place.append("ветка %s" % passport["branch"])
+    if (passport or {}).get("worktree"):
+        place.append("worktree %s" % passport["worktree"])
+    if place:
+        parts.append("Продолжай свою нитку (%s); чужие ветки и деревья не трогай."
+                     % ", ".join(place))
+    parts.append("Если работа уже закончена и напечатана итоговая сводка — "
+                 "подтверди и жди; если нужен выбор владельца — перечисли "
+                 "варианты и жди.")
+    return "\n".join(parts)
+
+
+def decision_report(report: dict) -> str:
+    """Строка отчёта: кто, когда, по каким фактам, какое решение, что сделано."""
+    dec = report.get("decision") or {}
+    facts = report.get("facts") or {}
+    bits = ["решение лечения сессии %s: действие «%s» (источник: %s)"
+            % (str(report.get("session_id") or "?")[:12],
+               ACTION_LABELS.get(dec.get("action"), dec.get("action") or "?"),
+               dec.get("source") or "?")]
+    if dec.get("reason"):
+        bits.append("причина: %s" % dec["reason"])
+    if dec.get("error"):
+        bits.append("запасной путь: %s" % dec["error"])
+    bits.append("факты: отчёт о выполнении — %s; контекст — %s%%; простой — %s мин; "
+                "ветка — %s; параллельных сессий — %s"
+                % ("есть" if facts.get("has_report") else "НЕТ",
+                   facts.get("context_fill"), facts.get("idle_minutes"),
+                   facts.get("branch") or "?",
+                   facts.get("parallel") or 0))
+    steps = report.get("steps") or []
+    done = []
+    for step in steps:
+        why = str(step.get("why") or "")
+        if not why:
+            for value in step.values():
+                if isinstance(value, dict) and value.get("why"):
+                    why = str(value["why"])
+                    break
+        if why:
+            done.append(why)
+    bits.append("что сделано: %s" % (", ".join(done) or "ничего — сессию не трогали"))
+    return ". ".join(bits)
+
+
+def treat_session(area: dict, v: dict, state: dict = None) -> dict:
+    """Лечение сессии по решению «Управляющего» (или правилу-фолбэка).
+
+    Порядок (промт #172, п.2):
+      1) **паспорт нитки** — снимаем всегда (нить не теряется);
+      2) действие:
+         - «продолжать» — сессию **не трогаем**: ни команды завершения, ни
+           архивации; если она стоит — мягко подталкиваем инструкцией из
+           паспорта;
+         - «завершать» — сессию можно закрыть;
+         - «новая сессия с продолжением нитки» — паспорт → (корректное
+           завершение старой сессии, если так решили) → архив → новая сессия
+           в СВОЕЙ ветке/worktree с паспортом и командой «продолжи нитку».
+    """
+    sess = {"session_id": v["session_id"], "title": v.get("title") or "",
+            "workspace_dir": area.get("folder", "")}
+    report = {"session_id": v["session_id"], "verdict": v.get("verdict"),
+              "area": area.get("slug") or "", "steps": []}
+    con = core.connect(core.area_db(area["dir"]))
+    try:
+        facts, passport = thread_facts(area, sess, v, con)
+    finally:
+        if con:
+            con.close()
+    decision = treatment_decision(facts)
+    action = decision["action"]
+    report["action"] = action
+    report["decision"] = {
+        "action": action, "label": ACTION_LABELS.get(action, action),
+        "reason": decision.get("reason") or "",
+        "source": decision.get("source") or "",
+        "instruction": decision.get("instruction") or "",
+    }
+    if decision.get("error"):
+        report["decision"]["error"] = decision["error"]
+    report["facts"] = {"has_report": facts.get("has_report"),
+                       "context_fill": facts.get("context_fill"),
+                       "peak_fill": facts.get("peak_fill"),
+                       "idle_minutes": facts.get("idle_minutes"),
+                       "branch": facts.get("branch"),
+                       "worktree": facts.get("worktree"),
+                       "parallel": len(facts.get("parallel_sessions") or [])}
+
+    # 1) паспорт нитки — всегда (даже если лечение не сработало, нить не теряется)
+    if passport_mod is not None and passport:
+        path = passport_mod.save(passport)
+        report["steps"].append({"passport": path})
+        report["passport"] = path
+
+    # 2) действие
+    if action == ACTION_CONTINUE:
+        instr = continue_instruction(passport, decision)
+        last_revive = int((((state or {}).get("revived") or {})
+                           .get(sess["session_id"])) or 0)
+        if last_revive and int(time.time()) - last_revive < REVIVE_COOLDOWN:
+            # Недавно уже подталкивали — второй раз не тыкаем (очки и терпение
+            # агента — не бесконечные).
+            report["steps"].append({"continue": "недавно подталкивали — не трогаем"})
+            report["ok"] = True
+            report["why"] = "сессия продолжает работу"
+        else:
+            res = send_to_session(area, sess, instr, background=True)
+            report["steps"].append({"continue": res})
+            report["ok"] = bool(res.get("ok"))
+            report["why"] = res.get("why")
+            if state is not None and res.get("ok"):
+                state.setdefault("revived", {})[sess["session_id"]] = int(time.time())
+        # ⚠️ НИ команды «заверши работу правильно», НИ архивации: отчёта о
+        # выполнении нет — работа не закончена, нитка продолжается здесь.
+    elif action == ACTION_FINISH:
+        report["steps"].append({"finish": "решение «Управляющего»: закрываем"})
+        arc = archive_session(area["dir"], sess["session_id"])
+        report["steps"].append({"archived": arc})
+        report["ok"] = bool(arc.get("ok"))
+        report["why"] = arc.get("why")
+    elif action == ACTION_ROTATE:
+        # Корректно завершить старую сессию — только если решили (или отчёт
+        # есть: тогда работа закончена и сводка не прерывает её на полпути).
+        if facts.get("has_report") or decision.get("finish_old"):
+            res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
+            report["steps"].append({"close_command": res})
+            if res.get("ok"):
+                closed = wait_closed(area, sess["session_id"])
+                report["steps"].append({"closed": closed})
+        arc = archive_session(area["dir"], sess["session_id"])
+        report["steps"].append({"archived": arc})
+        if not arc.get("ok"):
+            report["ok"] = False
+            report["why"] = "не архивировалась: %s" % arc.get("why")
+        else:
+            text = (passport_mod.as_brief(passport)
+                    if passport_mod is not None and passport
+                    else continuation_brief(area, sess))
+            cwd = str((passport or {}).get("worktree") or area.get("folder") or "")
+            opened = new_session(area, text, cwd=cwd)
+            report["steps"].append({"new_session": opened})
+            report["ok"] = bool(opened.get("ok"))
+            report["why"] = opened.get("why")
+    else:
+        report["ok"] = False
+        report["why"] = "неизвестное действие: %s" % action
+
+    text = decision_report(report)
+    core.report("info" if report.get("ok") else "warn", "session", text)
+    core.log("СЕССИИ: %s — %s" % (area.get("slug") or "?", text))
+    return report
+
+
 # ────────────────────────────────────────────────────────── проход демона
 
 def survey(area: dict, state: dict) -> list:
@@ -882,28 +1355,26 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
         if v["verdict"] in ("готова", "работает", "кончились очки", "ждёт владельца"):
             continue
         if v["verdict"] in ("скомпактилась", "контекст заполнен"):
-            # ⚠️ Заказ владельца (24.11): НЕ открывать новую сессию, а сбросить
-            # текущую на месте: правильно завершить -> рантайм сожмёт контекст ->
-            # та же сессия продолжит нитку. Ротация (новая сессия) — только если
-            # сброс не удался.
+            # ⚠️ Промт #172: решение лечения принимает **встроенная модель**
+            # «Управляющий» (факты → решение: продолжать / завершать / новая
+            # сессия с продолжением нитки). Жёсткое правило в коде больше не
+            # решает: без отчёта о выполнении сессия НЕ получает команду
+            # «заверши работу правильно» — её лечение = «продолжать».
             if dry_run:
-                actions.append({"session": v["session_id"], "action": "сброс на месте (сухой прогон)"})
+                actions.append({"session": v["session_id"],
+                                "action": "решение «Управляющего» (сухой прогон)"})
                 continue
-            last_reset = int((state.get("reset") or {}).get(v["session_id"]) or 0)
-            if last_reset and int(time.time()) - last_reset < RESET_COOLDOWN:
-                actions.append({"session": v["session_id"], "action": "сброс был недавно — не трогаем"})
+            last_decision = int((state.get("decision") or {}).get(v["session_id"]) or 0)
+            if last_decision and int(time.time()) - last_decision < DECISION_COOLDOWN:
+                actions.append({"session": v["session_id"],
+                                "action": "решение спрашивали недавно — не трогаем"})
                 continue
-            sess = {"session_id": v["session_id"], "title": v["title"],
-                    "workspace_dir": area.get("folder", "")}
-            rep = reset_session(area, sess)
-            if not rep.get("ok"):
-                rep = rotate_session(area, sess)
-                rep["fallback"] = "ротация"
-            state.setdefault("reset", {})[v["session_id"]] = int(time.time())
-            actions.append({"session": v["session_id"], "action": "сброс на месте", "report": rep})
-            core.log("СЕССИИ: %s — %s: %s" % (
-                slug, "сброс на месте" if not rep.get("fallback") else "сброс не удался — ротация",
-                rep.get("why")))
+            rep = treat_session(area, v, state)
+            state.setdefault("decision", {})[v["session_id"]] = int(time.time())
+            actions.append({"session": v["session_id"],
+                            "action": ACTION_LABELS.get(rep.get("action"),
+                                                       rep.get("action") or "?"),
+                            "report": rep})
             continue
         if v["verdict"] == "упала по сети":
             # Поднимаем, когда сеть **сейчас** в порядке (по данным сетевого

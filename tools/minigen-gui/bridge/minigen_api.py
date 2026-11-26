@@ -17,6 +17,7 @@
 | `POST /restart?name=<демон>` | перезапуск конкретного демона |
 | `POST /start?name=<демон>` / `POST /stop?name=<демон>` | запуск и остановка конкретного демона |
 | `POST /start-all` / `POST /stop-all` / `POST /restart-all` | то же для всех демонов |
+| `POST /manager-decision` | решение о лечении сессии: встроенная нейросеть «Управляющий» решает (промт #172) |
 
 ⚠️ Зачем окну ходить в API (живой случай 24.11): демоны, поднятые с
 повышенными правами, окно не видит — WMI не отдаёт их командные строки, а
@@ -24,6 +25,15 @@
 видит всегда. Поэтому окно спрашивает демонов **у него** — иначе врало «демоны
 0/3» при живых демонах, а «запустить» означало бы «поднять вторую копию»
 (урок 22.11: два лечащих брали аккаунты дважды).
+
+⚠️ `POST /manager-decision` (промт #172) — канал от сторожа сессий к
+**встроенной** нейросети «Управляющий». Сервер живёт в том же процессе, что и
+модель, поэтому сторож на машине получает решение той же встроенной модели,
+что отвечает в чате. Тело запроса — факты о ситуации (JSON), ответ — решение:
+действие (`continue` / `finish` / `rotate`), инструкция обслуживаемому агенту
+и причина. Если программа не запущена или модель недоступна — ответ
+`{"ok": false, ...}`, и сторож применяет **правило-фолбэк** (оно не требует
+завершения сессии без отчёта о выполнении).
 
 Токен лежит в `%LOCALAPPDATA%\\minigen-gui\\bridge-token.txt` и создаётся при
 первом запуске. Он нужен, чтобы случайная веб-страница не могла
@@ -51,6 +61,17 @@ TOKEN_FILE = LOCAL / "bridge-token.txt"
 # (надзиратель демонов). Флаг «порт держим мы» нужен, чтобы окно знало,
 # кому говорить, а сам надзиратель не звал бы себя по сети.
 SERVING = False
+
+#: Кто решает лечение сессии (промт #172). Ставится мостом при старте:
+#: `set_decider(bridge.manager_decision)`. Пока он не задан — решения нет,
+#: и сторож применяет правило-фолбэк (это предсказуемо и безопасно).
+DECIDER = None
+
+
+def set_decider(func) -> None:
+    """Задать исполнителя решения о лечении сессии."""
+    global DECIDER
+    DECIDER = func
 
 
 def token() -> str:
@@ -141,6 +162,37 @@ class Handler(BaseHTTPRequestHandler):
                   or (query.get("token") or [""])[0])
         return bool(given) and given == token()
 
+    def _read_json(self) -> dict[str, Any]:
+        """Тело запроса — JSON-объект (пустой, если тела нет)."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        try:
+            raw = self.rfile.read(length).decode("utf-8", "replace")
+            data = json.loads(raw or "{}")
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _decision(self) -> None:
+        """Решение о лечении сессии — от встроенной модели (промт #172)."""
+        if DECIDER is None:
+            self._send(503, {"ok": False,
+                             "error": "решение недоступно: программа не дала «Управляющего»"})
+            return
+        facts = self._read_json()
+        try:
+            result = DECIDER(facts)
+        except Exception as exc:  # noqa: BLE001 — ответ всегда фактом
+            self._send(200, {"ok": False, "error": str(exc), "source": "model"})
+            return
+        payload = result if isinstance(result, dict) else {"ok": False,
+                                                           "error": "пустой ответ"}
+        self._send(200, payload)
+
     def do_GET(self) -> None:                               # noqa: N802
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
@@ -174,6 +226,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(404, {"error": "нет такого демона: %s" % name})
                 return
             self._send(200, daemons.restart(spec))
+            return
+        if parsed.path == "/manager-decision":
+            self._decision()
             return
         if parsed.path == "/start":
             name = (query.get("name") or [""])[0]
@@ -229,7 +284,7 @@ def base_url(port: int = PORT) -> str:
     return "http://127.0.0.1:%d" % port
 
 
-def another_instance_running(port: int = PORT, timeout: int = 5) -> bool:
+def another_instance_running(port: int = PORT, timeout: int = 15) -> bool:
     """Живой ли уже другой фоновый экземпляр программы.
 
     Проверка по **ответу API**, а не по файлу-флагу: флаг может остаться
@@ -237,6 +292,11 @@ def another_instance_running(port: int = PORT, timeout: int = 5) -> bool:
     (сторожа останутся без присмотра). API отвечает — значит, экземпляр
     жив и второй поднимать не надо: два процесса-менеджера демонов — это
     ровно то, из-за чего лечащий брал аккаунты дважды.
+
+    ⚠️ Ответ `/status` считает живые демоны (WMI по процессам) — на тяжёлой
+    машине это **дольше пяти секунд**, и короткий таймаут давал ложное
+    «никого нет» ⇒ второй менеджер демонов поднимался (урок 22.11). Поэтому
+    ждём щедрее: «медленный ответ» — это тоже ответ.
     """
     import urllib.request
     try:

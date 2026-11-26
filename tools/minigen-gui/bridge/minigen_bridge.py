@@ -65,6 +65,7 @@ import minigen_prompts as prompts_mod  # noqa: E402
 import minigen_council as council_mod  # noqa: E402
 import minigen_install as install_mod  # noqa: E402
 import minigen_repos as repos_mod      # noqa: E402
+import minigen_manager as manager_mod  # noqa: E402 — решение лечения (промт #172)
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
@@ -537,6 +538,34 @@ class Bridge:
             return str(alive[0].get("accessToken") or "")
         except Exception:  # noqa: BLE001
             return ""
+
+    def manager_decision(self, facts: dict[str, Any]) -> dict[str, Any]:
+        """Решение о лечении сессии — от встроенной модели (промт #172).
+
+        Сюда приходит сторож сессий через локальный API `:8097` и приносит
+        **факты** о ситуации (вердикт, есть ли отчёт о выполнении, сжатие
+        контекста, заполнение, репозиторий/ветка/worktree, параллельные
+        сессии). Ответ — ровно одно из трёх действий + инструкция
+        обслуживаемому агенту + причина.
+
+        ⚠️ Модель недоступна (нет аккаунта/очков, вендор лежит, программа не
+        запущена) ⇒ `ok: False`, и **сторож** применяет правило-фолбэк. Правило
+        живёт на стороне сторожа: там оно и должно быть видно.
+        """
+        facts = facts if isinstance(facts, dict) else {}
+        area_slug = str(facts.get("area") or "minigen")
+        try:
+            cfg = manager_mod.provider_config(area_slug, self._area_token(area_slug))
+        except Exception as exc:  # noqa: BLE001 — конфига нет ⇒ решения нет
+            return {"ok": False, "error": "нет конфига провайдера: %s" % exc,
+                    "source": "model", "raw": ""}
+        result = manager_mod.decide(facts, cfg=cfg, area_slug=area_slug)
+        if result.get("ok"):
+            self.core.log("СЕССИИ: решение «Управляющего» по %s — %s (%s)"
+                          % (str(facts.get("session_id") or "?")[:12],
+                             manager_mod.ACTION_LABELS.get(result.get("action"), "?"),
+                             result.get("reason") or "без причины"))
+        return result
 
     def cmd_snapshot(self, args: dict[str, Any]) -> dict[str, Any]:
         snap = state.snapshot(self.mods,
@@ -2163,6 +2192,15 @@ def daemon_mode() -> int:
         return 0
 
     bridge = Bridge()
+    # ⚠️ Решение о лечении сессии принимает встроенная модель (промт #172) —
+    # она живёт в этом же процессе, поэтому сторож сессий спрашивает её через
+    # локальный API. Пока исполнитель не задан, сторож применяет
+    # правило-фолбэк (оно не требует завершения сессии без отчёта).
+    try:
+        import minigen_api
+        minigen_api.set_decider(bridge.manager_decision)
+    except Exception:  # noqa: BLE001 — канал решения не обязателен
+        pass
     try:
         bridge.core.log("ДЕМОНЫ: программа «МиниГен» в фоновом режиме — "
                         "демоны подняты и следятся (API на %s)"

@@ -102,14 +102,21 @@ def main() -> int:
     check(hasattr(watcher, "rotate_session"), "ротация-откат пропала")
     check(int(getattr(watcher, "RESET_COOLDOWN", 0)) > 0, "нет кулдауна на повторный сброс")
 
-    print("3) ветка решения предпочитает сброс, а ротация — откат")
+    print("3) ветка решения: спрашиваем «Управляющего», а фолбэк не завершает без отчёта")
     src = (HERE / "minimax-sessionwatch.py").read_text(encoding="utf-8")
-    branch = src[src.find('if v["verdict"] in ("скомпактилась"'):][:1500]
-    check("reset_session(area, sess)" in branch,
-          "ветка вердиктов не вызывает reset_session")
-    check("rotate_session(area, sess)" in branch and "fallback" in branch,
-          "в ветке нет отката на ротацию")
-    check('state.setdefault("reset", {})' in branch, "нет отметки времени сброса")
+    branch = src[src.find('if v["verdict"] in ("скомпактилась"'):][:2500]
+    check("treat_session(area, v" in branch,
+          "ветка вердиктов не зовёт лечение по решению «Управляющего»")
+    check("def rotate_session(" in src, "ротация-откат пропала")
+    check('state.setdefault("decision", {})' in branch, "нет отметки времени решения")
+    check("DECISION_COOLDOWN" in branch, "нет кулдауна на решение «Управляющего»")
+    # ⚠️ Промт #172: без отчёта о выполнении — «продолжать», а не «закрыть».
+    fallback = watcher.fallback_decision({"has_report": False, "idle_minutes": 3})
+    check(fallback["action"] == "continue",
+          "правило-фолбэк без отчёта требует завершения: %s" % fallback["action"])
+    fallback_done = watcher.fallback_decision({"has_report": True})
+    check(fallback_done["action"] == "finish",
+          "правило-фолбэк с отчётом не закрывает сессию: %s" % fallback_done["action"])
 
     print("4) порог компактизации — постоянные 0.9 (решение владельца 24.11)")
     check(0 < float(getattr(watcher, "COMPACTION_TRIGGER", 0)) <= 1,
