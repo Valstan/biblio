@@ -95,6 +95,29 @@ STATE_FILE = LOCAL / "mcode-web" / "points-watchdog.json"
 DEFAULT_BUDGET = {1000: 800_000, 400: 600_000}
 #: Номинал неизвестен (панель не ответила) — порог по умолчанию.
 FALLBACK_BUDGET = 700_000
+#: Остаток очков аккаунта — по данным сайта MiniMax. Это тот же эндпоинт,
+#: который дёргает веб-консоль MiniMax (`GET /minimax-cloud/api/v1/credit/details`):
+#: леджер дневных грантов с выданным / потраченным / остатком. Остаток =
+#: сумма `remaining_amount` по непросроченным грантам.
+#:
+#: ⚠️ Очки **накапливаются**: каждый дневной грант (400 или 1000) живёт ~30 суток
+#: (проверено: `expire_at_ms - granted_at_ms` ≈ 29.8 сут на всех грантах) и
+#: остатки складываются. Поэтому «сегодняшняя клетка» из `signin/status` — это
+#: НЕ остаток: у бывшего аккаунта p-orca остаток 4779.70 при дневном гранте 400.
+#: Тратится остаток по очереди, с самых старых грантов.
+BALANCE_URL = "https://agent.minimax.io/minimax-cloud/api/v1/credit/details"
+#: Кэш остатка: панель отвечает небыстро, а лечащий ходит по областям каждые
+#: 10 с. Двух минут кэша хватает: остаток меняется медленно.
+BALANCE_TTL_SEC = 120
+#: Остаток ниже этого — аккаунт меняем.
+#:
+#: ⚠️ Владелец предлагал 10 очков («когда очков станет меньше 10»). По замеру это
+#: слишком туго: один очко ≈ 837 биллинговых токенов, то есть 10 очков — это
+#: ~8 тыс. токенов запаса, а **один запрос** стоит медианой 1 178, а на хвосте
+#: (p99 по 133 657 запросам) — 206 138 токенов ≈ 246 очков, максимум — 845 тыс.
+#: ≈ 1 009 очков. При пороге 10 аккаунт умирал бы прямо посреди хода.
+#: Поэтому дефолт — 300 очков (≈250 тыс. токенов запаса, перекрывает p99).
+POINTS_THRESHOLD = 300.0
 #: Порог не может быть нулевым и не может превышать дефолт класса.
 MIN_BUDGET = 50_000
 #: Час сброса суточных очков у вендора (MSK). Очки начисляются на сутки,
@@ -370,6 +393,60 @@ def remember_points(email: str, points: int) -> None:
     save_state(state)
 
 
+def remaining_points(area_dir: Path, email: str, force: bool = False) -> float:
+    """Остаток очков аккаунта по данным сайта MiniMax.
+
+    Возвращает сумму остатков по грантам. `None` — остаток узнать не удалось
+    (токен протух, сеть или сайт недоступны): тогда вердикт опирается на
+    расход токенов.
+
+    ⚠️ Кэш на `BALANCE_TTL_SEC`: лечащий ходит по областям каждые 10 с, а
+    панель отвечает небыстро.
+    """
+    if not email:
+        return None
+    state = load_state()
+    cache = (state.get("areas") or {}).get("balance")
+    cache = cache if isinstance(cache, dict) else {}
+    cached = cache.get(email)
+    now = time.time()
+    if (not force and isinstance(cached, dict)
+            and cached.get("email") == email
+            and now - float(cached.get("at") or 0) < BALANCE_TTL_SEC):
+        value = cached.get("remaining")
+        return float(value) if value is not None else None
+    token = (store_record(area_dir) or {}).get("accessToken") or ""
+    if not token:
+        return None
+    req = urllib.request.Request(
+        BALANCE_URL, method="GET",
+        headers={"Accept": "application/json", "Authorization": "Bearer " + token})
+    try:
+        with _opener().open(req, timeout=20) as resp:
+            payload = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    details = payload.get("details")
+    if not isinstance(details, list):
+        return None
+    total = 0.0
+    for row in details:
+        if not isinstance(row, dict):
+            continue
+        try:
+            total += float(row.get("remaining_amount") or 0)
+        except (TypeError, ValueError):
+            continue
+    areas = state.setdefault("areas", {})
+    cache = areas.get("balance")
+    cache = cache if isinstance(cache, dict) else {}
+    cache[email] = {"remaining": total, "at": now, "email": email,
+                    "grants": len(details)}
+    areas["balance"] = cache
+    save_state(state)
+    return total
+
+
 # ─────────────────────────────────────────────────────────────── порог
 
 def budget_for(points: int, deaths: list = None) -> int:
@@ -501,7 +578,14 @@ def probe(area_dir: Path, timeout: int = 30) -> tuple:
       * ``unknown``   — сеть/вендор недоступны, отказа по очкам **нет**.
     """
     base, model = provider_of(area_dir)
-    token = (store_record(area_dir) or {}).get("accessToken") or ""
+    rec = store_record(area_dir)
+    token = rec.get("accessToken") or ""
+    email = str(rec.get("email") or "")
+    # Сначала остаток очков: если он виден и равен нулю, аккаунт мёртв —
+    # ход к модели не нужен (дешевле и точнее, чем ловить отказ провайдера).
+    left = remaining_points(area_dir, email, force=True) if email else None
+    if left is not None and left <= 0:
+        return "exhausted", "на сайте остаток %s очков" % left
     if not base or not model:
         return "unknown", "у области нет конфига провайдера"
     if not token:
@@ -535,6 +619,30 @@ def probe(area_dir: Path, timeout: int = 30) -> tuple:
 
 # ─────────────────────────────────────────────────────────── сводка
 
+def verdict_for(remaining, threshold: float, billable: int, budget: int,
+                idle: bool, points: int = 0) -> tuple:
+    """Вердикт по аккаунту: (вердикт, пояснение).
+
+    Порядок:
+    1. **Остаток очков известен** — он с сайта MiniMax и он точен:
+       ниже порога ⇒ аккаунт меняем, выше ⇒ живой (расход тут ни при чём:
+       у аккаунта может быть накоплено до 4 800 очков);
+    2. остаток узнать не удалось ⇒ запасная эвристика «расход токенов»;
+    3. область простаивает ⇒ не трогаем (очки не растут).
+    """
+    if remaining is not None and remaining <= threshold:
+        return "почти без очков", "осталось %s очков (порог %s)" % (remaining, threshold)
+    if remaining is not None:
+        return "жив", "осталось %s очков, расход %s" % (remaining, billable)
+    if idle:
+        return "простаивает", "последний запрос давно — расход не растёт"
+    if billable >= budget:
+        return "почти без очков", (
+            "расход %s при пороге %s (номинал %s очков, остаток узнать не удалось)" % (
+                billable, budget, points or "?"))
+    return "жив", "расход %s из %s (номинал %s очков)" % (billable, budget, points or "?")
+
+
 def usage(area_dir: Path, slug: str = "", force: bool = False, network: bool = True) -> dict:
     """Сводка по аккаунту области: кто стоит, с какого момента, расход, порог."""
     rec = store_record(area_dir)
@@ -542,7 +650,8 @@ def usage(area_dir: Path, slug: str = "", force: bool = False, network: bool = T
     generation = rec.get("generation")
     out = {"slug": slug or area_dir.name, "email": email, "generation": generation,
            "installed_at": 0, "billable": 0, "requests": 0, "cache": 0, "last_ms": 0,
-           "points": 0, "budget": 0, "verdict": "нет данных", "why": ""}
+           "points": 0, "budget": 0, "remaining": None, "threshold": POINTS_THRESHOLD,
+           "verdict": "нет данных", "why": ""}
     if not email:
         out["why"] = "в области нет записи входа"
         return out
@@ -563,24 +672,22 @@ def usage(area_dir: Path, slug: str = "", force: bool = False, network: bool = T
     manual = int(((state.get("areas") or {}).get(out["slug"]) or {}).get("budget") or 0)
     budget = manual or budget_for(points, state.get("deaths") or [])
     out["budget"] = budget
+    # Порог по остатку очков — свой на область (владелец может менять).
+    threshold = float(((state.get("areas") or {}).get(out["slug"]) or {})
+                      .get("pointsThreshold") or POINTS_THRESHOLD)
+    out["threshold"] = threshold
     # ⚠️ Простаивающую область подменять незачем: очки не растут, а аккаунт
     # сгорит зря. Меняем только область, которая сейчас работает.
     last_ms = out["last_ms"]
     idle = bool(last_ms and (time.time() * 1000 - last_ms) > IDLE_GAP_SEC * 1000)
     if not last_ms:
         idle = True
-    if idle:
-        out["verdict"] = "простаивает"
-        out["why"] = "последний запрос %s назад — расход не растёт" % (
-            mtime.fmt_ms(last_ms) if last_ms else "не было")
-    elif out["billable"] >= budget:
-        out["verdict"] = "почти без очков"
-        out["why"] = "расход %s при пороге %s (номинал %s очков)" % (
-            out["billable"], budget, points or "?")
-    else:
-        out["verdict"] = "жив"
-        out["why"] = "расход %s из %s (номинал %s очков)" % (
-            out["billable"], budget, points or "?")
+    # Остаток очков — по данным сайта MiniMax. Это точнее расхода: остаток
+    # видим прямо, а расход — эвристика (номинал очков ёмкость не задаёт).
+    remaining = remaining_points(area_dir, email, force=force)
+    out["remaining"] = remaining
+    out["verdict"], out["why"] = verdict_for(
+        remaining, threshold, out["billable"], budget, idle, points)
     return out
 
 
@@ -616,12 +723,33 @@ def cmd_status(args) -> int:
     if not rows:
         print("областей нет (ядро «МиниГена» недоступно?)")
         return 1
-    print("%-14s %-24s %-11s %-11s %-8s %-8s %s" % (
-        "область", "аккаунт", "израсходовано", "порог", "очки", "запросов", "вердикт"))
+    print("%-14s %-24s %-11s %-11s %-9s %-8s %s" % (
+        "область", "аккаунт", "остаток", "расход", "порог", "запросов", "вердикт"))
     for r in rows:
-        print("%-14s %-24s %-11s %-11s %-8s %-8s %s" % (
-            r["slug"], (r["email"] or "?")[:24], r["billable"], r["budget"],
-            r["points"] or "?", r["requests"], r["verdict"]))
+        left = r.get("remaining")
+        print("%-14s %-24s %-11s %-11s %-9s %-8s %s" % (
+            r["slug"], (r["email"] or "?")[:24],
+            ("%.2f" % left) if left is not None else "?",
+            r["billable"], r["budget"], r["requests"], r["verdict"]))
+    return 0
+
+
+def cmd_balance(args) -> int:
+    """Остаток очков по областям — прямо с сайта MiniMax.
+
+    Это тот же эндпоинт, что и у веб-консоли MiniMax:
+    `GET /minimax-cloud/api/v1/credit/details` — леджер дневных грантов.
+    """
+    rows = status(args.area, force=True)
+    if not rows:
+        print("областей нет (ядро «МиниГена» недоступно?)")
+        return 1
+    print("%-14s %-24s %-11s %s" % ("область", "аккаунт", "остаток", "вердикт"))
+    for r in rows:
+        left = r.get("remaining")
+        print("%-14s %-24s %-11s %s" % (
+            r["slug"], (r["email"] or "?")[:24],
+            ("%.2f" % left) if left is not None else "не узнать", r["verdict"]))
     return 0
 
 
@@ -683,13 +811,27 @@ def cmd_learn(args) -> int:
 
 
 def cmd_set(args) -> int:
+    """Порог остатка очков для области (в очках)."""
     state = load_state()
     areas = state.setdefault("areas", {})
     rec = areas.get(args.area) or {}
-    rec["budget"] = int(args.tokens)
+    rec["pointsThreshold"] = float(args.value)
     areas[args.area] = rec
     save_state(state)
-    print("порог области %s = %s токенов" % (args.area, args.tokens))
+    print("порог области %s = %s очков" % (args.area, args.value))
+    return 0
+
+
+def cmd_set_budget(args) -> int:
+    """Порог расхода для области (в биллинговых токенах) — запасной, если
+    остаток очков узнать не удалось."""
+    state = load_state()
+    areas = state.setdefault("areas", {})
+    rec = areas.get(args.area) or {}
+    rec["budget"] = int(args.value)
+    areas[args.area] = rec
+    save_state(state)
+    print("порог расхода области %s = %s токенов" % (args.area, args.value))
     return 0
 
 
@@ -713,14 +855,24 @@ def main() -> int:
     p_refresh.add_argument("area", nargs="?", default="")
     p_refresh.set_defaults(func=cmd_refresh)
 
+    p_balance = sub.add_parser("balance", help="остаток очков по сайту MiniMax")
+    p_balance.add_argument("area", nargs="?", default="")
+    p_balance.set_defaults(func=cmd_balance)
+
     p_learn = sub.add_parser("learn", help="выученная статистика отказов")
     p_learn.add_argument("--json", action="store_true")
     p_learn.set_defaults(func=cmd_learn)
 
-    p_set = sub.add_parser("set", help="ручной порог для области")
+    p_set = sub.add_parser("set", help="порог остатка очков для области (в очках)")
     p_set.add_argument("area")
-    p_set.add_argument("tokens", type=int)
+    p_set.add_argument("value", type=float)
     p_set.set_defaults(func=cmd_set)
+
+    p_setb = sub.add_parser("set-budget",
+                             help="порог расхода для области (в токенах, запасной)")
+    p_setb.add_argument("area")
+    p_setb.add_argument("value", type=int)
+    p_setb.set_defaults(func=cmd_set_budget)
 
     args = parser.parse_args()
     if not getattr(args, "func", None):

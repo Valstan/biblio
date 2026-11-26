@@ -137,7 +137,26 @@ def main() -> int:
     check(abs(start - ref.timestamp()) < 120,
           "окно не совпадает с сегодняшним сбросом (получено %s)" % datetime.datetime.fromtimestamp(start))
 
-    print("5) лечащий: вердикт T4 и проба аккаунта на месте")
+    print("5) вердикт по остатку очков (данные сайта MiniMax)")
+    v, why = mp.verdict_for(50.0, mp.POINTS_THRESHOLD, 0, 800000, False)
+    check(v == "почти без очков", "остаток ниже порога должен давать подмену (получено %s)" % v)
+    check("осталось" in why, "пояснение должно называть остаток")
+    v2, _ = mp.verdict_for(5000.0, mp.POINTS_THRESHOLD, 3000000, 800000, False)
+    check(v2 == "жив",
+          "большой остаток при большом расходе — аккаунт живой (получено %s)" % v2)
+    v3, _ = mp.verdict_for(None, mp.POINTS_THRESHOLD, 900000, 800000, False, 1000)
+    check(v3 == "почти без очков",
+          "без остатка работает запасная эвристика по расходу (получено %s)" % v3)
+    v4, _ = mp.verdict_for(None, mp.POINTS_THRESHOLD, 1000, 800000, True)
+    check(v4 == "простаивает", "простаивающая область не трогается (получено %s)" % v4)
+    check(mp.POINTS_THRESHOLD >= 200,
+          "порог по очкам должен перекрывать p99 одного запроса (246 очков), а не 10")
+    src_points = (HERE / "minimax-points.py").read_text(encoding="utf-8")
+    check("credit/details" in src_points,
+          "остаток должен читаться с сайта MiniMax (credit/details)")
+    check("remaining_points" in src_points, "функция чтения остатка не найдена")
+
+    print("6) лечащий: вердикт T4 и проба аккаунта на месте")
     source = (HERE / "minimax-autheal.py").read_text(encoding="utf-8")
     check('out["verdict"] = "ПОЧТИ БЕЗ ОЧКОВ"' in source,
           "в diagnose нет вердикта «ПОЧТИ БЕЗ ОЧКОВ»")
@@ -149,9 +168,11 @@ def main() -> int:
     probe_call = source.count("points_probe(area[\"dir\"])")
     check(probe_call >= 1, "проба аккаунта не стоит в пути получения аккаунта")
 
-    print("6) watchdog не ломает лечащего без сети")
+    print("7) watchdog не ломает лечащего без сети")
     check(mp.classify_response(0, "") == "unknown",
           "сетевая ошибка не должна читаться как отказ по очкам")
+    check(mp.remaining_points(pathlib.Path(tempfile.gettempdir()), "нет@такого") is None,
+          "остаток несуществующего аккаунта должен быть None, а не 0")
 
     if failures:
         print("❌ приёмка watchdog'а очков: FAIL (%d)" % len(failures))
