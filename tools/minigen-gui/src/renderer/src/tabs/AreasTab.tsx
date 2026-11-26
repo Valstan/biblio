@@ -3,6 +3,7 @@ import type { Area, Snapshot } from '@shared/types'
 import { api } from '../api'
 import { verdictClass } from '../format'
 import { AREA_COLUMNS, DEFAULT_AREA_SORT, nextSort, sortAreas } from './areas-sort'
+import { DRIVER_HINTS, DRIVER_LABELS, DRIVER_VALUES, driverHint } from './driver-view'
 
 interface Props {
   areas: Area[]
@@ -10,6 +11,19 @@ interface Props {
   run: (action: () => Promise<unknown>) => Promise<void>
   busy: boolean
 }
+
+/**
+ * Переключатель «водитель проекта» (промт КАРМАНА #174): в каждый момент у
+ * проекта один водитель сессий — либо «Управляющий», либо автомат управления
+ * сессиями, либо никто. Значение «по правилу» — то самое правило по
+ * умолчанию: если в области работает Управляющий, водит он (автомат только
+ * наблюдает), иначе — автомат.
+ */
+const DRIVERS = DRIVER_VALUES.map((value) => ({
+  value,
+  label: DRIVER_LABELS[value],
+  hint: DRIVER_HINTS[value]
+}))
 
 export default function AreasTab({ areas, snapshot, run, busy }: Props) {
   const [creating, setCreating] = useState(false)
@@ -115,6 +129,7 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
                 </button>
               </th>
             ))}
+            <th>Водитель</th>
             <th>Действия</th>
           </tr>
         </thead>
@@ -168,6 +183,25 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
                     )}
                   </div>
                 )}
+              </td>
+              <td>
+                <select
+                  value={area.driver || 'auto'}
+                  disabled={busy}
+                  title={driverHint(area)}
+                  onChange={(e) =>
+                    void run(() => api.setDriver(area.slug, e.target.value))
+                  }
+                >
+                  {DRIVERS.map((item) => (
+                    <option key={item.value} value={item.value}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+                <div className="muted small">
+                  {area.driverNow?.title ? `сейчас: ${area.driverNow.title}` : 'сейчас: —'}
+                </div>
               </td>
               <td className="actions">
                 <button className="ghost" disabled={busy} onClick={() => void run(() => api.start(area.slug))}>

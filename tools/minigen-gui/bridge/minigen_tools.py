@@ -293,6 +293,20 @@ TOOLS: list[dict[str, Any]] = [
           "areas.set_autoheal", True,
           "сменит режим обслуживания области"),
 
+    _tool("areas.set_driver",
+          "Переключить водителя сессий области (промт #174): кто водит сессиями "
+          "проекта — «manager» (Управляющий: автомат только наблюдает и пишет в "
+          "отчёт, что не действует), «automaton» (автомат управления сессиями), "
+          "«none» (никто не вмешивается) или «auto» (по правилу: если в области "
+          "работает Управляющий — водит он, иначе автомат).",
+          {"type": "object",
+           "properties": {"slug": SLUG,
+                          "driver": {"type": "string",
+                                     "enum": ["auto", "manager", "automaton", "none"]}},
+           "required": ["slug", "driver"]},
+          "areas.set_driver", True,
+          "сменит водителя сессий области"),
+
     _tool("areas.start",
           "Запустить десктоп области (открыть окно MiniMax Code этой области).",
           {"type": "object", "properties": {"slug": SLUG}, "required": ["slug"]},
