@@ -121,6 +121,47 @@ def main() -> int:
     check("COMPACTION_TRIGGER = 0.9" in src,
           "в коде сторожа порог не равен 0.9")
 
+    print("5) постоянный порог пишется ТОЛЬКО в область minigen")
+    check(getattr(watcher, "COMPACTION_AREA", "") == "minigen",
+          "не задано, к какой области относится решение владельца")
+    body = src[src.find("def reset_session("):][:3000]
+    check("area_compaction_trigger(area)" in body,
+          "сброс на месте различает область minigen и чужие области не через "
+          "проверку области")
+    check(body.count("set_compaction_trigger") == 0,
+          "сброс на месте пишет порог напрямую — мимо проверки области")
+
+    # ⚠️ Смысл проверки: решение владельца касается области `minigen`.
+    # Сброс на месте идёт по ЛЮБОЙ области, и запись порога уехала бы в
+    # чужие конфиги (у brain2 свой порог 0.5, у остальных — дефолт рантайма).
+    # В чужих областях сброс лишь не трогает конфиг: «очистку» делает сам
+    # рантайм — сессия уже перешла порог, сжатие случится само.
+    with tempfile.TemporaryDirectory() as tmp:
+        foreign = pathlib.Path(tmp) / "p-chuv"
+        foreign.mkdir()
+        cfg = foreign / "config.yaml"
+        cfg.write_text(CONFIG, encoding="utf-8")
+        before = cfg.read_text(encoding="utf-8")
+        res = watcher.area_compaction_trigger({"slug": "brain2", "dir": foreign})
+        check(res.get("ok"), "порог для чужой области отвечает ошибкой: %s"
+              % res.get("why"))
+        check(not res.get("changed"),
+              "чужой объект отмечен как изменённый: %s" % res)
+        check(cfg.read_text(encoding="utf-8") == before,
+              "конфиг чужой области изменён")
+
+        own = pathlib.Path(tmp) / "p-svoy"
+        own.mkdir()
+        cfg2 = own / "config.yaml"
+        cfg2.write_text(CONFIG, encoding="utf-8")
+        res2 = watcher.area_compaction_trigger({"slug": "minigen", "dir": own})
+        check(res2.get("ok"), "порог для своей области не поставился: %s"
+              % res2.get("why"))
+        check(res2.get("changed") is True,
+              "в своей области порог не записан")
+        check("compactionTriggerAt: 0.9" in cfg2.read_text(encoding="utf-8"),
+              "в своей области порог не 0.9")
+
     if failures:
         print("❌ приёмка сброса на месте: FAIL (%d)" % len(failures))
         return 1
