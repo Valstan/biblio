@@ -1,4 +1,5 @@
 # Логи отладки, сохранённая позиция и собранные пакеты — артефакты работы, не исходники
 clock-debug.log
+_cap_*.png
 clock-position.txt
 clock*.zip
