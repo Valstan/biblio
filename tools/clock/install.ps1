@@ -40,7 +40,38 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Silen
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 1
 
-# --- 3. autostart shortcut: wscript, not powershell ---
+# --- 3. autostart ---
+# 3a. Scheduled Task "KompikClock" - the main entry point.
+#     trigger "at log on": the widget is up right after the PC is turned on;
+#     trigger "once + repeat every 10 min": a watchdog. If the widget was killed
+#     (a stray "Exit" in the menu, a session cleanup), the next repeat brings
+#     it back. The single-instance mutex keeps the repeats from piling up.
+# 3b. The Startup folder shortcut stays as a fallback: it needs no rights at
+#     all and survives a cleanup of the task scheduler.
+$TaskName = 'KompikClock'
+$TaskRegistered = $false
+try {
+    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\wscript.exe" -Argument ('"{0}"' -f $VbsTarget)
+    $trigLogon = New-ScheduledTaskTrigger -AtLogOn -User ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME)
+    $trigWatch = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(10) `
+        -RepetitionInterval (New-TimeSpan -Minutes 10) -RepetitionDuration ([TimeSpan]::FromDays(3650))
+    $principal = New-ScheduledTaskPrincipal -UserId ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME) `
+        -LogonType Interactive -RunLevel Limited
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+        -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+    Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($trigLogon, $trigWatch) `
+        -Settings $settings -Principal $principal `
+        -Description 'Kompik clock: date and time widget (starts at logon, watchdog every 10 minutes)' `
+        -Force | Out-Null
+    $TaskRegistered = $true
+    Write-Host "  scheduled task: $TaskName (at logon + every 10 min)"
+} catch {
+    Write-Host "  scheduled task: NOT registered - $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host '  the Startup shortcut below still starts the clock at logon'
+}
+
+# --- 4. autostart shortcut: wscript, not powershell ---
 # The shortcut points at wscript.exe so that no console window appears at logon
 # and the widget does not belong to any console: closing a terminal cannot kill it.
 $WshShell = New-Object -ComObject WScript.Shell
@@ -51,9 +82,9 @@ $lnk.WorkingDirectory = $ToolsDir
 $lnk.Description      = 'Kompik clock: one-line date and time'
 $lnk.WindowStyle      = 7
 $lnk.Save()
-Write-Host "  autostart: $Shortcut"
+Write-Host "  autostart shortcut: $Shortcut"
 
-# --- 4. hide the native taskbar clock (Windows 11) ---
+# --- 5. hide the native taskbar clock (Windows 11) ---
 $cur = (Get-ItemProperty -Path $Key -Name 'ShowSystrayDateTimeValueName' -ErrorAction SilentlyContinue).ShowSystrayDateTimeValueName
 if ($null -eq $cur -or $cur -ne 0) {
     New-ItemProperty -Path $Key -Name 'ShowSystrayDateTimeValueName' -Value 0 -PropertyType DWord -Force | Out-Null
@@ -65,7 +96,7 @@ if ($null -eq $cur -or $cur -ne 0) {
     Write-Host '  native taskbar clock: already hidden'
 }
 
-# --- 5. start it (quiet: no console window) ---
+# --- 6. start it (quiet: no console window) ---
 Start-Process "$env:SystemRoot\System32\wscript.exe" -ArgumentList "`"$VbsTarget`""
 Start-Sleep -Seconds 3
 
@@ -75,10 +106,13 @@ if ($alive) {
     Write-Host ''
     Write-Host 'Done. The clock is running.' -ForegroundColor Green
     Write-Host "  payload:    $Target"
+    if ($TaskRegistered) { Write-Host "  autostart:  task $TaskName (at logon + every 10 min)" }
     Write-Host "  autostart:  $Shortcut"
     Write-Host ''
     Write-Host 'Right-click the clock: bigger / smaller / show the system clock / exit.' -ForegroundColor Green
-    Write-Host 'To remove: delete the folder, the shortcut, and set'
+    Write-Host 'The clock keeps itself above the taskbar and remembers where it is dragged.'
+    Write-Host 'To remove: delete the folder, the shortcut, the task'
+    Write-Host "  (Unregister-ScheduledTask -TaskName $TaskName), and set"
     Write-Host "  HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced\ShowSystrayDateTimeValueName = 1"
     Write-Host ''
 } else {

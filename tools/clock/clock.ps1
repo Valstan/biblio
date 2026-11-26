@@ -7,12 +7,14 @@ $FontFamily   = 'Segoe UI'
 $FontSize     = 13          # points; the native taskbar clock is about 9
 $FontBold     = $false
 $MarginRight  = 10          # pixels from the right screen edge
-$MarginBottom = 6           # pixels from the taskbar edge
+$MarginBottom = 28          # GAP between the chip bottom and the taskbar top
 $Format       = 'ddd, dd MMM yyyy, HH:mm'
 $ShowSystemClock = $false   # hide the native taskbar clock (Windows 11 key)
 # The chip sits just ABOVE the taskbar. Drawing it inside the taskbar strip does
 # not work: on Windows 11 the taskbar surface is drawn over topmost windows
 # (verified 26.11.2026 - the clock was invisible in that mode).
+# The gap is not 0: a chip that touches the panel looks like it is hidden behind
+# it (the complaint on 26.11.2026). 28 px keeps it clearly detached.
 # =================================================================
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
@@ -41,6 +43,28 @@ function Get-TaskbarRect {
   $r = New-Object ClockNative+RECT
   if ([ClockNative]::GetWindowRect($h, [ref]$r)) { return $r }
   return $null
+}
+
+# The screen area WITHOUT the taskbar strip (Windows reports it as the working
+# area of the primary screen). The chip must stay inside it: on Windows 11 the
+# taskbar is painted over topmost windows, so a chip that overlaps the strip
+# disappears behind the panel and cannot be grabbed with the mouse.
+function Get-WorkArea {
+  return [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+}
+
+# Keep the chip inside the working area: never behind the taskbar, never off
+# the screen. Called while dragging and after a position restore.
+function Clamp-ChipPosition {
+  $wa = Get-WorkArea
+  $maxLeft = $wa.Right - $form.Width
+  $maxTop  = $wa.Bottom - $form.Height
+  if ($maxLeft -lt $wa.Left) { $maxLeft = $wa.Left }
+  if ($maxTop  -lt $wa.Top)  { $maxTop  = $wa.Top }
+  if ($form.Left -lt $wa.Left)   { $form.Left = $wa.Left }
+  if ($form.Left -gt $maxLeft)   { $form.Left = $maxLeft }
+  if ($form.Top  -lt $wa.Top)    { $form.Top  = $wa.Top }
+  if ($form.Top  -gt $maxTop)    { $form.Top  = $maxTop }
 }
 
 function Test-DarkTheme {
@@ -95,11 +119,28 @@ function New-ClockFont([double]$size) {
 # Where the owner dragged the chip to. Kept next to the script, so the position
 # survives a restart and a new login.
 $PositionFile = Join-Path $PSScriptRoot 'clock-position.txt'
+# The font size the owner picked with the menu. Kept as well: the widget now
+# starts itself at every logon, so without this the size would reset to the
+# default on every boot.
+$StyleFile = Join-Path $PSScriptRoot 'clock-style.txt'
 
-function Save-ChipPosition {
+function Save-ChipState {
   try {
     Set-Content -LiteralPath $PositionFile -Value ("{0},{1}" -f $form.Left, $form.Top) -Encoding ASCII
+    Set-Content -LiteralPath $StyleFile -Value ("size={0}" -f $script:FontSize) -Encoding ASCII
   } catch {}
+}
+
+function Restore-ChipStyle {
+  if (-not (Test-Path $StyleFile)) { return }
+  $raw = (Get-Content -LiteralPath $StyleFile -Encoding ASCII -ErrorAction SilentlyContinue | Select-Object -First 1)
+  if ($raw -and $raw -match 'size\s*=\s*(\d+)') {
+    $s = [int]$Matches[1]
+    if ($s -ge 7 -and $s -le 40) {
+      $script:FontSize = $s
+      $label.Font = New-ClockFont $s
+    }
+  }
 }
 
 function Restore-ChipPosition {
@@ -107,11 +148,14 @@ function Restore-ChipPosition {
   $raw = (Get-Content -LiteralPath $PositionFile -Encoding ASCII -ErrorAction SilentlyContinue | Select-Object -First 1)
   if (-not $raw -or $raw -notmatch '^\s*(-?\d+)\s*,\s*(-?\d+)\s*$') { return $false }
   $x = [int]$Matches[1]; $y = [int]$Matches[2]
-  $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-  if ($x -lt $screen.Left - 200 -or $x -gt $screen.Right - 50) { return $false }
-  if ($y -lt $screen.Top - 40 -or $y -gt $screen.Bottom - 10) { return $false }
+  # The working area, not the screen: a saved position under the taskbar strip
+  # is rejected, otherwise the chip would start hidden behind the panel.
+  $wa = Get-WorkArea
+  if ($x -lt $wa.Left - 200 -or $x -gt $wa.Right - 50) { return $false }
+  if ($y -lt $wa.Top - 40 -or $y -gt $wa.Bottom - 10) { return $false }
   $form.Left = $x
   $form.Top = $y
+  Clamp-ChipPosition
   return $true
 }
 
@@ -128,7 +172,10 @@ $form.Padding = New-Object System.Windows.Forms.Padding 8, 2, 10, 2
 $label = New-Object System.Windows.Forms.Label
 $label.AutoSize = $false
 $label.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
-$label.BackColor = $form.BackColor
+# Transparent so the outline drawn by the form (below) stays visible: without
+# it the chip merges into a light wallpaper and there is nothing to grab
+# (the owner could not catch the widget on 26.11.2026).
+$label.BackColor = [System.Drawing.Color]::Transparent
 $label.Font = New-ClockFont $FontSize
 $label.ForeColor = $(if ($isDark) { [System.Drawing.Color]::FromArgb(240, 240, 240) } else { [System.Drawing.Color]::FromArgb(32, 32, 32) })
 $form.Controls.Add($label)
@@ -234,6 +281,9 @@ $onMouseMove = {
     $screen = $sender.PointToScreen($e.Location)
     $form.Left = $screen.X - $script:dragOffset.X
     $form.Top = $screen.Y - $script:dragOffset.Y
+    # The chip is clamped while it is dragged: it cannot be pushed under the
+    # taskbar strip, where it would be invisible and impossible to grab again.
+    Clamp-ChipPosition
     if ($DebugLog) {
       Add-Content -LiteralPath (Join-Path $PSScriptRoot 'clock-debug.log') `
         -Value ('{0} mousemove screen={1},{2} offset={3},{4} form={5},{6} from {7}' -f `
@@ -246,7 +296,7 @@ $onMouseUp = {
   param($sender, $e)
   if (-not $script:dragging) { return }
   $script:dragging = $false
-  try { Save-ChipPosition } catch { Write-ClockError 'MouseUp' $e }
+  try { Save-ChipState } catch { Write-ClockError 'MouseUp' $e }
 }
 foreach ($target in @($form, $label)) {
   $target.Add_MouseDown($onMouseDown)
@@ -254,6 +304,21 @@ foreach ($target in @($form, $label)) {
   $target.Add_MouseUp($onMouseUp)
 }
 
+# A thin outline around the chip. The chip takes the taskbar colour, which on a
+# light wallpaper is the same colour as the wallpaper: the widget looked like it
+# was part of the background and could not be grabbed (26.11.2026). The label
+# inside is transparent, so this outline is the only thing that separates the
+# chip from the desktop.
+$form.Add_Paint({
+  param($sender, $e)
+  try {
+    $pen = New-Object System.Drawing.Pen -ArgumentList @([System.Drawing.Color]::FromArgb(150, 0, 0, 0), [single]1)
+    $e.Graphics.DrawRectangle($pen, 0, 0, $sender.Width - 1, $sender.Height - 1)
+    $pen.Dispose()
+  } catch { Write-ClockError 'Paint' $e }
+})
+
+Restore-ChipStyle
 Update-Clock
 # A restored position must switch the anchoring off, otherwise the next tick
 # snaps the chip back to the corner (found on 26.11.2026 - the dragged position
@@ -266,14 +331,14 @@ $timer.Add_Tick({ Update-Clock; Set-ChipRegion })
 $timer.Start()
 
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
-$itemBigger = $menu.Items.Add('Bigger', $null, { $script:FontSize = $script:FontSize + 1; $label.Font = New-ClockFont $script:FontSize; Update-Clock })
-$itemSmaller = $menu.Items.Add('Smaller', $null, { $script:FontSize = [Math]::Max(7, $script:FontSize - 1); $label.Font = New-ClockFont $script:FontSize; Update-Clock })
+$itemBigger = $menu.Items.Add('Bigger', $null, { $script:FontSize = $script:FontSize + 1; $label.Font = New-ClockFont $script:FontSize; Update-Clock; Save-ChipState })
+$itemSmaller = $menu.Items.Add('Smaller', $null, { $script:FontSize = [Math]::Max(7, $script:FontSize - 1); $label.Font = New-ClockFont $script:FontSize; Update-Clock; Save-ChipState })
 [void]$menu.Items.Add('-')
 $itemAnchor = $menu.Items.Add('Snap to the corner', $null, { $script:anchored = $true; Remove-Item -LiteralPath $PositionFile -ErrorAction SilentlyContinue })
 $itemShowSystem = $menu.Items.Add('Show system clock', $null, { Set-SystemClockHidden $false })
 $itemHideSystem = $menu.Items.Add('Hide system clock', $null, { Set-SystemClockHidden $true })
 [void]$menu.Items.Add('-')
-$itemQuit = $menu.Items.Add('Exit', $null, { Save-ChipPosition; $timer.Stop(); $form.Close() })
+$itemQuit = $menu.Items.Add('Exit', $null, { Save-ChipState; $timer.Stop(); $form.Close() })
 $form.ContextMenuStrip = $menu
 $form.Add_FormClosing({ $timer.Stop() })
 $form.Add_Shown({ Set-ChipRegion })
