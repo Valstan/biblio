@@ -33,12 +33,31 @@ r"""Канал промтов раздела `MiniGen` в КАРМАНе (ман
     (свой каталог программы), затем переменная ``PROMPTS_TOKEN_MINIGEN``;
   * адрес сервиса — файл ``vault-url`` в том же каталоге, затем файл
     ``%USERPROFILE%\.biblio-keys\vault-url`` (адрес сервиса один для всех, а
-    не секрет), затем переменная ``KARMAN_URL``.
+    не секрет), затем переменная ``KARMAN_URL``;
+  * секрет канала библиотеки (``PROMPTS_INGEST_SECRET``) — переменная, затем
+    файл ``prompts-ingest-secret``, затем **vault-комната проекта** (её читает
+    токен комнаты ``room-token``) — так же, как это делает программа.
 
 ⚠️ **Токен раздела берётся только из своего каталога.** В каталоге дома утилит
 (``.biblio-keys``) лежит токен **другого** раздела (``PROMPTS_TOKEN_BIBLIO``) —
 подставить его сюда значит спросить не свой раздел и получить 403. Каталог
 дома утилит — запасной источник **адреса**, не токена.
+
+**Два канала, один раздел.** Раздел `MiniGen` читается **двумя** путями, и они
+живут по-разному:
+
+- **канал раздела** (``GET/POST /api/prompts/section``, токен
+  ``PROMPTS_TOKEN_MINIGEN``) — он же архив: без него промт не убрать;
+- **канал библиотеки** (``GET /api/prompts?project=...``, общий секрет канала
+  ``PROMPTS_INGEST_SECRET``) — им программа читает **свой** раздел (вкладка
+  «Промты»).
+
+Живая проверка 26.11 (промт #100): канал раздела отвечает **503** (секрет
+сервису не выдан, выдача #36 не принята), а раздел через канал библиотеки
+**читается** — 11 промтов. Прежний клиент говорил «канал не настроен» и
+промтов не показывал: очередь была видна в программе и невидима в инструменте.
+Теперь клиент читает раздел **тем же путём, что и программа**, а состояние
+канала архива показывает честно и отдельно.
 
 Три урока из живых проверок (письмо brain от 23.11, пул G690):
 
@@ -72,6 +91,14 @@ URL_ENV = "KARMAN_URL"
 #: Файлы с ключами (в каталоге ключей программы).
 TOKEN_FILE = "prompts-token"
 URL_FILE = "vault-url"
+#: Секрет канала библиотеки промтов (общий секрет сервиса): им читается
+#: библиотека, в том числе раздел программы. Имя — как у сервиса.
+CHANNEL_SECRET = "PROMPTS_INGEST_SECRET"
+CHANNEL_SECRET_ENV = "PROMPTS_INGEST_SECRET"
+CHANNEL_SECRET_FILE = "prompts-ingest-secret"
+#: Токен комнаты vault'а — им читается секрет канала.
+ROOM_TOKEN_FILE = "room-token"
+ROOM_TOKEN_ENV = "KARMAN_ROOM_TOKEN"
 TIMEOUT = 20
 
 #: Коды ответа сервиса — человеческим языком (мандат brain, раздел «Ответы»).
@@ -84,6 +111,12 @@ REASONS = {
     503: "канал не настроен: раздел не отдаётся "
          "(токен не выдан комнате сервиса или выдача не принята)",
 }
+
+#: Что делать, когда канал архива закрыт: сказать, **кто** и **что** может
+#: открыть. Иначе «канал не настроен» — это не причина, а молчание.
+ARCHIVE_HINT = ("Архив ставит только канал раздела: его токен должен быть выдан "
+                "сервису (выдача в комнату-получателя — её принимает получатель). "
+                "Сами промты при этом читаются — по каналу библиотеки.")
 
 
 # ────────────────────────────────────────────────────────── имя секрета раздела
@@ -177,6 +210,62 @@ def read_base() -> tuple[str, str]:
     return "", ""
 
 
+def read_room_token() -> tuple[str, str]:
+    """(токен комнаты, источник) — им читается секрет канала из vault'а."""
+    value, _folder = _find(ROOM_TOKEN_FILE, keys_dirs())
+    if value:
+        return value, "file"
+    value = (os.environ.get(ROOM_TOKEN_ENV) or "").strip()
+    if value:
+        return value, "env"
+    return "", ""
+
+
+def read_channel_secret() -> tuple[str, str]:
+    """(секрет канала библиотеки, источник).
+
+    Источник: ``env`` | ``file`` | ``vault`` | ``''``. Секрет лежит в
+    vault-комнате проекта — читает его токен комнаты (как это делает программа:
+    `bridge/minigen_karman.py` → `vault_secret`).
+    """
+    value = (os.environ.get(CHANNEL_SECRET_ENV) or "").strip()
+    if value:
+        return value, "env"
+    value, _folder = _find(CHANNEL_SECRET_FILE, keys_dirs())
+    if value:
+        return value, "file"
+    value = _vault_secret(CHANNEL_SECRET)
+    if value:
+        return value, "vault"
+    return "", ""
+
+
+def _vault_secret(key: str) -> str:
+    """Секрет из vault-комнаты проекта (по токену комнаты).
+
+    Ошибка тут **не** исключение: канал может быть закрыт — и это не повод
+    ронять инструмент.
+    """
+    token, _src = read_room_token()
+    base, _base_src = read_base()
+    if not token or not base:
+        return ""
+    url = base.rstrip("/") + "/api/secrets?key=" + urllib.parse.quote(key)
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Accept", "application/json")
+    try:
+        with _opener().open(req, timeout=TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, OSError, urllib.error.HTTPError):
+        return ""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return ""
+    return str((payload.get("secrets") or {}).get(key) or "")
+
+
 # ────────────────────────────────────────────────────────── HTTP
 
 def _opener():
@@ -191,7 +280,7 @@ def _opener():
 
 
 def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
-    """Один вызов сервиса. Возвращает (код, payload).
+    """Один вызов **канала раздела** (токен раздела).
 
     Код ``0`` — вызова не было вовсе (нет токена/адреса или сеть недоступна);
     в payload тогда лежит ``error`` с причиной.
@@ -201,6 +290,17 @@ def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
     if not token:
         return 0, {"error": "токена раздела %s нет ни в файле, ни в env" % SECTION_SECRET,
                    "token_source": "", "url_source": base_src}
+    return call_with(token, method, path, body, token_src=token_src)
+
+
+def call_with(token_value: str, method: str, path: str,
+              body: dict | None = None, token_src: str = "") -> tuple[int, dict]:
+    """Один вызов сервиса с **точным** токеном (каналом).
+
+    Нужен, чтобы читать раздел по секрету канала, не выдавая его за токен
+    раздела: право на канал — у того, чей секрет в запросе.
+    """
+    base, base_src = read_base()
     if not base:
         return 0, {"error": "адрес сервиса не задан (файл vault-url или %s)" % URL_ENV,
                    "token_source": token_src, "url_source": ""}
@@ -208,7 +308,7 @@ def call(method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
     url = base.rstrip("/") + path
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("Authorization", "Bearer " + token)
+    req.add_header("Authorization", "Bearer " + token_value)
     req.add_header("Accept", "application/json")
     if data is not None:
         req.add_header("Content-Type", "application/json")
@@ -268,8 +368,51 @@ def _section_path(archived: bool = False) -> str:
     return "/api/prompts/section?project=%s%s" % (urllib.parse.quote(PROJECT, safe=""), query)
 
 
+def _library_path(archived: bool = False) -> str:
+    """Путь канала библиотеки: тот же раздел, но по общему секрету канала.
+
+    Им читается раздел в самой программе (вкладка «Промты») — то есть путь
+    живой, даже когда канал раздела (архива) ещё не настроен.
+    """
+    query = "&archived=1" if archived else ""
+    return "/api/prompts?project=%s%s" % (urllib.parse.quote(PROJECT, safe=""), query)
+
+
+def read_prompts(archived: bool = False) -> dict:
+    """Прочитать промты раздела. Возвращает:
+
+    - ``http`` — код ответа того канала, который ответил (200 — прочитали);
+    - ``path`` — ``section`` (канал раздела) или ``library`` (канал библиотеки);
+    - ``section_http`` — код канала раздела всегда (503 ⇒ архив недоступен);
+    - ``prompts`` — прочитанные промты; ``error`` — причина, если не вышло.
+
+    ⚠️ Канал раздела может отвечать 503 (секрет сервису не выдан), а раздел при
+    этом **читается** по секрету канала. Прежний клиент на 503 просто молчал:
+    очередь была видна в программе и невидима в инструменте.
+    """
+    code, payload = call("GET", _section_path(archived=archived))
+    if code == 200:
+        return {"http": 200, "path": "section", "section_http": 200,
+                "prompts": [normalize(p) for p in (payload.get("prompts") or [])],
+                "error": ""}
+    if code != 503:
+        return {"http": code, "path": "section", "section_http": code,
+                "prompts": [], "error": payload.get("error") or ""}
+    secret, _src = read_channel_secret()
+    if not secret:
+        return {"http": code, "path": "section", "section_http": code,
+                "prompts": [], "error": payload.get("error") or ""}
+    code2, payload2 = call_with(secret, "GET", _library_path(archived=archived))
+    if code2 != 200:
+        return {"http": code, "path": "section", "section_http": code,
+                "prompts": [], "error": payload.get("error") or ""}
+    return {"http": 200, "path": "library", "section_http": code,
+            "prompts": [normalize(p) for p in (payload2.get("prompts") or [])],
+            "error": ""}
+
+
 def status() -> dict:
-    """Живой статус канала: читается раздел или нет (и почему)."""
+    """Живой статус каналов: читается ли раздел и в каком канале."""
     token, token_src = read_token()
     base, base_src = read_base()
     out = {
@@ -281,36 +424,40 @@ def status() -> dict:
         "has_url": bool(base),
     }
     if not token:
-        out.update({"http": 0, "ok": False, "prompts": 0,
+        out.update({"http": 0, "ok": False, "prompts": 0, "read_path": "",
+                    "section_http": 0,
                     "reason": "токена раздела %s нет ни в файле, ни в env "
                               "(файл %s в каталоге ключей программы)"
                               % (SECTION_SECRET, TOKEN_FILE)})
         return out
     if not base:
-        out.update({"http": 0, "ok": False, "prompts": 0,
+        out.update({"http": 0, "ok": False, "prompts": 0, "read_path": "",
+                    "section_http": 0,
                     "reason": "адрес сервиса не задан (файл %s или %s)"
                               % (URL_FILE, URL_ENV)})
         return out
-    code, payload = call("GET", _section_path())
-    prompts = payload.get("prompts") or []
-    out["http"] = code
-    out["ok"] = code == 200
-    out["prompts"] = len(prompts)
-    if code == 200:
-        out["reason"] = "раздел читается"
-    elif code == 0:
-        out["reason"] = payload.get("error") or "сеть недоступна"
+    res = read_prompts()
+    out["http"] = res["http"]
+    out["prompts"] = len(res["prompts"])
+    out["read_path"] = res["path"]
+    out["section_http"] = res.get("section_http", res["http"])
+    out["ok"] = res["http"] == 200
+    if res["path"] == "library":
+        out["reason"] = ("раздел читается по секрету канала; канал раздела "
+                         "(архив) отвечает %s" % res["section_http"])
+    elif res["http"] == 200:
+        out["reason"] = "раздел читается (канал раздела)"
+    elif res["http"] == 0:
+        out["reason"] = res.get("error") or "сеть недоступна"
     else:
-        out["reason"] = REASONS.get(code, "HTTP %s" % code)
+        out["reason"] = REASONS.get(res["http"], "HTTP %s" % res["http"])
     return out
 
 
 def list_prompts(archived: bool = False) -> tuple[int, list]:
     """Живые промты раздела (или архивные при ``archived=True``)."""
-    code, payload = call("GET", _section_path(archived=archived))
-    if code != 200:
-        return code, []
-    return code, [normalize(p) for p in (payload.get("prompts") or [])]
+    res = read_prompts(archived=archived)
+    return res["http"], res["prompts"]
 
 
 def get_prompt(prompt_id: int) -> tuple[int, dict]:
@@ -346,14 +493,24 @@ def archive(prompt_id: int, done: bool = False) -> tuple[int, dict]:
     if not done:
         return 0, {"error": "не выполнил — не архивируй: "
                            "подтверди выполнение флагом --done"}
-    return call("POST", "/api/prompts/section",
-                {"project": PROJECT, "id": int(prompt_id), "archived": True})
+    code, payload = call("POST", "/api/prompts/section",
+                         {"project": PROJECT, "id": int(prompt_id), "archived": True})
+    if code == 503:
+        payload = dict(payload or {})
+        payload["error"] = "%s %s" % (payload.get("error") or REASONS.get(503, ""),
+                                     ARCHIVE_HINT)
+    return code, payload
 
 
 def unarchive(prompt_id: int) -> tuple[int, dict]:
     """Вернуть промт из архива (архив — не удаление)."""
-    return call("POST", "/api/prompts/section",
-                {"project": PROJECT, "id": int(prompt_id), "archived": False})
+    code, payload = call("POST", "/api/prompts/section",
+                         {"project": PROJECT, "id": int(prompt_id), "archived": False})
+    if code == 503:
+        payload = dict(payload or {})
+        payload["error"] = "%s %s" % (payload.get("error") or REASONS.get(503, ""),
+                                     ARCHIVE_HINT)
+    return code, payload
 
 
 # ────────────────────────────────────────────────────────── CLI
@@ -388,23 +545,31 @@ def main(argv: list | None = None) -> int:
         else:
             print("канал промтов раздела %s: %s" % (PROJECT, res["reason"]))
             print("   HTTP %s, промтов: %s" % (res["http"], res["prompts"]))
+            print("   канал раздела (архив): HTTP %s | прочитано по: %s"
+                  % (res.get("section_http"), res.get("read_path") or "—"))
             print("   токен раздела: %s (%s) | адрес: %s"
                   % (res["secret"], res["token_source"] or "нет",
                      res["url_source"] or "нет"))
         return 0 if res["ok"] else 1
 
     if command in ("list", "archived", "plans"):
-        code, items = list_prompts(archived=(command == "archived"))
+        res = read_prompts(archived=(command == "archived"))
+        code, items = res["http"], res["prompts"]
         if command == "plans":
             code, items = list_plans()
         if as_json:
-            print(json.dumps({"http": code, "prompts": items},
+            print(json.dumps({"http": code, "prompts": items,
+                              "read_path": res.get("path") or "",
+                              "section_http": res.get("section_http")},
                              ensure_ascii=False, indent=2))
             return 0 if code == 200 else 1
         if code != 200:
             print("не получилось: %s" % _explain(code),
                   file=sys.stderr)
             return 1
+        if res.get("path") == "library":
+            print("(прочитано по секрету канала; канал раздела — HTTP %s)"
+                  % res.get("section_http"))
         if not items:
             print("Пусто.")
             return 0
@@ -447,8 +612,10 @@ def main(argv: list | None = None) -> int:
             print("не получилось: %s" % payload.get("error"), file=sys.stderr)
             return 1
         if code != 200:
-            print("не получилось: %s" % _explain(code),
-                  file=sys.stderr)
+            # ⚠️ Причина из ответа сервиса — с подсказкой «что делать» (у 503
+            # архива её добавляет `archive`); общий код ответа — запасной вариант.
+            reason = str(payload.get("error") or "").strip() or _explain(code)
+            print("не получилось: %s" % reason, file=sys.stderr)
             return 1
         print("Промт #%s: archived=%s"
               % (payload.get("id", raw_id), payload.get("archived")))

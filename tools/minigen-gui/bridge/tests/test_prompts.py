@@ -64,6 +64,8 @@ class Handler(BaseHTTPRequestHandler):
     prompts: list = []
     sections: list = [SECTION]
     archive_calls: list = []
+    #: Код ответа на архив: 200 — работает, 503 — канал раздела закрыт.
+    archive_code = 200
 
     def log_message(self, *args):  # тишина
         pass
@@ -117,6 +119,9 @@ class Handler(BaseHTTPRequestHandler):
         Handler.calls.append(("POST", self.path, auth, body))
         if self.path.startswith("/api/prompts/section"):
             Handler.archive_calls.append(body)
+            if Handler.archive_code != 200:
+                self._send(Handler.archive_code, {"error": "канал не настроен"})
+                return
             self._send(200, {"id": body.get("id"), "archived": True})
             return
         if self.path.startswith("/api/prompts"):
@@ -450,6 +455,23 @@ class KarmanStoreTest(unittest.TestCase):
         res = store.archive("95", SECTION)
         self.assertFalse(res["ok"])
         self.assertIn("токена раздела нет", res["error"])
+
+    def test_closed_archive_channel_says_what_to_do(self) -> None:
+        """Канал архива закрыт ⇒ сообщение говорит, **что делать**.
+
+        ⚠️ Живой случай 26.11 (промт #100): канал раздела отвечает 503 (выдача
+        не принята), а раздел при этом читается по каналу библиотеки. «Канал не
+        настроен» без подсказки — это молчание, выданное за причину.
+        """
+        store = prompts.KarmanPromptStore()
+        Handler.archive_code = 503
+        try:
+            res = store.archive("94", SECTION)
+        finally:
+            Handler.archive_code = 200
+        self.assertFalse(res["ok"])
+        self.assertIn("канал раздела", res["error"])
+        self.assertIn("читаются", res["error"])
 
     def test_prompt_can_be_returned_from_the_archive(self) -> None:
         """Архив — не удаление: заданный по ошибке промт возвращается."""
