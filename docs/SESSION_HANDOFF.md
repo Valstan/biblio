@@ -119,10 +119,10 @@ Updated: 2026-11-26 (двадцать девятая смена: промт #100
   `tools/minigen-gui/bridge/minigen_bridge.py` (передача хранилища),
   `tools/minigen-gui/bridge/tests/test_prompts.py`,
   `AGENTS.md`, `docs/SESSION_HANDOFF.md`, `mailbox/to-brain/…`.
-  **Три PR, все смержены в `master`:** **#187** (`9e30a98` — код и приёмка; гейт
-  `gate pass 46s`, `panel pass 3m6s`), **#188** (`c5d5911` — README утилит;
-  `panel pass 3m9s`), **#189** (`49ae4a7` — уроки в пул и в «Грабли»;
-  `panel pass 3m5s`).
+  **PR полосы:** **#187** (`9e30a98` — код, приёмка и программа; гейт
+  `gate pass 46s`, `panel pass 3m6s`) и документация к нему — **#188, #189,
+  #190** (все смержены в `master`; полный список — `git log --oneline
+  origin/master`).
 - **Правок в репозитории `karman` не потребовалось**: контракт раздела уже
   есть (`GET/POST /api/prompts/section`, `section-auth.ts`, `runtime-secrets.ts`,
   `vault-client.ts`) — прочитан и проверен; блокер не в коде, а в непринятой
