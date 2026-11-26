@@ -58,10 +58,16 @@ def runtime_files() -> set[str]:
         # `BIN / "minimax-switch.py"`, `core.BIN / "..."`, `ORPHANS = BIN / "..."`,
         # а также PowerShell-скрипты, которые демоны зовут (`BIN / "mcode-....ps1"`)
         found |= set(re.findall(r'BIN\s*/\s*"([^"]+\.(?:py|ps1))"', text))
-        # `import minigen_core as core`
-        if re.search(r"^\s*import\s+minigen_core\b", text, re.M):
-            found.add("minigen_core.py")
-    return found
+        # ⚠️ Родные модули рядом: `import minigen_core as core`,
+        # `import minigen_thread as thread`, `import minigen_time as mtime`.
+        # Раньше проверка знала только про `minigen_core` — и новый модуль
+        # (промт #172: паспорт нитки) в список раскатки не попал бы, а демон
+        # на машине упал бы при старте. Теперь ловим **любой** такой импорт.
+        found |= set(re.findall(
+            r"(?m)^\s*import\s+(minigen_[a-z_]+)\b", text))
+    # Модули Python едут как `.py`, скрипты PowerShell — как есть.
+    return {name if name.endswith((".py", ".ps1")) else name + ".py"
+            for name in found}
 
 
 def main() -> int:

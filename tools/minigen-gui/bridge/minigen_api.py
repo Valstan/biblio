@@ -17,6 +17,7 @@
 | `POST /restart?name=<демон>` | перезапуск конкретного демона |
 | `POST /start?name=<демон>` / `POST /stop?name=<демон>` | запуск и остановка конкретного демона |
 | `POST /start-all` / `POST /stop-all` / `POST /restart-all` | то же для всех демонов |
+| `POST /treat-decision` | решение о лечении сессии: на вход — **факты**, на выход — одно из трёх действий (промт #172) |
 
 ⚠️ Зачем окну ходить в API (живой случай 24.11): демоны, поднятые с
 повышенными правами, окно не видит — WMI не отдаёт их командные строки, а
@@ -38,7 +39,7 @@ import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 import minigen_daemons as daemons
@@ -51,6 +52,17 @@ TOKEN_FILE = LOCAL / "bridge-token.txt"
 # (надзиратель демонов). Флаг «порт держим мы» нужен, чтобы окно знало,
 # кому говорить, а сам надзиратель не звал бы себя по сети.
 SERVING = False
+
+#: Решатель лечения сессий — **встроенная нейросеть «Управляющего»** (промт
+#: #172). Ставится мостом при старте (`set_decider`); пока не поставлен — API
+#: честно отвечает «решателя нет», и сторож применяет правило-фолбэк.
+DECIDER: Callable[[dict], dict] | None = None
+
+
+def set_decider(fn: Callable[[dict], dict] | None) -> None:
+    """Поставить (или снять) решателя лечения сессий."""
+    global DECIDER
+    DECIDER = fn
 
 
 def token() -> str:
@@ -141,6 +153,50 @@ class Handler(BaseHTTPRequestHandler):
                   or (query.get("token") or [""])[0])
         return bool(given) and given == token()
 
+    def _read_json(self) -> dict[str, Any]:
+        """Тело запроса — JSON (пустой словарь, если тела нет или оно битое)."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            length = 0
+        if length <= 0:
+            return {}
+        try:
+            raw = self.rfile.read(length).decode("utf-8", "replace")
+            data = json.loads(raw)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _treat_decision(self) -> None:
+        """Решение о лечении сессии — встроенная нейросеть «Управляющего» (#172).
+
+        На вход — **факты** о ситуации (вердикт сторожа, отчёт о выполнении,
+        сжатие контекста, репозиторий/ветка/worktree нитки, параллельные
+        сессии). На выход — одно из трёх действий + инструкция + причина.
+
+        ⚠️ Решателя может не быть (программа не подняла «Управляющего») — тогда
+        честный 503, и сторож применяет **правило-фолбэк**: оно не требует
+        завершать сессию без отчёта.
+        """
+        body = self._read_json()
+        facts = body.get("facts")
+        if not isinstance(facts, dict) or not facts:
+            self._send(400, {"ok": False, "why": "нужны факты о ситуации"})
+            return
+        decider = DECIDER
+        if decider is None:
+            self._send(503, {"ok": False,
+                             "why": "решателя нет: программа не подняла «Управляющего»"})
+            return
+        try:
+            result = decider(facts)
+        except Exception as exc:  # noqa: BLE001 — решение не должно ронять API
+            self._send(500, {"ok": False, "why": "решение не вышло: %s" % exc})
+            return
+        self._send(200, result if isinstance(result, dict)
+                   else {"ok": False, "why": "решение не разобрано"})
+
     def do_GET(self) -> None:                               # noqa: N802
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
@@ -163,6 +219,9 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(parsed.query)
         if not self._authorized(query):
             self._send(401, {"error": "нужен токен"})
+            return
+        if parsed.path == "/treat-decision":
+            self._treat_decision()
             return
         if parsed.path == "/restart-contour":
             self._send(200, restart_contour())

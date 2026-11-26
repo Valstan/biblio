@@ -38,6 +38,7 @@ KNOWLEDGE_PACK = HERE.parent / "docs" / "knowledge-pack.md"
 
 import minigen_provider as provider  # noqa: E402
 import minigen_council as council    # noqa: E402
+import minigen_treatment as treatment  # noqa: E402
 
 MAX_ROUNDS = 24
 DEFAULT_TIMEOUT = 120
@@ -392,6 +393,38 @@ class Agent:
             result["text"] = "%s\n\n%s" % (council_text, result.get("text") or "")
         if decision:
             result["council"] = decision
+        return result
+
+    # ────────────────────────────────────────── решение о лечении сессии (#172)
+    def decide_treatment(self, facts: dict[str, Any], area_slug: str = "minigen",
+                         model: str = "", timeout: int = 60) -> dict[str, Any]:
+        """Спросить у модели решение о лечении сессии (промт #172).
+
+        Это **тот же** агент, что отвечает в чате: та же модель, тот же токен
+        области, те же настройки оператора. Разница одна: вместо инструментов
+        модель получает вопрос с **фактами** и отвечает решением — ровно одно
+        из трёх (`продолжать` / `завершать` / `новая_сессия`), текстом
+        инструкции обслуживаемому агенту и причиной.
+
+        ⚠️ Совет специалистов здесь **не зовём**: решение о лечении — короткий
+        вопрос с фактами, а совет стоит отдельных ходов модели (живая проба
+        26.11: совет не укладывается в шаги).
+
+        ⚠️ Модель недоступна (нет очков, вендор лежит) ⇒ `{"ok": False}`:
+        решение принимает **правило-фолбэк** на стороне демона, и оно не
+        требует завершать сессию без отчёта.
+        """
+        cfg = self._model_config(area_slug, model)
+        system = treatment.SYSTEM_PROMPT
+        user = treatment.user_prompt(facts or {})
+        try:
+            data = chat_completion([{"role": "user", "content": user}], system, [],
+                                   cfg, timeout=timeout)
+        except ModelUnavailable as exc:
+            return {"ok": False, "why": "модель недоступна: %s" % exc}
+        _blocks, text, _calls = parse_message(data)
+        result = treatment.parse_decision(text)
+        result["model"] = cfg.get("model") or ""
         return result
 
     def _role_turn(self, system: str, messages: list[dict[str, Any]],
