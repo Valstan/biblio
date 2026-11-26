@@ -472,6 +472,10 @@ class KarmanStoreTest(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("канал раздела", res["error"])
         self.assertIn("читаются", res["error"])
+        # Причина и подсказка — разные предложения: «не настроен Архив ставит…»
+        # читалось как одно утверждение (живой случай 26.11, промт #100).
+        self.assertIn(". Архив ставит", res["error"])
+        self.assertNotIn("настроен Архив", res["error"])
 
     def test_prompt_can_be_returned_from_the_archive(self) -> None:
         """Архив — не удаление: заданный по ошибке промт возвращается."""

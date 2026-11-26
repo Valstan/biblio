@@ -359,7 +359,7 @@ python tools/minimax-project-areas/minigen_karman_prompts.py unarchive 100
 (`file`/`env`/`vault`).
 
 Приёмка: `python tools/minimax-project-areas/test_minigen_karman_prompts.py`
-(18 блоков, гоняется гейтом CI). После раскатки клиент лежит и в
+(19 блоков, гоняется гейтом CI). После раскатки клиент лежит и в
 `C:\Users\valstan\bin\minigen_karman_prompts.py`.
 
 **Если канал не открывается:**
