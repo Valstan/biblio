@@ -114,6 +114,95 @@ def _remotes(cwd: Path) -> dict[str, str]:
     return out
 
 
+def _program_remote(upstream: str = DEFAULT_UPSTREAM,
+                    cwd: Path | None = None) -> str:
+    """Remote, чей адрес — репозиторий программы (пусто — такого нет).
+
+    ⚠️ Сравнение строгое: «github.com/Valstan/biblio» — это подстрока и
+    «github.com/Valstan/biblio-minigen», а такой пушить нельзя.
+    """
+    cwd = cwd or CLONE_DIR
+    want = "github.com/%s" % upstream
+    for name, url in _remotes(cwd).items():
+        clean = url.strip()
+        if clean.endswith(".git"):
+            clean = clean[:-4]
+        if clean == want or clean.endswith("/" + want):
+            return name
+    return ""
+
+
+def _current_branch(cwd: Path) -> str:
+    """Имя текущей ветки клона."""
+    res = git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+    return res.get("out") or ""
+
+
+def _tracking(branch: str, cwd: Path) -> str:
+    """За какой веткой репозитория следит ветка (пусто — не следит)."""
+    if not branch:
+        return ""
+    res = git(["rev-parse", "--abbrev-ref", "--symbolic-full-name",
+               "%s@{u}" % branch], cwd)
+    if not res.get("ok"):
+        return ""
+    return res.get("out") or ""
+
+
+def _ff_master(remote: str, cwd: Path) -> dict[str, Any]:
+    """Догнать локальный `master` до свежего master программы — только вперёд.
+
+    ⚠️ Живой случай 26.11 (промт КАРМАНА #98, полоса «МиниГен»): у живой
+    копии ветка копии `copies/<id>` жила **без слежения**, а `sync` тянул
+    текущую ветку ⇒ «обновление не прошло» на исправной машине; и локальный
+    `master` не догонял программу ⇒ правки копии (worktree'и) брались из
+    устаревшего кода.
+
+    Теперь: fetch → сверка (двигаем `master` только вперёд) → сдвиг. Если
+    master программы переписан (не fast-forward) — **не трогаем** и говорим
+    прямо: правило «только fast-forward» не нарушаем.
+    """
+    fetch = git(["fetch", remote, "master"], cwd, timeout=600)
+    if not fetch.get("ok"):
+        return {"ok": False, "why": fetch.get("err") or fetch.get("out")
+                or "master не отдан"}
+    head = git(["rev-parse", "--verify", "FETCH_HEAD"], cwd).get("out") or ""
+    if not head:
+        return {"ok": False, "why": "master программы не найден"}
+    current = git(["rev-parse", "--verify", "master"], cwd).get("out") or ""
+    if not current:
+        # ветки master ещё нет (клон пустого репозитория) — заводим её от
+        # master программы. Рабочее дерево при этом не переключаем: в режиме
+        # «папка в общем репозитории» клон стоит на ветке копии.
+        create = git(["branch", "master", head], cwd)
+        if not create.get("ok"):
+            return {"ok": False, "why": create.get("err") or create.get("out")}
+        if _current_branch(cwd) in ("", "HEAD"):
+            # клон пустой: рабочее дерево надо посадить на master
+            checkout = git(["checkout", "master"], cwd)
+            if not checkout.get("ok"):
+                return {"ok": False,
+                        "why": checkout.get("err") or checkout.get("out")}
+        return {"ok": True, "changed": True, "sha": head,
+                "why": "ветка master заведена от master программы"}
+    if current == head:
+        return {"ok": True, "changed": False, "sha": head,
+                "why": "master уже свежий"}
+    ancestor = git(["merge-base", "--is-ancestor", current, head], cwd)
+    if not ancestor.get("ok"):
+        return {"ok": False,
+                "why": "master программы переписан (не fast-forward) — не трогаю"}
+    if _current_branch(cwd) == "master":
+        move = git(["merge", "--ff-only", head], cwd)
+    else:
+        # ветка не проверяется в дереве — двигаем ссылку атомарно
+        move = git(["update-ref", "refs/heads/master", head, current], cwd)
+    if not move.get("ok"):
+        return {"ok": False, "why": move.get("err") or move.get("out")}
+    return {"ok": True, "changed": True, "sha": head,
+            "why": "master догнал программу"}
+
+
 def status() -> dict[str, Any]:
     """Состояние клона копии и пула генов."""
     data = lineage.instance()
@@ -148,9 +237,22 @@ def status() -> dict[str, Any]:
     if info["clone_exists"]:
         res = git(["rev-parse", "--abbrev-ref", "HEAD"], CLONE_DIR)
         info["branch"] = res.get("out") or ""
+        # ⚠️ Живой случай 26.11: у ветки копии не было слежения — владелец
+        # видел «обновление не прошло» и не понимал почему. Теперь видно
+        # прямо: за какой веткой в репозитории копия следит.
+        info["tracking"] = _tracking(info["branch"], CLONE_DIR)
         info["remotes"] = _remotes(CLONE_DIR)
         dirty = git(["status", "--porcelain"], CLONE_DIR)
         info["dirty"] = bool(dirty.get("out"))
+        # отстал ли локальный master от программы (правки копии берутся из него)
+        upstream = str(data.get("upstream") or DEFAULT_UPSTREAM)
+        remote = _program_remote(upstream, CLONE_DIR)
+        if remote:
+            local = git(["rev-parse", "--verify", "master"], CLONE_DIR).get("out") or ""
+            fresh = git(["rev-parse", "--verify", "%s/master" % remote],
+                        CLONE_DIR).get("out") or ""
+            info["master"] = {"local": local, "remote": fresh,
+                              "behind": bool(local and fresh and local != fresh)}
     if info["pool_exists"]:
         info["pool_remotes"] = _remotes(POOL_DIR)
     return info
@@ -167,6 +269,16 @@ def register_folder(instance_id: str = "", upstream: str = DEFAULT_UPSTREAM
 
     Опасное действие: пишет в репозиторий программы ⇒ только после
     подтверждения владельца.
+
+    ⚠️ Живой случай 26.11 (промт КАРМАНА #98): папка копии заводилась
+    **пересозданием** ветки от master (`checkout -B`), а ветка уходила в
+    репозиторий программы **без** force. Как только master программы уезжал
+    вперёд, push отвергался как non-fast-forward («папка не ушла в репозиторий
+    программы»), и регистрация копии переставала обновляться навсегда.
+    Теперь: `master` догоняет программу (только fast-forward) и **вливается**
+    в ветку копии — история ветки дополняется, а не переписывается ⇒ push
+    проходит без force, и у ветки появляется слежение (иначе `sync` не смог бы
+    её обновить).
     """
     data = lineage.instance()
     ident = _safe_ident(instance_id or str(data.get("instance_id") or "copy"))
@@ -180,28 +292,40 @@ def register_folder(instance_id: str = "", upstream: str = DEFAULT_UPSTREAM
         report["why"] = "клона нет — сначала clone.setup"
         return report
     # куда пушить: remote, чей адрес — репозиторий программы
-    # ⚠️ Сравнение строгое: «github.com/Valstan/biblio» — это подстрока и
-    # «github.com/Valstan/biblio-minigen», а такой пушить нельзя.
-    target = ""
-    want = "github.com/%s" % upstream
-    remotes = _remotes(CLONE_DIR)
-    for name, url in remotes.items():
-        clean = url.strip()
-        if clean.endswith(".git"):
-            clean = clean[:-4]
-        if clean == want or clean.endswith("/" + want):
-            target = name
-            break
+    target = _program_remote(upstream, CLONE_DIR)
     if not target:
         report["ok"] = False
         report["why"] = ("не найден remote на репозиторий программы (%s) — "
                          "ветку некуда отправить" % upstream)
         return report
-    checkout = git(["checkout", "-B", branch, "master"], CLONE_DIR)
+    # 1) ветка копии: есть — берём её; нет — заводим от master
+    checkout = git(["checkout", branch], CLONE_DIR)
     if not checkout.get("ok"):
+        checkout = git(["checkout", "-B", branch, "master"], CLONE_DIR)
+        if not checkout.get("ok"):
+            report["ok"] = False
+            report["why"] = "ветку не создать: %s" % (checkout.get("err") or checkout.get("out"))
+            return report
+        report["steps"].append({"branch": branch, "how": "заведена от master"})
+    else:
+        report["steps"].append({"branch": branch, "how": "уже была — обновляем"})
+    # 2) master программы — свежий (только fast-forward)
+    ff = _ff_master(target, CLONE_DIR)
+    if not ff.get("ok"):
         report["ok"] = False
-        report["why"] = "ветку не создать: %s" % (checkout.get("err") or checkout.get("out"))
+        report["why"] = "master программы не обновить: %s" % ff.get("why")
         return report
+    report["steps"].append({"master": ff.get("why"), "how": "код программы"})
+    # 3) влить master программы в ветку копии
+    merge = git(["merge", "--no-edit", "master"], CLONE_DIR)
+    if not merge.get("ok"):
+        git(["merge", "--abort"], CLONE_DIR)
+        report["ok"] = False
+        report["why"] = "master программы не влился в ветку копии: %s" % (
+            merge.get("err") or merge.get("out"))
+        return report
+    report["steps"].append({"merge": "master → %s" % branch,
+                            "how": "код программы в ветке копии"})
     marker = {
         "instance_id": ident,
         "family": str(data.get("family") or "minigen"),
@@ -225,15 +349,22 @@ def register_folder(instance_id: str = "", upstream: str = DEFAULT_UPSTREAM
         return report
     commit = git(["commit", "-m", "copy: register %s" % ident], CLONE_DIR, timeout=180)
     if not commit.get("ok"):
-        report["ok"] = False
-        report["why"] = "коммит не прошёл: %s" % (commit.get("err") or commit.get("out"))
-        return report
+        message = (commit.get("err") or commit.get("out") or "").lower()
+        if "nothing to commit" not in message and "нечего коммитить" not in message:
+            report["ok"] = False
+            report["why"] = "коммит не прошёл: %s" % (commit.get("err") or commit.get("out"))
+            return report
+        report["steps"].append({"commit": "нечего коммитить — регистрация та же"})
     push = git(["push", target, "HEAD:refs/heads/%s" % branch], CLONE_DIR, timeout=600)
     if not push.get("ok"):
         report["ok"] = False
         report["why"] = "папка не ушла в репозиторий программы: %s" % (
             push.get("err") or push.get("out"))
         return report
+    # 4) слежение за веткой в репозитории программы: без него `git pull
+    #    --ff-only` (это делает `sync`) не знает, откуда тянуть, и обновление
+    #    падало бы на исправной машине.
+    git(["branch", "--set-upstream-to=%s/%s" % (target, branch), branch], CLONE_DIR)
     report["ok"] = True
     report["why"] = "папка копии заведена в общем репозитории: %s (ветка %s)" % (
         folder, branch)
@@ -349,9 +480,11 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
     #     нарушает: канон программы (её master) остаётся нетронутым, PR идут
     #     в upstream. Репозиторий копии живёт на ветках правок.
     fetch_from = "origin" if (shared and "upstream" not in remotes) else "upstream"
-    fetch = git(["fetch", fetch_from, "master"], CLONE_DIR, timeout=600)
-    if fetch.get("ok"):
-        git(["checkout", "-B", "master", "FETCH_HEAD"], CLONE_DIR)
+    # ⚠️ Живой случай 26.11: `master` сбрасывался на FETCH_HEAD (`checkout -B`)
+    # — это отбрасывало локальные коммиты ветки. Теперь master **догоняет**
+    # программу только вперёд (fast-forward), локальное не трогаем.
+    ff = _ff_master(fetch_from, CLONE_DIR)
+    if ff.get("ok"):
         if shared:
             # В режиме «общий репозиторий» ветка правок уходит прямо в
             # репозиторий программы: пушить в master нельзя (правило машины),
@@ -429,7 +562,19 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
 
 
 def sync() -> dict[str, Any]:
-    """Обновить клон и пул (только fast-forward, локальные правки не трогаем)."""
+    """Обновить клон и пул (только fast-forward, локальные правки не трогаем).
+
+    ⚠️ Живой случай 26.11 (промт КАРМАНА #98): `sync` тянул **текущую**
+    ветку клона, а ветка копии `copies/<id>` живёт без слежения ⇒ pull падал
+    («There is no tracking information») ⇒ владелец видел «обновление не
+    прошло» на исправной машине; и локальный `master` не догонял программу ⇒
+    правки копии брались из устаревшего кода.
+
+    Теперь обновление идёт от **master программы**: `master` догоняет программу
+    (только fast-forward) и вливается в ветку копии; ветка копии уходит в
+    репозиторий программы (её собственная ветка) — без force, историю не
+    переписываем.
+    """
     out: dict[str, Any] = {"steps": []}
     # ⚠️ Локальный режим (заказ владельца 25.11): сети нет — обновлять
     # нечего. Говорим прямо, а не делаем вид, что «обновление прошло».
@@ -443,21 +588,72 @@ def sync() -> dict[str, Any]:
                        "недоступны"}
     except Exception:  # noqa: BLE001
         pass
-    for name, path in (("clone", CLONE_DIR), ("pool", POOL_DIR)):
-        if not (path / ".git").is_dir():
-            out["steps"].append({"what": name, "ok": False, "why": "клона нет"})
-            continue
-        dirty = git(["status", "--porcelain"], path)
+    # 1) пул генов — общий репозиторий наработок
+    if not (POOL_DIR / ".git").is_dir():
+        out["steps"].append({"what": "pool", "ok": False, "why": "клона нет"})
+    else:
+        dirty = git(["status", "--porcelain"], POOL_DIR)
         if dirty.get("out"):
-            out["steps"].append({"what": name, "ok": False,
+            out["steps"].append({"what": "pool", "ok": False,
                                  "why": "есть локальные правки — не трогаю"})
-            continue
-        fetch = git(["fetch", "--all", "--prune"], path, timeout=600)
-        if not fetch.get("ok"):
-            out["steps"].append({"what": name, "ok": False, "why": fetch.get("err")})
-            continue
-        pull = git(["pull", "--ff-only"], path, timeout=600)
-        out["steps"].append({"what": name, "ok": bool(pull.get("ok")),
+        else:
+            fetch = git(["fetch", "--all", "--prune"], POOL_DIR, timeout=600)
+            if not fetch.get("ok"):
+                out["steps"].append({"what": "pool", "ok": False,
+                                     "why": fetch.get("err")})
+            else:
+                pull = git(["pull", "--ff-only"], POOL_DIR, timeout=600)
+                out["steps"].append({"what": "pool", "ok": bool(pull.get("ok")),
+                                     "why": pull.get("out") or pull.get("err")})
+    # 2) клон копии
+    if not (CLONE_DIR / ".git").is_dir():
+        out["steps"].append({"what": "clone", "ok": False, "why": "клона нет"})
+        out["ok"] = all(bool(s.get("ok")) for s in out["steps"])
+        return out
+    dirty = git(["status", "--porcelain"], CLONE_DIR)
+    if dirty.get("out"):
+        out["steps"].append({"what": "clone", "ok": False,
+                             "why": "есть локальные правки — не трогаю"})
+        out["ok"] = all(bool(s.get("ok")) for s in out["steps"])
+        return out
+    fetch = git(["fetch", "--all", "--prune"], CLONE_DIR, timeout=600)
+    if not fetch.get("ok"):
+        out["steps"].append({"what": "clone", "ok": False,
+                             "why": fetch.get("err") or fetch.get("out")})
+        out["ok"] = all(bool(s.get("ok")) for s in out["steps"])
+        return out
+    upstream = str((lineage.instance() or {}).get("upstream") or DEFAULT_UPSTREAM)
+    remote = _program_remote(upstream, CLONE_DIR)
+    if not remote:
+        out["steps"].append({"what": "clone", "ok": False,
+                             "why": "не найден remote на репозиторий программы "
+                                    "(%s)" % upstream})
+        out["ok"] = all(bool(s.get("ok")) for s in out["steps"])
+        return out
+    # 2a) master программы — только вперёд
+    ff = _ff_master(remote, CLONE_DIR)
+    out["steps"].append({"what": "master программы", "ok": bool(ff.get("ok")),
+                         "why": ff.get("why")})
+    if not ff.get("ok"):
+        out["ok"] = all(bool(s.get("ok")) for s in out["steps"])
+        return out
+    # 2b) текущая ветка копии: влить master и отправить (своя ветка копии)
+    branch = _current_branch(CLONE_DIR)
+    if branch.startswith("copies/"):
+        merge = git(["merge", "--no-edit", "master"], CLONE_DIR)
+        if not merge.get("ok"):
+            git(["merge", "--abort"], CLONE_DIR)
+            out["steps"].append({"what": "ветка копии", "ok": False,
+                                 "why": "master программы не влился: %s"
+                                        % (merge.get("err") or merge.get("out"))})
+        else:
+            push = git(["push", remote, "HEAD:refs/heads/%s" % branch],
+                       CLONE_DIR, timeout=600)
+            out["steps"].append({"what": "ветка копии", "ok": bool(push.get("ok")),
+                                 "why": push.get("out") or push.get("err")})
+    else:
+        pull = git(["pull", "--ff-only"], CLONE_DIR, timeout=600)
+        out["steps"].append({"what": "клон", "ok": bool(pull.get("ok")),
                              "why": pull.get("out") or pull.get("err")})
     out["ok"] = all(bool(s.get("ok")) for s in out["steps"])
     return out
