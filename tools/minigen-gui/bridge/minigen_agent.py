@@ -45,11 +45,29 @@ DEFAULT_TIMEOUT = 120
 # читаются целиком — иначе модель видит только начало модуля и не может
 # найти нестыковку (окно модели — 1 млн токенов, места хватает).
 TOOL_RESULT_LIMIT = 24_000
-#: Бюджет совета — **свой**, работа его не съедает (живой случай 25.11, проба
-#: самоотладки: при общем бюджете на работу оставалось 4 шага, а задача «найди
-#: дефект и почини» столько не занимает). Совет обсуждает — работа делает;
-#: одно не отменяет другого.
-COUNCIL_ROUNDS = 16
+#: Бюджет совета — **часть бюджета задачи**, а не отдельный счёт.
+#:
+#: ⚠️ Живой случай 25.11 (проба самоотладки): бюджет был общий, и совет съедал
+#: его целиком — на работу оставалось 4 шага, а задача «найди дефект и почини»
+#: (поиск → чтение → ветка → правка → проверки → коммит → PR) столько не
+#: занимает: проба остановилась на «достигнут лимит шагов» и PR не открыла.
+#:
+#: Теперь: совет занимает не больше `COUNCIL_ROUNDS`, работа получает остаток,
+#: но не меньше `WORK_FLOOR`. Итог — раундов на задачу **не больше
+#: `MAX_ROUNDS`** (совет + работа вместе), и работа никогда не остаётся без
+#: шагов. Это и есть приёмка промта #132: «число раундов на задачу не выходит
+#: за `MAX_ROUNDS`».
+#:
+#: ⚠️ Числа — из живых проб 26.11 (см. `docs/SESSION_HANDOFF.md`): работа по
+#: задаче «объясни, как устроен совет» без совета занимает **12** раундов, а
+#: полный совет (3 голоса + 3 исполнителя + судья + секретарь) — не меньше 14.
+#: На 24 раундах обе части не помещаются ⇒ совет получает 12, работа — не
+#: меньше 12. Голосов в бюджет совета помещается два (по два раунда: прочитать
+#: и ответить) — поэтому секретарь зовёт не больше, чем бюджет выдерживает.
+COUNCIL_ROUNDS = 12
+#: Гарантированный запас работы: сколько шагов хода остаётся на работу, сколько
+#: бы совет ни занял. Живой случай 25.11 оставил 4 — этого не хватало.
+WORK_FLOOR = 12
 
 
 class ModelUnavailable(RuntimeError):
@@ -275,6 +293,25 @@ class Agent:
     def _tool_by_name(self, name: str) -> dict[str, Any] | None:
         return next((tool for tool in self.tools if tool["name"] == name), None)
 
+    def _run_tool(self, call: dict[str, Any],
+                  allowed: set[str]) -> Any:
+        """Выполнить вызов инструмента и вернуть его результат.
+
+        Ошибка — тоже результат: модели нужен ответ на **каждый** вызов, и
+        ошибка честнее, чем «вызова не было» (вендор такой ход отвергает).
+        """
+        tool = self._tool_by_name(call["name"])
+        if tool is None:
+            return {"error": "неизвестный инструмент %s" % call["name"]}
+        if tool["name"] not in allowed:
+            # Голос совета работает со своим набором инструментов:
+            # чужой инструмент он не вызывает (даже если выдумал его).
+            return {"error": "инструмент %s в этом ходе недоступен" % call["name"]}
+        try:
+            return self.dispatch(tool["command"], call["input"])
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+
     # ── основной ход ──
     def ask(self, history: list[dict[str, Any]], user_text: str,
             area_slug: str = "minigen", model: str = "",
@@ -287,6 +324,10 @@ class Agent:
         решение и назначает исполнителей → основной ход работает по решению.
         Продолжения нитки («Продолжай») совет не зовёт — он по этой задаче уже
         отработал.
+
+        ⚠️ Бюджет: совет и работа делят **один** бюджет задачи (`MAX_ROUNDS`).
+        Совет занимает часть и оставляет работе гарантированный запас
+        (`WORK_FLOOR`) — см. `COUNCIL_ROUNDS`.
 
         ⚠️ `note` — подсказка на **один ход** (сводка отчётов сторожей, заказ
         24.11). Она попадает в системную подсказку хода, а **не** в историю
@@ -357,25 +398,42 @@ class Agent:
 
         Если совет не сложился (модель недоступна, реестр не прочитан, решения
         нет) — работа продолжается **без** совета, и в чате это сказано прямо.
+
+        **Бюджет.** Совет занимает часть бюджета задачи (`COUNCIL_ROUNDS`), работа
+        получает остаток, но не меньше `WORK_FLOOR` — итого раундов на задачу не
+        больше `MAX_ROUNDS` (живой случай 25.11 — см. `COUNCIL_ROUNDS`).
         """
         cohort = council.roles()
         if not cohort:
             return {"status": "done", "history": messages, "council_text": ""}
         limit = council.max_roles(settings)
-        # ⚠️ Живой случай 25.11 (проба самоотладки, промт #129): бюджет был
-        # общим, и совет съедал его целиком — на работу оставалось 4 шага, а
-        # задача «найди дефект и почини» (поиск → чтение → ветка → правка →
-        # проверки → коммит → PR) столько не занимает. Теперь у совета **свой**
-        # предел (COUNCIL_ROUNDS), а работа получает весь MAX_ROUNDS: совет
-        # обсуждает, а работу он не отменяет.
-        initial = max(2, min(COUNCIL_ROUNDS, budget.get("left", MAX_ROUNDS)))
-        used = {"left": initial}
+        task_left = int(budget.get("left", MAX_ROUNDS))
+        # Сколько совет может занять: не больше COUNCIL_ROUNDS и не больше
+        # того, что останется работе (WORK_FLOOR — гарантированный запас).
+        cap = max(2, min(COUNCIL_ROUNDS, task_left - WORK_FLOOR))
+        used = {"left": cap}
+
+        # ⚠️ Сколько голосов бюджет совета выдерживает: секретарь не должен
+        # звать больше, чем совет потом оплатит (иначе часть голосов не
+        # говорит — и это видно владельцу в переписке).
+        voices_pool = max(0, cap - council.JUDGE_ROUNDS - council.EXECUTOR_POOL - 1)
+        limit = max(1, min(limit, voices_pool // council.MIN_VOICE_ROUNDS))
+
+        def spent() -> int:
+            """Сколько раундов занял совет к этому моменту."""
+            return max(0, cap - used["left"])
+
+        def give_back() -> None:
+            """Отдать бюджету задачи то, что занял совет (и раундов не
+            осталось лишних — работа получает остаток, но не меньше запаса)."""
+            budget["left"] = max(WORK_FLOOR, task_left - spent())
 
         # 1) секретарь отбирает, кто нужен на задачу
         triage = self._role_turn(
             council.triage_prompt(task, cohort, limit),
             [{"role": "user", "content": task}], [], cfg, 1, used)
         if triage.get("status") != "done":
+            give_back()
             return {"status": "done", "history": messages, "council_text": ""}
         wanted = council.parse_json(triage.get("text") or "").get("roles") or []
         selected: list[dict[str, Any]] = []
@@ -389,18 +447,34 @@ class Agent:
                 break
 
         # 2) обсуждение: каждый специалист — по своей роли и своими инструментами
+        #
+        # ⚠️ Резерв под судью и исполнителей: без решения совета обсуждение
+        # бессмысленно, и голоса не должны съесть весь бюджет совета. Резерв
+        # откладывается **до** голосов, а доля голоса делится поровну между
+        # оставшимися специалистами: один голос не съедает бюджет остальных.
+        reserve = council.JUDGE_ROUNDS + council.EXECUTOR_POOL
+        voices = {"left": voices_pool}
         opinions: list[dict[str, Any]] = []
-        for item in selected:
+        for index, item in enumerate(selected):
+            if voices["left"] < council.MIN_VOICE_ROUNDS:
+                break              # бюджет голосов исчерпан — совет без шума
+            # Доля голоса: остаток поровну на оставшихся, но не меньше двух
+            # раундов (голос должен успеть прочитать и ответить).
+            share = max(council.MIN_VOICE_ROUNDS,
+                        min(council.ROLE_ROUNDS,
+                            voices["left"] // (len(selected) - index)))
+            share = min(share, voices["left"])
             turn = self._role_turn(
                 council.role_prompt(item, task),
                 [{"role": "user", "content": task}],
-                item.get("tools") or [], cfg, council.ROLE_ROUNDS, used)
+                item.get("tools") or [], cfg, share, voices)
             if turn.get("status") == "unavailable":
                 break
             opinions.append({"slug": item.get("slug"),
                              "title": item.get("title") or item.get("slug"),
                              "text": (turn.get("text") or "").strip()
                              [:council.ROLE_TEXT_LIMIT]})
+        used["left"] = voices["left"] + reserve
 
         # 3) решение судьи
         judge = self._role_turn(
@@ -411,32 +485,48 @@ class Agent:
             council.parse_json(judge.get("text") or ""),
             [str(item.get("slug")) for item in council.executors()])
         if not decision.get("to_do") and not decision.get("executors"):
+            give_back()
             return {"status": "done", "history": messages,
                     "council_text": "Совет специалистов: решение не сложилось — "
                                     "работаю без него."}
 
         # 4) исполнители: у каждого своя часть и свои инструменты
         outputs: list[dict[str, Any]] = []
-        for slug in decision.get("executors") or []:
+        makers = {"left": min(council.EXECUTOR_POOL, used["left"])}
+        wanted = list(decision.get("executors") or [])
+        for index, slug in enumerate(wanted):
+            if makers["left"] < council.MIN_VOICE_ROUNDS:
+                break              # бюджет исполнителей исчерпан
             item = council.role(slug)
             if item is None:
                 continue
+            # Доля исполнителя — та же поровну (приёмка: работа делится между
+            # исполнителями, а не делается одним — каждому нужны свои шаги).
+            share = max(council.MIN_VOICE_ROUNDS,
+                        min(council.EXECUTOR_ROUNDS,
+                            makers["left"] // (len(wanted) - index)))
+            share = min(share, makers["left"])
+            before = makers["left"]
             turn = self._role_turn(
                 council.executor_prompt(item, decision),
                 [{"role": "user",
                   "content": council.executor_input(task, decision, outputs)}],
-                item.get("tools") or [], cfg, council.EXECUTOR_ROUNDS, used)
+                item.get("tools") or [], cfg, share, makers)
+            used["left"] -= before - makers["left"]
             outputs.append({"slug": slug, "title": item.get("title") or slug,
                             "text": (turn.get("text") or "").strip()
                             [:council.ROLE_TEXT_LIMIT]})
 
-        # ⚠️ Бюджет работы **не трогаем**: у совета свой предел (COUNCIL_ROUNDS),
-        # и работа получает все MAX_ROUNDS (живой случай 25.11 — см. выше).
+        # ⚠️ Бюджет задачи: совет занял часть, работа получает остаток — но не
+        # меньше WORK_FLOOR. Итого раундов на задачу не больше MAX_ROUNDS.
+        consumed = spent()
+        give_back()
         context = council.context_block(decision, opinions, outputs)
         return {"status": "done",
                 "history": list(messages) + [{"role": "user", "content": context}],
                 "council_text": council.format_discussion(opinions, decision),
-                "decision": decision}
+                "decision": decision,
+                "rounds": consumed}
 
     def _loop(self, messages: list[dict[str, Any]], cfg: dict[str, Any],
               calls: list[dict[str, Any]],
@@ -447,9 +537,10 @@ class Agent:
         """Рабочий цикл: модель → инструменты → модель.
 
         `system` и `tools` позволяют прогнать голос совета (свой промпт и
-        свой набор инструментов). `budget` — общий счётчик раундов задачи:
-        совет и работа считаются вместе, поэтому лимит `MAX_ROUNDS` на задачу
-        не превышается.
+        свой набор инструментов). `budget` — счётчик раундов: у совета он
+        свой (`_council` считает свой расход и уменьшает общий), у работы —
+        общий. Поэтому раундов на задачу — не больше `MAX_ROUNDS`, а работа
+        никогда не остаётся без шагов (`WORK_FLOOR`).
         """
         prompt = system if system is not None else system_prompt()
         payload = self._tool_payload(tools)
@@ -473,20 +564,46 @@ class Agent:
             if not tool_calls:
                 return {"status": "done", "text": text, "calls": calls,
                         "history": messages}
-            # Сначала проверяем все вызовы: если среди них опасный — не
-            # выполняем ничего и отдаём решение владельцу.
-            dangerous = next((call for call in tool_calls
-                              if (self._tool_by_name(call["name"]) or {}).get("dangerous")),
-                             None)
-            if dangerous is not None:
-                tool = self._tool_by_name(dangerous["name"]) or {}
+            # ⚠️ Протокол вендора (проверено живой пробой 26.11): на **каждый**
+            # вызов модели в ходе должен прийти ответ (`tool_result`). Если
+            # вызовов было два, а ответ один — вендор отвечает 400
+            # «tool call and result not match (2013)», и ход умирает.
+            # Опасные вызовы ждут владельца, поэтому ответ на них известен
+            # не сразу ⇒ ход модели уходит вендору только после того, как
+            # подтверждены (или отменены) **все** опасные вызовы.
+            dangerous = [call for call in tool_calls
+                         if (self._tool_by_name(call["name"]) or {}).get("dangerous")]
+            if dangerous:
+                # безопасные вызовы этого хода выполняем сейчас — они и не
+                # требуют подтверждения; опасные ждут.
+                results = []
+                for call in tool_calls:
+                    if any(call is item for item in dangerous):
+                        continue
+                    result = self._run_tool(call, allowed)
+                    calls.append({"tool": call["name"], "args": call["input"],
+                                  "result": _safe(result)})
+                    results.append((call, result))
+                tool = self._tool_by_name(dangerous[0]["name"]) or {}
                 self.pending = {
-                    "tool": dangerous["name"],
-                    "args": dangerous["input"],
+                    "tool": dangerous[0]["name"],
+                    "args": dangerous[0]["input"],
                     "reason": tool.get("confirm_hint") or
                               "действие требует подтверждения владельца",
-                    "call_id": dangerous["id"],
-                    "messages": messages,
+                    "call_id": dangerous[0]["id"],
+                    # ход модели целиком — его вернём вендору с ответами
+                    "blocks": blocks,
+                    # все опасные вызовы хода: подтверждаем по одному
+                    "dangerous": dangerous,
+                    # порядок вызовов модели: ответы на вызовы уходят вендору
+                    # в том же порядке, в каком модель их вызвала
+                    "tool_calls": tool_calls,
+                    # результаты безопасных вызовов (уже выполнены)
+                    "results": results,
+                    # история **без** хода модели: ход вернём вместе с
+                    # ответами на вызовы — иначе вендор увидит вызов без
+                    # ответа и откажет.
+                    "messages": list(messages[:-1]),
                     "cfg": cfg,
                     "calls": calls,
                 }
@@ -494,25 +611,14 @@ class Agent:
                         "calls": calls, "text": text, "history": messages}
             results = []
             for call in tool_calls:
-                tool = self._tool_by_name(call["name"])
-                if tool is None:
-                    result: Any = {"error": "неизвестный инструмент %s" % call["name"]}
-                elif tool["name"] not in allowed:
-                    # Голос совета работает со своим набором инструментов:
-                    # чужой инструмент он не вызывает (даже если выдумал его).
-                    result = {"error": "инструмент %s в этом ходе недоступен"
-                              % call["name"]}
-                else:
-                    try:
-                        result = self.dispatch(tool["command"], call["input"])
-                    except Exception as exc:  # noqa: BLE001
-                        result = {"error": str(exc)}
+                result = self._run_tool(call, allowed)
                 calls.append({"tool": call["name"], "args": call["input"],
-                              "result": _trim(result)})
+                              "result": _safe(result)})
                 results.append((call, result))
             messages.append({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": call["id"],
-                 "content": json.dumps(_trim(result), ensure_ascii=False)}
+                 "content": json.dumps(_trim(result), ensure_ascii=False,
+                                       default=str)}
                 for call, result in results
             ]})
         return {"status": "done",
@@ -524,28 +630,82 @@ class Agent:
 
     def confirm(self, approved: bool, history: list[dict[str, Any]],
                 area_slug: str = "minigen", model: str = "") -> dict[str, Any]:
-        """Владелец подтвердил (или отклонил) отложенное действие."""
+        """Владелец подтвердил (или отклонил) отложенное действие.
+
+        ⚠️ Опасных вызовов в ходе может быть несколько — подтверждаются по
+        одному (каждый отдельный ответ владельца). Ход модели уходит вендору
+        только когда подтверждены **все** опасные вызовы: на каждый вызов
+        модели нужен ответ, иначе вендор отвечает 400 «tool call and result
+        not match (2013)» (живая проба 26.11).
+
+        ⚠️ Отмена — без хода модели: действие не сделано, ход вендору не
+        уходит, владелец видит «действие отменено владельцем» и решает дальше
+        (проверено тестом `test_dangerous_tool_can_be_declined`).
+        """
         pending = self.pending
-        self.pending = None
         if not pending:
             return {"status": "error", "error": "нечего подтверждать", "calls": []}
-        if not approved:
+        queue = list(pending.get("dangerous") or [])
+        if not queue:
+            # отложенный вызов без очереди (старый вид) — подтверждаем один
+            queue = [{"name": pending.get("tool"), "input": pending.get("args") or {},
+                      "id": pending.get("call_id") or pending.get("tool")}]
+        current = queue[0]
+        rest = queue[1:]
+        results = list(pending.get("results") or [])
+        calls = list(pending.get("calls") or [])
+        if approved:
+            tool = self._tool_by_name(current["name"])
+            if tool is None:
+                result: Any = {"error": "инструмент исчез"}
+            else:
+                try:
+                    result = self.dispatch(tool["command"], current["input"])
+                except Exception as exc:  # noqa: BLE001
+                    result = {"error": str(exc)}
+            calls.append({"tool": current["name"], "args": current["input"],
+                          "result": _safe(result), "approved": True})
+        else:
+            # Отмена — ход модели вендору не уходит (ответ на вызов не нужен,
+            # если вызова не было). Опасные вызовы хода отменяются все.
+            for item in queue:
+                calls.append({"tool": item["name"], "args": item["input"],
+                              "result": {"cancelled": True,
+                                         "note": "владелец отменил действие"},
+                              "approved": False})
+            self.pending = None
             return {"status": "done", "text": "действие отменено владельцем",
-                    "calls": pending.get("calls") or [], "history": history}
-        tool = self._tool_by_name(pending["tool"])
-        if tool is None:
-            return {"status": "error", "error": "инструмент исчез", "calls": []}
-        try:
-            result = self.dispatch(tool["command"], pending["args"])
-        except Exception as exc:  # noqa: BLE001
-            result = {"error": str(exc)}
-        call = {"tool": pending["tool"], "args": pending["args"],
-                "result": _trim(result), "approved": True}
-        calls = list(pending.get("calls") or []) + [call]
+                    "calls": calls, "history": history}
+        results.append((current, result))
+        if rest:
+            # опасных вызовов было несколько — спрашиваем по одному.
+            # ⚠️ Баннер в окне показывает **текущий** вызов: имя, аргументы и
+            # причину берём у следующего в очереди, а не у первого.
+            nxt = rest[0]
+            nxt_tool = self._tool_by_name(nxt["name"]) or {}
+            self.pending = {**pending, "dangerous": rest, "results": results,
+                            "calls": calls,
+                            "tool": nxt["name"], "args": nxt["input"],
+                            "call_id": nxt["id"],
+                            "reason": nxt_tool.get("confirm_hint") or
+                                      pending.get("reason") or
+                                      "действие требует подтверждения владельца"}
+            return {"status": "confirm", "pending": _pending_view(self.pending),
+                    "calls": calls,
+                    "text": "ждёт подтверждения: %s" % self.pending["tool"],
+                    "history": history}
+        self.pending = None
+        # Собираем сообщение для вендора: ход модели и ответ на **каждый**
+        # его вызов (безопасные — уже выполнены, опасный — подтверждён).
+        # ⚠️ Порядок ответов — как порядок вызовов модели (живая проба 26.11:
+        # вендор сверяет вызов с ответом по порядку и по id).
+        ordered = _ordered_results(pending.get("tool_calls") or [], results)
         messages = list(pending.get("messages") or history)
+        messages.append({"role": "assistant", "content": pending.get("blocks") or []})
         messages.append({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": pending.get("call_id") or pending["tool"],
-             "content": json.dumps(_trim(result), ensure_ascii=False)}
+            {"type": "tool_result", "tool_use_id": call["id"],
+             "content": json.dumps(_trim(result), ensure_ascii=False, default=str)}
+            for call, result in ordered
         ]})
         messages.append({"role": "user",
                          "content": "владелец подтвердил действие, продолжай."})
@@ -554,12 +714,47 @@ class Agent:
 
 
 def _pending_view(pending: dict[str, Any]) -> dict[str, Any]:
+    """Вид ожидающего подтверждения для окна.
+
+    ⚠️ Показывается **текущий** вызов очереди (первый), а не первый попавшийся.
+    """
+    queue = list(pending.get("dangerous") or [])
+    current = queue[0] if queue else {}
     return {
-        "tool": pending.get("tool"),
-        "args": pending.get("args") or {},
+        "tool": current.get("name") or pending.get("tool"),
+        "args": current.get("input") if current.get("input") is not None
+                else (pending.get("args") or {}),
         "reason": pending.get("reason") or "",
-        "call_id": pending.get("call_id") or "",
+        "call_id": current.get("id") or pending.get("call_id") or "",
     }
+
+
+def _ordered_results(tool_calls: list[dict[str, Any]],
+                     results: list[tuple[dict[str, Any], Any]]
+                     ) -> list[tuple[dict[str, Any], Any]]:
+    """Ответы на вызовы — в том же порядке, в каком модель их вызвала.
+
+    ⚠️ Вендор сверяет вызов с ответом (живая проба 26.11: «tool call and result
+    not match (2013)»). Безопасные вызовы выполняются раньше опасных, поэтому
+    порядок по умолчанию может не совпасть с порядком вызовов модели — здесь он
+    приводится к правильному.
+    """
+    if not tool_calls:
+        return list(results)
+    by_id: dict[Any, Any] = {}
+    for call, result in results:
+        by_id.setdefault(call.get("id"), (call, result))
+    ordered: list[tuple[dict[str, Any], Any]] = []
+    taken: set[Any] = set()
+    for call in tool_calls:
+        key = call.get("id")
+        if key in by_id and key not in taken:
+            ordered.append(by_id[key])
+            taken.add(key)
+    for call, result in results:
+        if call.get("id") not in taken:
+            ordered.append((call, result))
+    return ordered
 
 
 def _trim(value: Any, limit: int = TOOL_RESULT_LIMIT) -> Any:
@@ -573,3 +768,21 @@ def _trim(value: Any, limit: int = TOOL_RESULT_LIMIT) -> Any:
     if len(text) <= limit:
         return value
     return {"truncated": True, "preview": text[:limit]}
+
+
+def _safe(value: Any) -> Any:
+    """Значение, которое можно положить в JSON без потери формы.
+
+    ⚠️ Результат инструмента владелец видит **целиком** (промт #129: подробности
+    не выбрасываются), а обрезка живёт только в контексте модели. Поэтому здесь
+    значение приводится к JSON-безопасному виду: несериализуемое — строкой,
+    структура — сохраняется.
+    """
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except (TypeError, ValueError):
+        try:
+            return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            return str(value)

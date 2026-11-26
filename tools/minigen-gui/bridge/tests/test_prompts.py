@@ -64,6 +64,8 @@ class Handler(BaseHTTPRequestHandler):
     prompts: list = []
     sections: list = [SECTION]
     archive_calls: list = []
+    #: Код ответа на архив: 200 — работает, 503 — канал раздела закрыт.
+    archive_code = 200
 
     def log_message(self, *args):  # тишина
         pass
@@ -117,6 +119,9 @@ class Handler(BaseHTTPRequestHandler):
         Handler.calls.append(("POST", self.path, auth, body))
         if self.path.startswith("/api/prompts/section"):
             Handler.archive_calls.append(body)
+            if Handler.archive_code != 200:
+                self._send(Handler.archive_code, {"error": "канал не настроен"})
+                return
             self._send(200, {"id": body.get("id"), "archived": True})
             return
         if self.path.startswith("/api/prompts"):
@@ -256,6 +261,32 @@ class DispatchTest(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("уедет не туда", res["error"])
         self.assertEqual(self.watcher.sent, [], "промт ушёл не туда")
+
+    def test_the_program_area_does_not_take_the_house_section(self) -> None:
+        """Раздел дома утилит в область программы не уходит (D-190).
+
+        У области `minigen` поле `karman` — «biblio» (дом утилит), а её
+        собственный раздел — `MiniGen`. Помеченный промт дома утилит в область
+        программы не попадает: чужую работу выполняет тот, кому она
+        принадлежит.
+        """
+        house = self.store.save("biblio", "Промт дома", "Домашняя работа.")
+        prompts.set_mark("local", "biblio", house["id"], True, self.db)
+        own = self.store.save(SECTION, TITLE, BODY)
+        prompts.set_mark("local", SECTION, own["id"], True, self.db)
+
+        class HouseCore(FakeCore):
+            def areas(self) -> list:
+                return [{"slug": "minigen", "title": "МиниГен",
+                         "karman": "biblio", "dir": Path("/tmp/p-minigen")}]
+
+        mods = {"sessionwatch": self.watcher, "core": HouseCore()}
+        done = prompts.auto_dispatch_scan(mods, self.store, {})
+        sent = [item for item in done if item.get("ok")]
+        self.assertEqual(len(sent), 1, done)
+        self.assertEqual(len(self.watcher.sent), 1)
+        self.assertIn(SECTION, self.watcher.sent[0]["text"])
+        self.assertNotIn("Домашняя работа", self.watcher.sent[0]["text"])
 
     def test_plan_goes_with_the_prompt(self) -> None:
         self.store.save(SECTION, "План: хранилище промтов", "# План\n\nШаги плана.\n")
@@ -425,6 +456,27 @@ class KarmanStoreTest(unittest.TestCase):
         self.assertFalse(res["ok"])
         self.assertIn("токена раздела нет", res["error"])
 
+    def test_closed_archive_channel_says_what_to_do(self) -> None:
+        """Канал архива закрыт ⇒ сообщение говорит, **что делать**.
+
+        ⚠️ Живой случай 26.11 (промт #100): канал раздела отвечает 503 (выдача
+        не принята), а раздел при этом читается по каналу библиотеки. «Канал не
+        настроен» без подсказки — это молчание, выданное за причину.
+        """
+        store = prompts.KarmanPromptStore()
+        Handler.archive_code = 503
+        try:
+            res = store.archive("94", SECTION)
+        finally:
+            Handler.archive_code = 200
+        self.assertFalse(res["ok"])
+        self.assertIn("канал раздела", res["error"])
+        self.assertIn("читаются", res["error"])
+        # Причина и подсказка — разные предложения: «не настроен Архив ставит…»
+        # читалось как одно утверждение (живой случай 26.11, промт #100).
+        self.assertIn(". Архив ставит", res["error"])
+        self.assertNotIn("настроен Архив", res["error"])
+
     def test_prompt_can_be_returned_from_the_archive(self) -> None:
         """Архив — не удаление: заданный по ошибке промт возвращается."""
         store = prompts.KarmanPromptStore()
@@ -537,6 +589,45 @@ class KarmanSectionResolutionTest(unittest.TestCase):
                                       only_archived=True)
         self.assertEqual([item["id"] for item in archived], ["93"])
         self.assertTrue(archived[0]["archived"])
+
+    # ───────────────────────────── раздел области: свой, а не чужой (D-190)
+
+    def test_area_takes_only_its_own_section(self) -> None:
+        """Область программы берёт свой раздел, а не раздел дома утилит.
+
+        ⚠️ У области `minigen` поле `karman` — «biblio»: по реестру это имя
+        проекта в КАРМАНе (учёт расхода MiniMax и комната vault'а), а **не**
+        раздел библиотеки промтов. Раздел программы — `MiniGen`, раздел дома
+        утилит — `biblio`, и работа дома в область программы не уходит.
+        """
+        store = prompts.KarmanPromptStore()
+        area = {"slug": "minigen", "karman": "biblio"}
+        self.assertEqual(prompts.area_sections(area, store), [SECTION])
+        self.assertFalse(prompts.section_matches("biblio", area, store))
+        self.assertTrue(prompts.section_matches(SECTION, area, store))
+
+    def test_area_without_own_section_keeps_the_karman_field(self) -> None:
+        """Область, чей слаг ни на что не похож, берёт раздел из поля `karman`."""
+        store = prompts.KarmanPromptStore()
+        area = {"slug": "sabantuy", "karman": "SabantuyMalmyzh"}
+        self.assertEqual(prompts.area_sections(area, store),
+                         ["sabantuy", "SabantuyMalmyzh"])
+
+    def test_secret_name_rule_is_the_karman_one(self) -> None:
+        """Имя секрета раздела — по правилу сервиса (`sectionSecretName`)."""
+        self.assertEqual(prompts.section_secret_name("MiniGen"),
+                         "PROMPTS_TOKEN_MINIGEN")
+        self.assertEqual(prompts.section_secret_name("Matrica RMZ"),
+                         "PROMPTS_TOKEN_MATRICA_RMZ")
+
+    def test_archive_sends_the_canonical_section_name(self) -> None:
+        """Раздел в запросе — каноническое имя: сервис фильтрует точно."""
+        store = prompts.KarmanPromptStore()
+        res = store.archive("94", "minigen")
+        self.assertTrue(res["ok"], res)
+        body = Handler.archive_calls[-1]
+        self.assertEqual(body["project"], SECTION)
+        self.assertEqual(body["id"], 94)
 
 
 # ──────────────────────────────────────────────── секреты: не в репозитории

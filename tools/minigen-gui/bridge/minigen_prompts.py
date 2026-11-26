@@ -52,6 +52,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sqlite3
 import time
 import urllib.parse
@@ -82,6 +83,27 @@ KIND_PLAN = "plan"
 #: отправки) — в универсальной базе это тоже записи, просто свои виды.
 KIND_MARK = "prompt-mark"
 KIND_DISPATCH = "prompt-dispatch"
+
+#: Что делать, когда канал архива закрыт: сказать, **кто** и **что** может
+#: открыть. Иначе «канал не настроен» — это не причина, а молчание.
+#:
+#: ⚠️ Живой случай 26.11 (промт #100): канал раздела отвечал 503 (выдача не
+#: принята), а раздел при этом читался по каналу библиотеки.
+ARCHIVE_HINT = ("Архив ставит только канал раздела: его токен должен быть выдан "
+                "сервису (выдача в комнату-получателя — её принимает получатель). "
+                "Сами промты при этом читаются — по каналу библиотеки.")
+
+
+def archive_reason(reason: str) -> str:
+    """Причина + подсказка «что делать» — **двумя предложениями**.
+
+    ⚠️ Склейка через пробел читалась как «не настроен Архив ставит только
+    канал раздела…» — два утверждения в одном предложении.
+    """
+    base = (reason or "").strip()
+    if base and not base.endswith((".", "!", "?", ":", ";")):
+        base += "."
+    return ("%s %s" % (base, ARCHIVE_HINT)).strip()
 
 #: Сколько символов промта уходит в область (текст задания).
 MAX_TASK_TEXT = 20_000
@@ -536,6 +558,22 @@ class LocalPromptStore:
         names = {item["project"] for item in self._records() if item["project"]}
         return sorted(names)
 
+    def own_section(self, slug: str) -> str:
+        """Свой раздел области по её слагу.
+
+        В **локальной** базе разделы те, что владелец разложил сам, — но
+        правило то же: если в базе есть раздел, отвечающий слагу области, то
+        он и есть её раздел (и раздел **другой** области сюда не берётся).
+        Нет такого — пусто (путь «как раньше»).
+        """
+        want = str(slug or "").strip().lower()
+        if not want:
+            return ""
+        for name in self.sections():
+            if str(name).strip().lower() == want:
+                return str(name).strip()
+        return ""
+
     def list_prompts(self, project: str = "", include_archived: bool = False,
                      only_archived: bool = False) -> list[dict[str, Any]]:
         out = []
@@ -653,6 +691,24 @@ class KarmanPromptStore:
 
     def sections(self) -> list[str]:
         return self._sections_fetch()[1]
+
+    def own_section(self, slug: str) -> str:
+        """Свой раздел области по её слагу — каноническое имя из библиотеки.
+
+        ⚠️ Имя раздела в библиотеке **каноническое** (`MiniGen`,
+        `MatricaRMZ`), а у области — **слаг** (`minigen`, `matricarmz`) ⇒
+        ищем без учёта регистра.
+
+        Пусто — раздела по слагу нет (список недоступен или такого раздела
+        нет): тогда остаётся запасной путь области (поле `karman`).
+        """
+        want = str(slug or "").strip().lower()
+        if not want:
+            return ""
+        for section in self.sections():
+            if str(section).strip().lower() == want:
+                return str(section).strip()
+        return ""
 
     def canonical_section(self, name: str) -> str:
         """Каноническое имя раздела (регистр не важен).
@@ -772,27 +828,41 @@ class KarmanPromptStore:
 
     def archive(self, prompt_id: str, project: str = "",
                 archived: bool = True) -> dict[str, Any]:
-        """Архивировать в разделе (или вернуть из архива) — токеном раздела."""
+        """Архивировать в разделе (или вернуть из архива) — токеном раздела.
+
+        ⚠️ Раздел в запросе — **каноническое** имя (`MiniGen`, а не слаг
+        `minigen`): сервис фильтрует по `prompt.project` точным равенством,
+        и «промт не найден в разделе» из-за имени — это молчание вместо
+        правды. И токен берётся по тому же каноническому имени.
+        """
         name = (project or "").strip()
         if not name:
             return {"ok": False, "error": "не указан раздел"}
-        token, source = karman.vault_secret(section_secret_name(name))
+        canonical = self.canonical_section(name) or name
+        secret_name = section_secret_name(canonical)
+        token, source = karman.vault_secret(secret_name)
         if not token:
             return {"ok": False,
                     "error": "токена раздела нет (%s) — архивировать нечем;"
                              " попроси грант в комнату программы"
-                             % section_secret_name(name)}
+                             % secret_name}
         try:
             pid = int(prompt_id)
         except (TypeError, ValueError):
             return {"ok": False, "error": "плохой id промта"}
         code, payload = karman.call("POST", "/api/prompts/section",
-                                    {"project": name, "id": pid,
+                                    {"project": canonical, "id": pid,
                                      "archived": bool(archived)},
                                     token=token)
         if code != 200:
+            reason = karman.explain(code)
+            if code == 503:
+                # ⚠️ «Канал не настроен» — не причина, а молчание: сказать,
+                # **что делать**. Архивирует только канал раздела (токен
+                # раздела), а он 503, пока сервис не видит этот токен.
+                reason = archive_reason(reason)
             return {"ok": False,
-                    "error": "раздел не принял: %s" % karman.explain(code)}
+                    "error": "раздел не принял: %s" % reason}
         return {"ok": True, "archived": bool(archived), "token_source": source}
 
     def status(self) -> dict[str, Any]:
@@ -824,8 +894,18 @@ class UnknownSection(RuntimeError):
 
 
 def section_secret_name(section: str) -> str:
-    """Имя секрета раздела: `PROMPTS_TOKEN_<Раздел>` (канон КАРМАНА)."""
-    return "PROMPTS_TOKEN_%s" % (section or "").strip().upper()
+    """Имя секрета раздела: ``PROMPTS_TOKEN_<Раздел>`` (канон КАРМАНА).
+
+    ⚠️ Правило — **как у сервиса** (``karman/lib/prompts/section-auth.ts``,
+    ``sectionSecretName``): раздел в верхнем регистре, а всё, что не буква и
+    не цифра, ⇒ один ``_``. Своя копия правила: разойдёмся с сервером — положим
+    токен не под тем именем, и канал молча не откроется (503).
+
+        MiniGen      → PROMPTS_TOKEN_MINIGEN
+        Matrica RMZ  → PROMPTS_TOKEN_MATRICA_RMZ
+    """
+    cleaned = re.sub(r"[^A-Z0-9]+", "_", str(section or "").strip().upper())
+    return "PROMPTS_TOKEN_%s" % cleaned
 
 
 def store_for(settings: dict[str, Any]) -> LocalPromptStore | KarmanPromptStore:
@@ -838,26 +918,44 @@ def store_for(settings: dict[str, Any]) -> LocalPromptStore | KarmanPromptStore:
 
 # ──────────────────────────────────────────────── раздача в рабочие области
 
-def area_sections(area: dict[str, Any]) -> list[str]:
+def area_sections(area: dict[str, Any], store: Any = None) -> list[str]:
     """Разделы, которые подходят области: её слаг и её раздел в КАРМАНЕ.
 
     Слаг — это имя проекта (`matricarmz`), а раздел в библиотеке промтов —
     каноническое имя (`MatricaRMZ`). Сравнение — без учёта регистра.
+
+    ⚠️ **Свой раздел — только свой.** У области `minigen` поле `karman` — это
+    `biblio`: по реестру это имя проекта в КАРМАНе (учёт расхода MiniMax и
+    комната vault'а), а **не** раздел библиотеки промтов. Взять `biblio` отсюда
+    — значит забрать работу дома утилит в область программы (живой случай
+    26.11: раздел `MiniGen` программы и раздел `biblio` дома — разные).
+
+    Поэтому: если внешний ресурс знает **свой** раздел области (каноническое
+    имя по слагу: `minigen` → `MiniGen`), берётся только он. Поле `karman`
+    остаётся запасным путём для областей, у которых слаг на раздел не похож
+    (`sabantuy` → `SabantuyMalmyzh`).
     """
     out: list[str] = []
     for name in (str(area.get("slug") or ""), str(area.get("karman") or "")):
         clean = name.strip()
         if clean and clean.lower() not in [item.lower() for item in out]:
             out.append(clean)
+    if store is not None:
+        try:
+            own = str(store.own_section(str(area.get("slug") or "")) or "")
+        except Exception:  # noqa: BLE001
+            own = ""
+        if own:
+            return [own]
     return out
 
 
-def section_matches(section: str, area: dict[str, Any]) -> bool:
+def section_matches(section: str, area: dict[str, Any], store: Any = None) -> bool:
     """Раздел промта = проект области? (иначе задание уедет не туда)."""
     want = (section or "").strip().lower()
     if not want:
         return False
-    return want in [item.lower() for item in area_sections(area)]
+    return want in [item.lower() for item in area_sections(area, store)]
 
 
 def build_task_text(record: dict[str, Any], plan: dict[str, Any] | None = None) -> str:
@@ -943,8 +1041,8 @@ def area_busy(mods: dict[str, Any], area: dict[str, Any]) -> bool:
 
 
 def dispatch_to_area(mods: dict[str, Any], area: dict[str, Any],
-                     record: dict[str, Any], plan: dict[str, Any] | None = None
-                     ) -> dict[str, Any]:
+                     record: dict[str, Any], plan: dict[str, Any] | None = None,
+                     store: Any = None) -> dict[str, Any]:
     """Отдать промт в область: открыть там сессию с текстом задания.
 
     Механизм — тот же, что у Управляющего (`minimax-sessionwatch.py --new`):
@@ -953,7 +1051,7 @@ def dispatch_to_area(mods: dict[str, Any], area: dict[str, Any],
     watcher = mods.get("sessionwatch")
     if watcher is None:
         return {"ok": False, "error": "сторож сессий недоступен"}
-    if not section_matches(str(record.get("project") or ""), area):
+    if not section_matches(str(record.get("project") or ""), area, store):
         return {"ok": False,
                 "error": "раздел промта «%s» ≠ проект области «%s»: задание "
                          "уедет не туда" % (record.get("project") or "—",
@@ -992,7 +1090,7 @@ def auto_dispatch_scan(mods: dict[str, Any], store: Any,
         return out
     for area in areas:
         slug = str(area.get("slug") or "")
-        sections = area_sections(area)
+        sections = area_sections(area, store)
         if not sections:
             continue
         if area_busy(mods, area):
@@ -1030,7 +1128,7 @@ def auto_dispatch_scan(mods: dict[str, Any], store: Any,
                 continue
             # План идёт вместе со **своим** промтом (ближайший по времени).
             plan = find_plan(records, record)
-            res = dispatch_to_area(mods, area, record, plan)
+            res = dispatch_to_area(mods, area, record, plan, store)
             if res.get("ok"):
                 mark_dispatched(record.get("source", SOURCE_LOCAL),
                                 record.get("project", ""),

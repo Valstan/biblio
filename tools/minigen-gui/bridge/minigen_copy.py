@@ -267,9 +267,26 @@ def answer_first_run(agree: bool, wanted_mode: str = "") -> dict[str, Any]:
     report["ok"] = True
     report["agreed"] = bool(agree)
     report["mode"] = chosen
-    report["why"] = ("копия зарегистрирована в общем репозитории: %s"
-                     % SHARED_REPO) if agree else (
-        "отказ принят: копия работает локально, программа в порядке")
+    # ⚠️ Честность — правило этого модуля: ответ владельца **записан**, но
+    # последствия могли не получиться (нет сети — клон не взялся; нет
+    # исходников — локальный репозиторий не поднялся). Раньше `why` говорил
+    # «копия зарегистрирована» в любом случае — окно обещало то, чего нет.
+    # Теперь неудачные шаги перечисляются, и владелец видит правду.
+    failed = [step for step in (report.get("steps") or [])
+              if not step.get("ok")]
+    report["failed"] = failed
+    if failed:
+        report["why"] = ("ответ принят (режим: %s), но не всё получилось: %s"
+                         % (MODE_LABELS.get(chosen, chosen),
+                            "; ".join("%s — %s" % (step.get("what") or "шаг",
+                                                   step.get("why") or "причина неизвестна")
+                                      for step in failed)))
+    elif agree:
+        report["why"] = ("копия зарегистрирована в общем репозитории: %s"
+                         % SHARED_REPO)
+    else:
+        report["why"] = ("отказ принят: копия работает локально, программа "
+                         "в порядке")
     return report
 
 
@@ -326,7 +343,20 @@ def set_mode(value: str) -> dict[str, Any]:
     report = _apply_mode(value)
     report["ok"] = True
     report["mode"] = value
-    report["why"] = "режим копии: %s" % MODE_LABELS[value]
+    # ⚠️ Честность (как в `answer_first_run`): режим записан всегда, но
+    # перевод копии в это состояние мог не получиться (нет сети — клон не
+    # взялся). Окно должно видеть неудачные шаги, а не только подпись режима.
+    failed = [step for step in (report.get("steps") or [])
+              if not step.get("ok")]
+    report["failed"] = failed
+    if failed:
+        report["why"] = ("режим переключён на «%s», но не всё получилось: %s"
+                         % (MODE_LABELS.get(value, value),
+                            "; ".join("%s — %s" % (step.get("what") or "шаг",
+                                                   step.get("why") or "причина неизвестна")
+                                      for step in failed)))
+    else:
+        report["why"] = "режим копии: %s" % MODE_LABELS[value]
     lineage.record("mode", mode=value)
     return report
 

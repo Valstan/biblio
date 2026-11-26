@@ -18,6 +18,7 @@ import type {
 import { api } from '../api'
 import { TZ_LABEL, formatDateTime } from '../time'
 import { answerConfirmText, firstRunView, modeConfirmText, modeRows, type Tone } from './copy-view'
+import CopyFirstRunQuestion from './copy-first-run'
 import {
   DB_DECISIONS,
   dbPlanSummary,
@@ -673,57 +674,16 @@ export default function SettingsTab({ settings, snapshot, onSaved }: Props) {
             Мост не ответил — вопрос первого запуска не задан, состояние копии
             неизвестно.
           </p>
-        ) : first.asked ? (
-          <p className="muted small">
-            Вопрос первого запуска уже задан:{' '}
-            {copySnapshot?.first_run?.agreed ? 'согласие' : 'отказ'}. Режим копии
-            меняется ниже.
-          </p>
         ) : (
-          <>
-            <p className="title">{first.title}</p>
-            <table className="grid compact">
-              <tbody>
-                <tr>
-                  <td className="muted">Репозиторий</td>
-                  <td>{first.repository}</td>
-                </tr>
-                <tr>
-                  <td className="muted">Папка копии</td>
-                  <td>{first.folder}</td>
-                </tr>
-              </tbody>
-            </table>
-            <p className="muted small">Что это даёт:</p>
-            <ul className="muted small">
-              {(first.gives.length ? first.gives : ['—']).map((item) => (
-                <li key={item}>{item}</li>
-              ))}
-            </ul>
-            <p className="muted small">Если отказаться:</p>
-            <ul className="muted small">
-              {(first.ifRefuse.length ? first.ifRefuse : ['—']).map((item) => (
-                <li key={item}>{item}</li>
-              ))}
-            </ul>
-            <p className="muted small">{first.who}</p>
-            <div className="row">
-              <button
-                className="primary"
-                onClick={() => void answerFirstRun(true)}
-                disabled={busy}
-              >
-                Согласиться
-              </button>
-              <button
-                className="ghost"
-                onClick={() => void answerFirstRun(false)}
-                disabled={busy}
-              >
-                Отказаться
-              </button>
-            </div>
-          </>
+          /* ⚠️ Тот же вопрос, что и в окне при первом открытии (промт #131) —
+             один компонент на два места: если тексты разойдутся, окно однажды
+             скажет владельцу не то. */
+          <CopyFirstRunQuestion
+            snapshot={copySnapshot}
+            busy={busy}
+            onAgree={() => void answerFirstRun(true)}
+            onRefuse={() => void answerFirstRun(false)}
+          />
         )}
 
         <p className="muted small" style={{ marginTop: 8 }}>

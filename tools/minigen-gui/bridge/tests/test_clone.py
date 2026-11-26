@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
 import unittest
@@ -28,6 +29,7 @@ sys.path.insert(0, str(BRIDGE_DIR))
 import minigen_clone as clone_mod  # noqa: E402
 import minigen_code as code        # noqa: E402
 import minigen_lineage as lineage  # noqa: E402
+import minigen_state as state      # noqa: E402
 
 
 class _FakeGit:
@@ -115,13 +117,37 @@ class SetupTest(unittest.TestCase):
         self._old_gh = clone_mod.gh
         clone_mod.git = self._git
         clone_mod.gh = self._gh
+        # ⚠️ Живые файлы программы не трогаем: настройки, родословная и
+        # летопись — во временный каталог (иначе тест дописал бы режим
+        # копии в настройки боевой программы).
+        self._old_settings = state.SETTINGS_FILE
+        self._old_instance_file = lineage.INSTANCE_FILE
+        self._old_ledger = lineage.LEDGER_FILE
+        self.settings_file = Path(self.tmp.name) / "settings.json"
+        state.SETTINGS_FILE = self.settings_file
+        lineage.INSTANCE_FILE = Path(self.tmp.name) / "instance.json"
+        lineage.LEDGER_FILE = Path(self.tmp.name) / "lineage.jsonl"
+        self._old_instance = lineage.instance
+        lineage.instance = lambda: {"instance_id": "mg-abcdef12",
+                                    "family": "minigen", "generation": 1,
+                                    "fork_of": {"commit": "abc1234"}}
 
     def tearDown(self) -> None:
         clone_mod.CLONE_DIR = self._old_clone
         clone_mod.POOL_DIR = self._old_pool
         clone_mod.git = self._old_git
         clone_mod.gh = self._old_gh
+        state.SETTINGS_FILE = self._old_settings
+        lineage.INSTANCE_FILE = self._old_instance_file
+        lineage.LEDGER_FILE = self._old_ledger
+        lineage.instance = self._old_instance
         self.tmp.cleanup()
+
+    def settings(self) -> dict:
+        try:
+            return json.loads(self.settings_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
 
     def test_own_repo_is_created_when_fork_is_forbidden(self) -> None:
         report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool",
@@ -167,6 +193,28 @@ class SetupTest(unittest.TestCase):
         report = clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool")
         self.assertNotIn(str(self.tmp.name).lower(),
                          str(report.get("repo", "")).lower())
+
+    def test_settings_say_where_the_copy_works(self) -> None:
+        """Программа должна знать, где её копия (план 6 промта #130).
+
+        ⚠️ Ключи `copyMode`, `copyRepo`, `copyTokenFolder` были объявлены в
+        настройках, но никто их не писал: `settings.get` отдавал пустые
+        строки, и «где работает копия» знала только родословная.
+        """
+        clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool")
+        settings = self.settings()
+        self.assertEqual(settings.get("copyMode"), "shared")
+        self.assertEqual(settings.get("copyTokenFolder"), "copies/mg-abcdef12/")
+        # в режиме «папка в общем репозитории» своего репозитория нет
+        self.assertEqual(settings.get("copyRepo"), "")
+
+    def test_settings_name_the_own_repository_in_the_own_mode(self) -> None:
+        clone_mod.setup(upstream="Valstan/biblio", pool="Valstan/minigen-genepool",
+                        mode="own")
+        settings = self.settings()
+        self.assertEqual(settings.get("copyMode"), "own")
+        self.assertEqual(settings.get("copyRepo"), "minigen-abcdef12")
+        self.assertEqual(settings.get("copyTokenFolder"), "copies/mg-abcdef12/")
 
 
 class RegisterFolderTest(unittest.TestCase):

@@ -11,16 +11,17 @@ import {
   validateDraft,
   type AgentDraft
 } from './agents-view'
+import { requestSections, sectionsInUse, sectionsOf } from './agents-requests'
 
 /**
  * Вкладка «Агенты» — реестр агентов «МиниГена» глазами (заявка владельца
- * от 24.11, раздел КАРМАНА «MiniGen», промт #123).
+ * от 24.11, раздел КАРМАНА «MiniGen», промт #122).
  *
  * Что показывает:
  * - **канал КАРМАНА**: жив или не настроен, откуда взят секрет и сколько
  *   разделов (заявки уходят в раздел своего проекта);
  * - **реестр агентов**: slug, название, роль, репозиторий, область и
- *   число заявок;
+ *   число заявок — и разделы, куда эти заявки ушли;
  * - действия: «Восстановить» агента (по реестру с GitHub) и «Создать
  *   агента» — с подтверждением, потому что создание меняет внешний мир.
  *
@@ -73,6 +74,22 @@ export default function AgentsTab() {
   const rows = agentRows(snapshot)
   const channelInfo = channelView(channel)
   const warning = registryWarning(snapshot)
+  // Куда уходят заявки: по каждому агенту и по всем вместе (для канала).
+  const byAgent = requestSections(snapshot)
+  const usedSections = sectionsInUse(byAgent)
+
+  // Ячейка «Заявки»: сколько заявок и в какие разделы они ушли.
+  const requestCell = (slug: string, count: number) => {
+    const sections = sectionsOf(byAgent, slug)
+    return (
+      <>
+        {count}
+        {sections.length > 0 && (
+          <div className="muted small">раздел: {sections.join(', ')}</div>
+        )}
+      </>
+    )
+  }
 
   const restore = async (row: (typeof rows)[number]) => {
     if (!window.confirm(applyConfirmText(row))) return
@@ -187,6 +204,10 @@ export default function AgentsTab() {
           Заявки уходят в раздел своего проекта; если раздела нет — он
           заводится сам.
         </p>
+        <p className="muted small">
+          Заявки агентов ушли в разделы:{' '}
+          <span className="title">{usedSections.length ? usedSections.join(', ') : 'пока никуда'}</span>
+        </p>
         <p>
           <span className={`chip ${channelInfo.tone === 'ok' ? 'ok' : channelInfo.tone === 'warn' ? 'warn' : 'bad'}`}>
             {channelInfo.label}
@@ -194,12 +215,15 @@ export default function AgentsTab() {
           <span className="muted small">{channelInfo.detail}</span>
         </p>
         {channelInfo.sections.length > 0 && (
-          <div className="chips">
-            {channelInfo.sections.map((name) => (
-              <span key={name} className="chip muted">
-                {name}
-              </span>
-            ))}
+          <div>
+            <p className="muted small">Разделы канала:</p>
+            <div className="chips">
+              {channelInfo.sections.map((name) => (
+                <span key={name} className="chip muted">
+                  {name}
+                </span>
+              ))}
+            </div>
           </div>
         )}
       </div>
@@ -239,7 +263,7 @@ export default function AgentsTab() {
                   <td className="muted">{row.role}</td>
                   <td className="muted">{row.repo}</td>
                   <td className="muted">{row.area}</td>
-                  <td className="muted">{row.requests}</td>
+                  <td className="muted">{requestCell(row.slug, row.requests)}</td>
                   <td className="actions">
                     <button className="ghost" onClick={() => void restore(row)} disabled={busy}>
                       Восстановить

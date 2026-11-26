@@ -10,9 +10,12 @@ import {
   answerConfirmText,
   exchangeView,
   firstRunView,
+  localOfferView,
   modeConfirmText,
   modeRows,
   modeView,
+  newWorksPhrase,
+  newWorksView,
   suggestionRows
 } from '../src/renderer/src/tabs/copy-view'
 
@@ -291,5 +294,73 @@ describe('режимы копии и первый запуск', () => {
     expect(no).toContain('PR')
     expect(no).toContain('обмен с другими копиями недоступен')
     expect(no).toContain('не ломает программу')
+  })
+})
+
+describe('уведомление о новых наработках', () => {
+  it('новые — те, которых копия ещё не видела', () => {
+    const view = newWorksView(suggestions(), ['g-1'])
+    expect(view.count).toBe(1)
+    expect(view.genes).toEqual(['g-2'])
+    expect(view.text).toContain('найдена 1 новая наработка')
+  })
+
+  it('все показанные — новые, если ничего не помним', () => {
+    const view = newWorksView(suggestions(), [])
+    expect(view.count).toBe(2)
+    expect(view.fits).toBe(1)
+    expect(view.text).toContain('найдено 2 новые наработки')
+    expect(view.text).toContain('1 совпадает с вашей работой')
+  })
+
+  it('форма слова — по-русски (1 / 2-4 / 5+)', () => {
+    expect(newWorksPhrase(1)).toBe('найдена 1 новая наработка')
+    expect(newWorksPhrase(3)).toBe('найдено 3 новые наработки')
+    expect(newWorksPhrase(5)).toBe('найдено 5 новых наработок')
+    expect(newWorksPhrase(11)).toBe('найдено 11 новых наработок')
+    expect(newWorksPhrase(21)).toBe('найдено 21 новых наработок')
+  })
+
+  it('виденное повторно не предлагается (шум — не сигнал)', () => {
+    const view = newWorksView(suggestions(), ['g-1', 'g-2'])
+    expect(view.count).toBe(0)
+    expect(view.text).toBe('')
+  })
+
+  it('нет данных моста — уведомления нет, а не «найдено 0»', () => {
+    expect(newWorksView(null, []).count).toBe(0)
+    expect(newWorksView(null, []).text).toBe('')
+  })
+})
+
+describe('локальный режим: окно предлагает выход, а не молчит', () => {
+  const localStatus = (): CloneStatus =>
+    cloneStatus({
+      mode: 'local',
+      mode_label: 'Только локально, без сети',
+      exchange: {
+        available: false,
+        transport: 'нет',
+        pool: '',
+        pool_exists: false,
+        why: 'локальный режим: сети нет — обмен с другими копиями недоступен'
+      }
+    })
+
+  it('в локальном режиме предлагает включить режим с репозиторием', () => {
+    const view = localOfferView(localStatus())
+    expect(view.local).toBe(true)
+    expect(view.text).toContain('недоступен')
+    expect(view.text).toContain('папка в общем репозитории')
+    expect(view.text).toContain('Почему сейчас нет')
+  })
+
+  it('в других режимах предлагать нечего — смена режима не поможет', () => {
+    expect(localOfferView(cloneStatus({ mode: 'shared' })).local).toBe(false)
+    expect(localOfferView(cloneStatus({ mode: 'own' })).text).toBe('')
+  })
+
+  it('нет ответа моста — предложения нет, а не выдуманный локальный режим', () => {
+    expect(localOfferView(null).local).toBe(false)
   })
 })

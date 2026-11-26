@@ -48,6 +48,7 @@ import json
 import os
 import secrets
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -61,8 +62,8 @@ META_FILE = CREDENTIALS / "copy-token-meta.json"
 LOCAL_SECRET_FILE = CREDENTIALS / "copy-local-secret.txt"
 #: Заявки на токен — в своём разделе КАРМАНА (их читает владелец).
 REQUESTS_SECTION = "MiniGen-tokens"
-#: Папка копии в общем репозитории программы.
-COPIES_FOLDER = "copies"
+#: Папка копии в общем репозитории программы (корень — у всех копий один).
+COPIES_FOLDER = lineage.COPIES_FOLDER
 
 TOKEN_BYTES = 32
 PROOF_DOMAIN = "minigen-copy-token-v1"
@@ -124,13 +125,12 @@ def safe_ident(value: str) -> str:
     кладётся и в путь (`copies/<идентификатор>/`), и в имя файла ⇒ путь
     должен быть безопасным: оставляем только буквы, цифры, «-», «_», «.»,
     а пустое и «..» заменяем отпечатком.
+
+    Правило живёт в родословной (`minigen_lineage.safe_ident`) — это
+    **единственный** источник: иначе копия и токен посчитали бы папку
+    по-разному, и доказательство привязки не сошлось бы.
     """
-    raw = "".join(ch for ch in str(value or "")
-                  if ch.isalnum() or ch in "-_.").strip()
-    if not raw or raw in (".", "..") or ".." in raw:
-        return "copy-%s" % hashlib.sha256(
-            str(value or "").encode("utf-8")).hexdigest()[:12]
-    return raw
+    return lineage.safe_ident(value)
 
 
 def proof_for(secret: str, instance_id: str, folder: str) -> str:
@@ -207,10 +207,51 @@ def _write_meta(data: dict[str, Any]) -> None:
         pass
 
 
+def publish_settings() -> dict[str, Any]:
+    """Опубликовать в настройках, где токен и кто он (без самого токена).
+
+    ⚠️ В настройках — **только** путь к стору, отпечаток (идентификатор) и
+    папка копии. Значения токена там нет и быть не должно: секрет живёт в
+    сторе на машине, а не в файле настроек (D-038 — секрет в репозитории
+    быть не может, а настройки программы — часть её следа).
+
+    ⚠️ Настройки **не источник правды**: токен лежит в сторе, и программа
+    только говорит, где он. Поэтому публикация ничего не ломает, даже если
+    файл настроек снесли.
+
+    ⚠️ Пишем только когда значения разошлись: окно спрашивает состояние
+    токена каждые несколько секунд, а настройки — файл на диске.
+    """
+    secret, _ = read_token()
+    meta = _meta()
+    own_ident, own_folder = _own()
+    patch = {
+        "copyTokenPath": str(TOKEN_FILE),
+        "copyTokenId": token_id(secret) or str(meta.get("token_id") or ""),
+        "copyTokenFolder": own_folder,
+    }
+    try:
+        import minigen_state as state
+        current = state.read_settings()
+        if all(str(current.get(key) or "") == str(value)
+               for key, value in patch.items()):
+            return patch           # уже совпадает — файл не трогаем
+        state.write_settings(patch)
+    except Exception:  # noqa: BLE001
+        # Настройки — не критично: токен лежит в сторе, и его наличие
+        # программа узнает и без них (`copy.token_status`).
+        pass
+    return patch
+
+
 def instance_folder(instance_id: str = "") -> str:
-    """Папка копии в общем репозитории: `copies/<идентификатор копии>/`."""
-    ident = instance_id or str(lineage.instance().get("instance_id") or "copy")
-    return "%s/%s/" % (COPIES_FOLDER, safe_ident(ident))
+    """Папка копии в общем репозитории: `copies/<идентификатор копии>/`.
+
+    ⚠️ Строка папки — **доказательство привязки** токена (HMAC считается
+    от неё), поэтому берётся из родословной, а не строится на месте: иначе
+    токен, выпущенный под одну папку, подошёл бы к другой.
+    """
+    return lineage.copies_folder(instance_id)
 
 
 def _issued_record_path(instance_id: str) -> Path:
@@ -244,6 +285,7 @@ def issue(instance_id: str = "", folder: str = "", name: str = "") -> dict[str, 
         # выпуск самому себе: секрет сразу ложится в свой стор
         _write(TOKEN_FILE, secret)
         _write_meta(record)
+        publish_settings()
     return {"ok": True, "token": pack(secret, proof), "token_id": token_id(secret),
             "proof": proof, "instance_id": ident, "folder": folder,
             "issued_at": issued, "path": str(_issued_record_path(ident)),
@@ -282,6 +324,7 @@ def set_token(value: str, instance_id: str = "", folder: str = "",
                  "name": str(meta.get("name") or ""),
                  "issued_at": int(issued_at or meta.get("issued_at") or _now()),
                  "token_id": token_id(secret), "proof": proof})
+    publish_settings()
     ok = bool(proof)
     return {"ok": True, "token_id": token_id(secret), "bound": ok,
             "instance_id": own_ident, "folder": own_folder,
@@ -301,6 +344,7 @@ def clear_token() -> dict[str, Any]:
                 path.unlink()
         except OSError:
             pass
+    publish_settings()
     return {"ok": True, "why": "токен убран из стора"}
 
 
@@ -353,6 +397,10 @@ def status() -> dict[str, Any]:
                          "похоже, он выдан другой копии" % own_folder)
     else:
         out["reason"] = "токен выдан под папку %s" % own_folder
+    # Настройки приводим в соответствие с реальностью: после обновления
+    # программы токен мог остаться в сторе, а путь и отпечаток в настройках
+    # — ещё нет. Пишем только при изменении (см. `publish_settings`).
+    publish_settings()
     return out
 
 
@@ -477,7 +525,12 @@ def requests(section: str = REQUESTS_SECTION) -> list[dict[str, Any]]:
     import minigen_prompts as prompts_mod
     section = (section or REQUESTS_SECTION).strip() or REQUESTS_SECTION
     try:
-        code, payload = karman.call("GET", "/api/prompts?project=%s" % section)
+        # ⚠️ Имя раздела — в адрес **экранированным**: кириллица в имени иначе
+        # роняет запрос (UnicodeEncodeError), а это молчаливый отказ — владелец
+        # видел бы пустой список заявок и думал, что их нет (живой случай
+        # 26.11 в разделе промтов).
+        code, payload = karman.call(
+            "GET", "/api/prompts?project=%s" % urllib.parse.quote(section, safe=""))
     except Exception:  # noqa: BLE001
         return []
     if code != 200:

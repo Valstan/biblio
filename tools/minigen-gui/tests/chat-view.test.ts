@@ -6,6 +6,7 @@ import {
   callDetails,
   callsSummary,
   greetingMessage,
+  pendingArgs,
   restoreMessages
 } from '../src/renderer/src/tabs/chat-view'
 
@@ -66,6 +67,26 @@ describe('подробности вызова', () => {
     expect(details.tool).toBe('areas.state')
     expect(details.args).toBe('{}')
     expect(details.result).toBe('')
+  })
+})
+
+describe('подтверждение опасного действия', () => {
+  it('аргументы — в свёртке: владелец видит, что именно выполняется', () => {
+    const pending = {
+      tool: 'code.commit',
+      args: { branch: 'fix/defect', message: 'починил дефект' },
+      reason: 'коммит требует подтверждения владельца',
+      call_id: 't1'
+    }
+    const text = pendingArgs(pending)
+    expect(text).toContain('fix/defect')
+    expect(text).toContain('починил дефект')
+  })
+
+  it('аргументы пустые — не выдумываются', () => {
+    expect(
+      pendingArgs({ tool: 'code.pr', args: {}, reason: '', call_id: 't2' })
+    ).toBe('{}')
   })
 })
 

@@ -332,3 +332,116 @@ export function answerConfirmText(agree: boolean, offer: CopyOffer): string {
     'Продолжить?'
   )
 }
+
+/**
+ * Режим «папка в общем репозитории» — как его предлагает окно, когда обмен
+ * недоступен из-за локального режима.
+ *
+ * ⚠️ Значение — по заказу владельца 25.11 (промт #131), а не выдумка окна:
+ * это тот же режим, что и в настройках, только поданный как предложение.
+ */
+export const SHARED_MODE_OPTION: CopyModeOption = {
+  id: 'shared',
+  label: 'Папка в общем репозитории',
+  hint: 'Правки и PR идут прямо в общий репозиторий программы. Обмен наработками доступен.'
+}
+
+/**
+ * Что окно предлагает, когда обмен наработками недоступен из-за локального
+ * режима (план промта #131, пункт 6: «предлагать включить режим с
+ * репозиторием»).
+ *
+ * ⚠️ Предлагать надо **тогда, когда это правда**: локальный режим — единственный
+ * случай, где недоступность обмена можно снять сменой режима. Если обмен не
+ * доступен по другой причине (пул не взят), смена режима не поможет — значит,
+ * и предлагать нечего.
+ */
+export function localOfferView(status: CloneStatus | null): {
+  local: boolean
+  text: string
+} {
+  const local = (status?.mode || '').trim() === 'local'
+  if (!local) {
+    return { local: false, text: '' }
+  }
+  const why = (status?.exchange?.why || '').trim()
+  return {
+    local: true,
+    text:
+      'Обмен с другими копиями недоступен: локальный режим, сети нет. ' +
+      'Можно перевести копию в режим «папка в общем репозитории» — тогда ' +
+      'обмен и PR заработают.' +
+      (why ? ` Почему сейчас нет: ${why}` : '')
+  }
+}
+
+/**
+ * Новые наработки других копий — сколько пришло с прошлого раза.
+ *
+ * ⚠️ «Новые» — те, которых копия ещё не видела (список виденного окно
+ * помнит на машине). Это честный признак «появились у соседей», а не
+ * «все наработки вообще»: показывать всё подряд — шум, а владелец шум не
+ * читает.
+ */
+export interface NewWorksView {
+  /** сколько новых наработок */
+  count: number
+  /** их идентификаторы (для показа) */
+  genes: string[]
+  /** сколько из них совпадает с текущей работой копии */
+  fits: number
+  /** текст уведомления */
+  text: string
+}
+
+/**
+ * Сколько новых наработок — по-русски: «найдена 1 новая наработка»,
+ * «найдено 2 новые наработки», «найдено 5 новых наработок».
+ *
+ * ⚠️ Форму стоит делать правильно: окно говорит с владельцем, и «найдено 1
+ * наработка» — неграмотно. Правило — как в `chat-view` (1 / 2-4 / 5+).
+ */
+export function newWorksPhrase(count: number): string {
+  if (count === 1) return 'найдена 1 новая наработка'
+  const mod100 = count % 100
+  const mod10 = count % 10
+  if (mod100 >= 11 && mod100 <= 14) return `найдено ${count} новых наработок`
+  if (mod10 >= 2 && mod10 <= 4) return `найдено ${count} новые наработки`
+  return `найдено ${count} новых наработок`
+}
+
+/** «1 совпадает» / «2 совпадают» — та же форма, но про совпадение. */
+function fitsPhrase(count: number): string {
+  const mod100 = count % 100
+  const mod10 = count % 10
+  if (mod100 >= 11 && mod100 <= 14) return `${count} совпадают`
+  if (mod10 === 1) return `${count} совпадает`
+  return `${count} совпадают`
+}
+
+export function newWorksView(
+  data: GeneSuggestions | null,
+  seen: readonly string[]
+): NewWorksView {
+  const known = new Set(
+    (seen ?? []).map((item) => (item || '').trim()).filter(Boolean)
+  )
+  const items = data?.suggestions ?? []
+  const fresh = items.filter((item) => {
+    const id = (item?.id || '').trim()
+    return Boolean(id) && !known.has(id)
+  })
+  const fits = fresh.filter((item) => item.fits === true).length
+  const count = fresh.length
+  const text = count
+    ? `${newWorksPhrase(count)} от других копий` +
+      (fits ? ` (${fitsPhrase(fits)} с вашей работой)` : '') +
+      ' — показать?'
+    : ''
+  return {
+    count,
+    genes: fresh.map((item) => (item.id || '').trim()),
+    fits,
+    text
+  }
+}

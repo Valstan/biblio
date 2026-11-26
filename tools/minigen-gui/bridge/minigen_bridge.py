@@ -1694,7 +1694,7 @@ class Bridge:
         if record is None:
             return {"ok": False, "error": "такого промта в хранилище нет"}
         plan = prompts_mod.find_plan(records, record)
-        res = prompts_mod.dispatch_to_area(self.mods, area, record, plan)
+        res = prompts_mod.dispatch_to_area(self.mods, area, record, plan, store)
         if res.get("ok"):
             prompts_mod.mark_dispatched(record.get("source", ""),
                                         record.get("project", ""), prompt_id,
