@@ -44,6 +44,8 @@ jobs:
         run: python3 tools/minimax-project-areas/test_session_reset_in_place.py
       - name: Приёмка лечения сессий по решению «Управляющего» (промт #172)
         run: python3 tools/minimax-project-areas/test_thread_treatment.py
+      - name: Приёмка пробелов #172 (предел простоя вынесен явно; секретов в паспорте нет)
+        run: python3 tools/minimax-project-areas/test_thread_treatment_gaps.py
       - name: Приёмка надзирателя (раскатка не должна оставлять программу без него)
         run: python3 tools/minimax-project-areas/test_rollout_keeps_supervisor.py
       - name: Приёмка канала промтов раздела (D-190)
