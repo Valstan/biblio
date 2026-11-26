@@ -399,6 +399,9 @@ class Bridge:
             "model.apply": self.cmd_model_apply,
             # сброс сессии на месте (заказ владельца 24.11)
             "sessions.reset": self.cmd_sessions_reset,
+            # решение о лечении сессии — встроенная нейросеть «Управляющего»
+            # (промт #172): на вход факты, на выход одно из трёх действий
+            "treat.decision": self.cmd_treat_decision,
             # «ящик отчётов»: сторожи и инструменты отчитываются туда,
             # нейросеть читает (заказ владельца 24.11)
             "reports.list": self.cmd_reports_list,
@@ -840,6 +843,33 @@ class Bridge:
         self.core.log("Панель «МиниГен»: %s — ротация сессии %s" % (
             area["slug"], sess["session_id"][:12]))
         return state.jsonable(rep)
+
+    # ──────────────────────────────────────── решение о лечении сессии (#172)
+    def cmd_treat_decision(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Решение о лечении сессии принимает **встроенная нейросеть** (промт #172).
+
+        На вход — факты о ситуации (их собрал сторож сессий: вердикт, отчёт о
+        выполнении, сжатие контекста, репозиторий/ветка/worktree нитки,
+        параллельные сессии). На выход — **ровно одно** из трёх действий
+        (`продолжать` / `завершать` / `новая_сессия`), текст инструкции
+        обслуживаемому агенту и причина.
+
+        ⚠️ Модель недоступна ⇒ честный отказ (`ok: false`): решение тогда
+        принимает **правило-фолбэк** на стороне демона, и оно не требует
+        завершать сессию без отчёта о выполнении.
+        """
+        facts = args.get("facts")
+        if not isinstance(facts, dict) or not facts:
+            return {"ok": False, "why": "нужны факты о ситуации"}
+        settings = state.read_settings()
+        area_slug = str(args.get("area") or settings.get("modelArea") or "minigen")
+        model = str(args.get("model") or settings.get("model") or "")
+        self.core.refresh_env()
+        try:
+            result = self.agent.decide_treatment(facts, area_slug, model)
+        except Exception as exc:  # noqa: BLE001 — модель/сеть не роняют программу
+            return {"ok": False, "why": "решение не вышло: %s" % exc}
+        return state.jsonable(result)
 
     def cmd_sessions_reset(self, args: dict[str, Any]) -> dict[str, Any]:
         """Сбросить сессию НА МЕСТЕ: правильно завершить → очистить → продолжить.
@@ -2163,6 +2193,14 @@ def daemon_mode() -> int:
         return 0
 
     bridge = Bridge()
+    try:
+        # Решатель лечения сессий — встроенная нейросеть «Управляющего»
+        # (промт #172). Ставится **после** поднятия API: сервер живёт в этом
+        # же процессе, и запросы решения приходят уже сюда.
+        import minigen_api
+        minigen_api.set_decider(bridge.cmd_treat_decision)
+    except Exception:  # noqa: BLE001 — без решателя работает правило-фолбэк
+        pass
     try:
         bridge.core.log("ДЕМОНЫ: программа «МиниГен» в фоновом режиме — "
                         "демоны подняты и следятся (API на %s)"

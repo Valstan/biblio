@@ -63,7 +63,11 @@ FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
          "minigen_karman_prompts.py",
          # 24.11: время программы — везде Москва, Россия (UTC+3). Модуль нужен
          # и демонам, и мосту (он грузит ядро из bin).
-         "minigen_time.py")
+         "minigen_time.py",
+         # 26.11 (промт #172): паспорт нитки и решение о лечении сессии —
+         # модуль сторожа сессий. Без него в списке демон на машине не
+         # поднимется (сторож грузит его при старте).
+         "minigen_thread.py")
 # ⚠️ 23.11: `minimax-autheal.py` в списке НЕ БЫЛ — раскатка выкладывала
 # сторожей, но не лечащего. Отсюда и расхождение «репозиторий ↔ машина»:
 # правки лечащего жили только на машине, а эталон (master) отставал, и
@@ -770,8 +774,8 @@ def main() -> int:
 
     print("--- проверка ---")
     ok = True
-    for name in ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
-                 "minimax-autheal.py"):
+    for name in ("minigen_core.py", "minigen_thread.py", "minimax-netwatch.py",
+                 "minimax-sessionwatch.py", "minimax-autheal.py"):
         r = subprocess.run([sys.executable, "-m", "py_compile", str(BIN / name)],
                            capture_output=True, text=True)
         good = r.returncode == 0
