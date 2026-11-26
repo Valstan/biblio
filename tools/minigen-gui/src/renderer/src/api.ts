@@ -1,6 +1,7 @@
 import type {
   Area,
   AgentsSnapshot,
+  ChatAttachment,
   ChatMessage,
   ChatReply,
   CloneStatus,
@@ -11,6 +12,10 @@ import type {
   CopyTokenRequest,
   CopyTokenStatus,
   DaemonStatus,
+  DbExportResult,
+  DbImportPlan,
+  DbImportReport,
+  DbStatus,
   GeneActionResult,
   GeneMap,
   GeneRecord,
@@ -22,6 +27,7 @@ import type {
   NetworkState,
   ProgramVersion,
   PromptsSnapshot,
+  PromptsView,
   Settings,
   Snapshot,
   Stats,
@@ -35,6 +41,10 @@ declare global {
       call(cmd: string, args?: Record<string, unknown>): Promise<unknown>
       openExternal(path: string): Promise<boolean>
       saveText(name: string, content: string): Promise<{ ok: boolean; path: string; error?: string }>
+      /** выбрать файлы для чата (диалог в главном процессе) */
+      pickFiles(): Promise<{ path: string; name: string; size: number }[]>
+      /** настоящий путь перетащенного файла (пусто — не удалось) */
+      getPathForFile(file: File): string
       relaunch(): Promise<boolean>
       buildInfo(): Promise<{ commit: string }>
       bridgeStatus(): Promise<{ alive: boolean; message: string }>
@@ -73,7 +83,8 @@ export const api = {
   stats: (days: number) => call<Stats>('stats.summary', { days }),
   settings: () => call<Settings>('settings.get'),
   saveSettings: (patch: Partial<Settings>) => call<Settings>('settings.set', patch),
-  chatSend: (text: string) => call<ChatReply>('chat.send', { text }),
+  chatSend: (text: string, attachments?: ChatAttachment[]) =>
+    call<ChatReply>('chat.send', { text, attachments }),
   chatConfirm: (approved: boolean) => call<ChatReply>('chat.confirm', { approved }),
   // История чата с диска машины: переписка не теряется при перезапуске окна.
   chatHistory: () => call<{ messages: ChatMessage[]; path?: string }>('chat.history'),
@@ -123,11 +134,14 @@ export const api = {
   },
   karmanStatus: () => call<KarmanChannel>('karman.status'),
   // ── «Хранилище промтов» (вкладка «Промты», 25.11) ────────────────────────
-  promptsList: (project?: string) =>
-    call<PromptsSnapshot>('prompts.list', project ? { project } : {}),
+  promptsList: (project?: string, view?: PromptsView) =>
+    call<PromptsSnapshot>('prompts.list', {
+      ...(project ? { project } : {}),
+      ...(view ? { view } : {})
+    }),
   promptsSave: (payload: { project: string; title: string; body: string }) =>
     call<{ ok: boolean; error?: string; id?: string }>('prompts.save', payload),
-  promptsArchive: (payload: { id: string; project?: string }) =>
+  promptsArchive: (payload: { id: string; project?: string; archived?: boolean }) =>
     call<{ ok: boolean; error?: string }>('prompts.archive', payload),
   promptsMark: (payload: { id: string; project?: string; auto: boolean }) =>
     call<{ ok: boolean; error?: string }>('prompts.mark', payload),
@@ -181,7 +195,23 @@ export const api = {
     call<{ ok?: boolean; why?: string; error?: string }>('copy.token_trust', {
       instance_id,
       key_id
-    })
+    }),
+  // ── локальная база «МиниГена» (промт #92) ───────────────────────────────
+  dbStatus: () => call<DbStatus>('db.status'),
+  dbRecords: (kind?: string, limit?: number) =>
+    call<{ ok: boolean; records: unknown[]; count: number }>('db.records', {
+      kind,
+      limit
+    }),
+  /** Выгрузка: путь выбирает оператор (диалог главного процесса). */
+  dbExport: () => call<DbExportResult>('db.export'),
+  /** Разбор файла выгрузки — ничего не меняет, только план и вопросы. */
+  dbInspect: (path: string) => call<DbImportPlan>('db.inspect', { path }),
+  /** Импорт: решения оператора по спорным записям («вид|ключ» → решение). */
+  dbImport: (path: string, decisions?: Record<string, string>) =>
+    call<DbImportReport>('db.import', { path, decisions }),
+  /** Выбор файла выгрузки — диалог открывает главный процесс. */
+  dbPickFile: () => call<{ ok: boolean; path?: string; canceled?: boolean }>('db.pick')
 }
 
 /** Действия окна (не моста): перезапуск, метка сборки, состояние моста. */

@@ -43,12 +43,14 @@ sys.path.insert(0, str(HERE))
 
 import minigen_state as state          # noqa: E402
 import minigen_tools as tools          # noqa: E402
+import minigen_db                      # noqa: E402 — локальная база «МиниГена»
 import minigen_code as code            # noqa: E402
 import minigen_clone as clone_mod      # noqa: E402
 import minigen_genes as genes_mod      # noqa: E402
 import minigen_copy as copy_mod        # noqa: E402
 import minigen_token as token_mod      # noqa: E402
 import minigen_chat_store as chat_store  # noqa: E402
+import minigen_files as files_mod      # noqa: E402
 import minigen_map as map_mod          # noqa: E402
 import minigen_update as update_mod    # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
@@ -64,10 +66,18 @@ import minigen_repos as repos_mod      # noqa: E402
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
+#: Сколько символов содержимого приложенного файла показывается **совету**
+#: специалистов: хватает, чтобы обсудить задачу, и не раздувает каждый вызов.
+COUNCIL_FILE_CHARS = 20_000
 #: Как часто программа проверяет хранилище промтов (секунды).
 #: Раздача без живого оператора — неспешная: минут хватает, а лишних
 #: запросов к внешнему ресурсу не делается.
 PROMPT_DISPATCH_EVERY = 60
+
+#: Как часто повторять в журнале одну и ту же причину отказа раздачи
+#: (секунды). Цикл автораздачи ходит раз в минуту — без этого журнал забивался
+#: бы одной и той же строкой. Первое появление причины пишется сразу.
+PROMPT_NOTE_EVERY = 6 * 3600
 
 
 def _title_from(text: str) -> str:
@@ -199,8 +209,32 @@ class Bridge:
         self._prompt_stop = threading.Event()
         self._prompt_thread: threading.Thread | None = None
         self.handlers = self._build_handlers()
+        self.migrate_legacy_prompts()
         self.start_daemon_supervision()
         self.start_prompt_dispatch()
+
+    def migrate_legacy_prompts(self) -> None:
+        """Перенести старую базу хранилища промтов в универсальную базу.
+
+        ⚠️ Перенос — **одноразовый** (отметка в `schema_meta`), а старый файл
+        остаётся на месте запасной копией. Делается тут, при старте программы:
+        хранилище само по себе диском не трогает — иначе любая проверка,
+        собрав его, задела бы настоящую базу на машине владельца.
+        """
+        try:
+            res = prompts_mod.migrate_legacy_store()
+        except Exception as exc:  # noqa: BLE001 — перенос не роняет программу
+            try:
+                self.core.log("БАЗА: перенос из старой базы не прошёл: %s" % exc)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if res.get("migrated"):
+            try:
+                self.core.log("БАЗА: перенесено записей из старой базы: %d"
+                              % int(res["migrated"]))
+            except Exception:  # noqa: BLE001
+                pass
 
     def start_prompt_dispatch(self) -> None:
         """Раздавать промты рабочим областям без живого оператора.
@@ -235,12 +269,38 @@ class Bridge:
                         self.core.log("ПРОМТЫ: промт %s отдан в область %s "
                                       "автоматически" % (item.get("id"),
                                                          item.get("area")))
+                    elif item.get("note"):
+                        self._log_prompt_note(item)
             except Exception as exc:  # noqa: BLE001
                 # Автораздача не должна ронять программу: сбой — в журнал.
                 try:
                     self.core.log("ПРОМТЫ: автораздача не прошла: %s" % exc)
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _log_prompt_note(self, item: dict[str, Any]) -> None:
+        """Причина отказа раздачи — в журнал, но **без повторов**.
+
+        ⚠️ Цикл ходит раз в минуту: одно и то же сообщение каждую минуту
+        забило бы журнал. Пишем, когда причина изменилась или её не писали
+        давно (`PROMPT_NOTE_EVERY`).
+        """
+        text = str(item.get("why") or "").strip()
+        if not text:
+            return
+        now = time.time()
+        seen = getattr(self, "_prompt_notes", None)
+        if seen is None:
+            seen = {}
+            self._prompt_notes = seen
+        last = float(seen.get(text) or 0.0)
+        if now - last < PROMPT_NOTE_EVERY:
+            return
+        seen[text] = now
+        try:
+            self.core.log("ПРОМТЫ: %s (%s)" % (text, item.get("area") or "—"))
+        except Exception:  # noqa: BLE001
+            pass
 
     def start_daemon_supervision(self) -> None:
         """Следить за демонами: поднимать упавшего.
@@ -287,6 +347,13 @@ class Bridge:
             "stats.summary": self.cmd_stats_summary,
             "settings.get": self.cmd_settings_get,
             "settings.set": self.cmd_settings_set,
+            # локальная база «МиниГена»: выгрузка в один файл и импорт без
+            # потерь (заказ владельца 24.11, промт #92)
+            "db.status": self.cmd_db_status,
+            "db.records": self.cmd_db_records,
+            "db.export": self.cmd_db_export,
+            "db.inspect": self.cmd_db_inspect,
+            "db.import": self.cmd_db_import,
             "daemons.status": self.cmd_daemons_status,
             "chat.send": self.cmd_chat_send,
             "chat.confirm": self.cmd_chat_confirm,
@@ -294,6 +361,8 @@ class Bridge:
             # видимая история чата с диска (промт #129): переписка не теряется
             # при перезапуске окна
             "chat.history": self.cmd_chat_history,
+            # файлы оператора: чтение файла, приложенного к чату (промт #90)
+            "files.read": self.cmd_files_read,
             "app.open_folder": self.cmd_open_folder,
             # самообновление программы
             "code.list": self.cmd_code_list,
@@ -1020,13 +1089,83 @@ class Bridge:
     def cmd_settings_set(self, args: dict[str, Any]) -> dict[str, Any]:
         return state.write_settings(args or {})
 
+    # ───────────────────────────────── локальная база «МиниГена» (промт #92)
+    def cmd_db_status(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Где лежит локальная база, какая в ней схема и сколько записей."""
+        try:
+            return state.jsonable(minigen_db.status())
+        except Exception as exc:  # noqa: BLE001 — мост отвечает фактом
+            return {"ok": False, "error": str(exc)}
+
+    def cmd_db_records(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Записи базы (по виду или все) — для отчёта и проверок."""
+        kind = str(args.get("kind") or "")
+        try:
+            limit = int(args.get("limit") or 200)
+        except (TypeError, ValueError):
+            limit = 200
+        con = minigen_db.connect()
+        try:
+            records = minigen_db.list_records(con, kind=kind or None, limit=limit)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        finally:
+            con.close()
+        return {"ok": True, "records": state.jsonable(records),
+                "count": len(records)}
+
+    def cmd_db_export(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Выгрузить базу в один файл — его можно унести на другой компьютер."""
+        path = str(args.get("path") or "")
+        try:
+            return state.jsonable(minigen_db.export_db(path or None))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+
+    def cmd_db_inspect(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Разбор файла выгрузки: что перенесётся, что спросить у оператора.
+
+        Ничего не меняет — только план и вопросы. Это и есть «помощник
+        импорта»: он спрашивает, **куда и как** переносить спорные данные.
+        """
+        path = str(args.get("path") or "")
+        if not path:
+            return {"ok": False, "error": "не указан файл выгрузки"}
+        try:
+            plan = minigen_db.plan_import(path)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        plan.pop("_body", None)          # тело файла наружу не отдаём
+        return state.jsonable(plan)
+
+    def cmd_db_import(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Импортировать базу из файла (решения оператора — по конфликтам).
+
+        ⚠️ Конфликт без решения оператора **не трогается**: молчаливых
+        перезаписей нет.
+        """
+        path = str(args.get("path") or "")
+        if not path:
+            return {"ok": False, "error": "не указан файл выгрузки"}
+        decisions = args.get("decisions")
+        if not isinstance(decisions, dict):
+            decisions = {}
+        try:
+            report = minigen_db.apply_import(path, decisions)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        report.pop("_body", None)
+        return state.jsonable(report)
+
     def cmd_daemons_status(self, args: dict[str, Any]) -> dict[str, Any]:
         return state.jsonable(state.daemons_status(self.mods))
 
     # ──────────────────────────────────────────────────────────────── чат
     def cmd_chat_send(self, args: dict[str, Any]) -> dict[str, Any]:
         text = str(args.get("text") or "").strip()
-        if not text:
+        attachments = [item for item in (args.get("attachments") or [])
+                       if isinstance(item, dict)]
+        if not text and not attachments:
             return {"status": "error", "error": "пустой запрос"}
         settings = state.read_settings()
         area_slug = str(args.get("area") or settings.get("modelArea") or "minigen")
@@ -1034,17 +1173,25 @@ class Bridge:
         # Прокси-переменные живут в реестре, а процесс мог устареть ⇒ перечитываем
         # их перед запросом (иначе модель «недоступна» при живом интернете).
         self.core.refresh_env()
+        # Файлы оператора читает мост (окно на диск не ходит). Содержимое уходит
+        # в контекст хода **блоками** — документ текстом, картинка картинкой
+        # (промт #90).
+        blocks, notes, council_note = self._read_attachments(attachments)
         # Реплика владельца — в историю сразу: даже если модель недоступна,
         # вопрос остаётся в переписке (промт #129).
-        chat_store.append({"role": "user", "text": text})
+        chat_store.append({"role": "user", "text": text, "attachments": notes})
         # Свежие отчёты программы — в контекст хода (заказ владельца 24.11):
         # нейросеть знает, что сторож и инструменты сделали, пока её не
         # спрашивали. ⚠️ Это **подсказка хода**, а не реплика: отчёты сторожей
         # в историю переписки не попадают (промт #129).
         feed = self._unread_reports()
+        # Если оператор приложил файлы, но ничего не написал, модели надо
+        # сказать, что делать: без текста задача пустая.
+        task = text or self._attachment_task(notes)
         try:
-            result = self.agent.ask(list(self.chat_history), text, area_slug,
-                                    model, note=feed)
+            result = self.agent.ask(list(self.chat_history), task, area_slug,
+                                    model, note=feed, blocks=blocks,
+                                    council_note=council_note)
         except ModelUnavailable as exc:
             chat_store.append({"role": "system", "text": str(exc)})
             return {"status": "unavailable", "error": str(exc),
@@ -1052,6 +1199,134 @@ class Bridge:
         if result.get("status") == "done":
             self.chat_history = self._trim_history(result.get("history") or [])
         return state.jsonable(self._remember_reply(result))
+
+    @staticmethod
+    def _attachment_task(notes: list[dict[str, Any]]) -> str:
+        """Что сказать модели, когда оператор приложил файлы, но не написал."""
+        names = ", ".join(str(note.get("name") or "") for note in notes
+                          if note.get("name"))
+        return ("Оператор приложил файл(ы) к чату: %s. "
+                "Посмотри их и ответь по делу." % names) if names else \
+            "Оператор приложил файл(ы) к чату. Посмотри их и ответь по делу."
+
+    @staticmethod
+    def _read_attachments(attachments: list[dict[str, Any]]
+                          ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        """Файлы оператора → блоки контекста модели + список для видимой реплики.
+
+        Возвращает `(blocks, notes, council_note)`:
+        - `blocks` — что уходит вендору в основном ходе (текст документа /
+          картинка);
+        - `notes` — что видит владелец в переписке (имя, вид, размер);
+        - `council_note` — то же содержимое **словом** для совета специалистов:
+          роли совета живут в своём контексте и без этого бросались искать
+          файл по диску (живая проба 25.11).
+        """
+        blocks: list[dict[str, Any]] = []
+        notes: list[dict[str, Any]] = []
+        council_lines: list[str] = []
+        for item in attachments:
+            path = str(item.get("path") or "").strip()
+            if not path:
+                continue
+            name = str(item.get("name") or Path(path).name)
+            read = files_mod.read_for_context(path)
+            kind = str(read.get("kind") or "")
+            size = int(read.get("size") or 0)
+            # Файл запоминаем: нейросеть сможет перечитать именно его и не
+            # сможет залезть в чужие файлы на диске.
+            files_mod.register_attached(path, name=name, kind=kind, size=size)
+            notes.append({"name": name, "kind": kind, "size": size,
+                          "ok": bool(read.get("ok")), "path": path})
+            if not read.get("ok"):
+                # ⚠️ С **полным путём**: оператор должен видеть, какой именно
+                # файл не прочитан (приёмка #6 промта #90).
+                message = ("Файл «%s» не прочитан: %s\nПуть: %s"
+                           % (name, read.get("error") or "неизвестная причина",
+                              path))
+                blocks.append({"type": "text", "text": message})
+                council_lines.append(message)
+                continue
+            if kind == "image":
+                blocks.append({
+                    "type": "image",
+                    "source": {"type": "base64",
+                               "media_type": str(read.get("media_type")
+                                                or "image/png"),
+                               "data": str(read.get("image") or "")},
+                })
+                council_lines.append(
+                    "Картинка «%s» (%s, %s) приложена к сообщению: её "
+                    "содержимое модель видит как изображение в основном ходе."
+                    % (name, kind, files_mod.human_size(size)))
+                continue
+            warnings = [str(item) for item in (read.get("warnings") or [])]
+            header = "Файл «%s» (%s, %s):" % (name, kind,
+                                             files_mod.human_size(size))
+            tail = ("\n[предупреждения при чтении: %s]" % "; ".join(warnings)
+                    if warnings else "")
+            body = str(read.get("text") or "")
+            blocks.append({"type": "text", "text": "%s\n%s%s" % (header, body,
+                                                                tail)})
+            # Совету — начало содержимого: хватает, чтобы обсудить задачу, и
+            # не раздувает каждый вызов совета.
+            shown = body[:COUNCIL_FILE_CHARS]
+            council_lines.append(
+                "%s\n%s%s%s" % (header, shown,
+                                "\n… (файл показан частично)" if len(body) > len(shown) else "",
+                                tail))
+        council_note = "\n\n".join(council_lines)
+        return blocks, notes, council_note
+
+    def cmd_files_read(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Прочитать файл, приложенный оператором (инструмент нейросети).
+
+        ⚠️ Только то, что оператор приложил к чату: произвольные файлы с
+        диска нейросеть не читает (иначе она могла бы утянуть в переписку
+        ключи — D-038).
+        """
+        path = str(args.get("path") or "").strip()
+        if not path:
+            return {"ok": False, "error": "путь к файлу не указан"}
+        if not files_mod.is_attached(path) and not self._attached_before(path):
+            return {"ok": False, "path": path,
+                    "error": "этот файл оператор не прикладывал — читать "
+                             "произвольные файлы с диска нейросети нельзя"}
+        out = dict(files_mod.read_for_context(path))
+        if out.get("image"):
+            # ⚠️ Картинка уже в контексте хода: в ответе инструмента её
+            # повторять не надо (это мегабайты base64 в переписке).
+            out["image"] = ""
+            out["warnings"] = list(out.get("warnings") or []) + [
+                "картинка уже в контексте хода — полные данные не повторяются"]
+        return state.jsonable(out)
+
+    @staticmethod
+    def _attached_before(path: str) -> bool:
+        """Прикладывал ли оператор этот файл раньше (по видимой истории).
+
+        ⚠️ Реестр приложенных файлов живёт в памяти моста и после перезапуска
+        программы пуст. Но в видимой переписке вложения остались — значит,
+        файл оператор приложил, и модель может его перечитать.
+        """
+        try:
+            target = str(Path(path).expanduser().resolve())
+        except OSError:
+            target = str(path)
+        for message in chat_store.load():
+            for item in message.get("attachments") or []:
+                if not isinstance(item, dict):
+                    continue
+                value = str(item.get("path") or "")
+                if not value:
+                    continue
+                try:
+                    same = str(Path(value).expanduser().resolve()) == target
+                except OSError:
+                    same = value == str(path)
+                if same:
+                    return True
+        return False
 
     def _remember_reply(self, result: dict[str, Any]) -> dict[str, Any]:
         """Ответ модели — в видимую историю (на диске) и в ответ окну.
@@ -1289,12 +1564,18 @@ class Bridge:
             })
         return out
 
-    def _prompt_records(self, store: Any, project: str = "") -> list[dict[str, Any]]:
+    def _prompt_records(self, store: Any, project: str = "",
+                        include_archived: bool = False,
+                        only_archived: bool = False
+                        ) -> list[dict[str, Any]]:
         """Промты выбранного хранилища с пометками владельца."""
         try:
-            records = store.list_prompts(project)
+            records = store.list_prompts(project, include_archived=include_archived,
+                                         only_archived=only_archived)
         except prompts_mod.KarmanUnavailable as exc:
             raise ValueError("внешний ресурс не отдал промты: %s" % exc)
+        except prompts_mod.UnknownSection as exc:
+            raise ValueError("внешний ресурс: %s" % exc)
         for record in records:
             record["auto"] = prompts_mod.get_mark(
                 record.get("source", ""), record.get("project", ""),
@@ -1309,6 +1590,12 @@ class Bridge:
         settings = state.read_settings()
         store = self._prompt_store()
         project = str(args.get("project") or "").strip()
+        # Вид: `live` (живые), `archived` (архив) или `all` (и те и другие).
+        view = str(args.get("view") or "live").strip().lower()
+        if view not in ("live", "archived", "all"):
+            view = "live"
+        include_archived = view in ("archived", "all")
+        only_archived = view == "archived"
         info: dict[str, Any] = {
             "kind": store.kind,
             "label": store.label,
@@ -1323,10 +1610,18 @@ class Bridge:
             info["ok"] = bool(status.get("ok"))
             info["reason"] = str(status.get("reason") or "")
             info["sections"] = list(status.get("sections") or [])
-            prompts = self._prompt_records(store, project)
+            prompts = self._prompt_records(store, project,
+                                           include_archived=include_archived,
+                                           only_archived=only_archived)
         except prompts_mod.KarmanUnavailable as exc:
             info["ok"] = False
             info["reason"] = "внешний ресурс недоступен: %s" % exc
+        except prompts_mod.UnknownSection as exc:
+            info["ok"] = False
+            info["reason"] = "внешний ресурс: %s" % exc
+        except ValueError as exc:
+            info["ok"] = False
+            info["reason"] = str(exc)
         except Exception as exc:  # noqa: BLE001
             info["ok"] = False
             info["reason"] = "хранилище не отдало промты: %s" % exc
@@ -1335,6 +1630,7 @@ class Bridge:
             "prompts": prompts,
             "targets": self._prompt_targets(),
             "auto_dispatch": bool(settings.get("promptAutoDispatch")),
+            "view": view,
         }
 
     def cmd_prompts_save(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1348,12 +1644,19 @@ class Bridge:
         return res
 
     def cmd_prompts_archive(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Архивировать выполненный промт (архив = сделано)."""
+        """Архивировать выполненный промт (архив = сделано).
+
+        `archived: false` — вернуть из архива (архив не удаление: заданный
+        по ошибке промт должен вернуться в оборот).
+        """
         store = self._prompt_store()
+        archived = bool(args.get("archived", True))
         res = store.archive(str(args.get("id") or ""),
-                            str(args.get("project") or ""))
+                            str(args.get("project") or ""), archived=archived)
         if res.get("ok"):
-            self.core.log("ПРОМТЫ: промт архивирован (%s)" % (args.get("id") or ""))
+            self.core.log("ПРОМТЫ: промт %s %s"
+                          % (args.get("id") or "",
+                             "архивирован" if archived else "возвращён из архива"))
         return res
 
     def cmd_prompts_mark(self, args: dict[str, Any]) -> dict[str, Any]:

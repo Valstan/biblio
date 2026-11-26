@@ -83,6 +83,12 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
               />
             </label>
           </div>
+          <p className="muted small">
+            Раздел КАРМАНа — имя проекта области в библиотеке промтов (например
+            <code> SARAFAN</code>). По нему промт из «Хранилища промтов» уходит в
+            эту область; если раздел не совпадает, задание не отправляется — оно
+            ушло бы не туда.
+          </p>
           <div className="row">
             <button className="primary" onClick={() => void submit()} disabled={busy}>
               Создать

@@ -1,6 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
-import { writeFileSync } from 'fs'
-import { join } from 'path'
+import { statSync, writeFileSync } from 'fs'
+import { basename, join } from 'path'
 import { Bridge } from './bridge'
 import { sendToWindow } from './window-events'
 import { clickTabScript, mapGeometryScript, parseSmokeTabs, shotName } from './smoke'
@@ -20,6 +20,21 @@ import { clickTabScript, mapGeometryScript, parseSmokeTabs, shotName } from './s
  */
 
 const daemonMode = process.argv.includes('--daemon-mode')
+
+/**
+ * Имя файла выгрузки базы по умолчанию — с меткой времени.
+ *
+ * Выгрузка — это файл с данными: он уходит с машины только по решению
+ * оператора, поэтому имя должно быть понятным и не перетирать прошлые.
+ */
+function defaultExportName(): string {
+  const now = new Date()
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  const stamp =
+    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+    `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+  return `minigen-${stamp}.minigen.json`
+}
 
 if (daemonMode) {
   // Отдельный профиль: иначе включится блокировка одного экземпляра и
@@ -85,6 +100,32 @@ app.whenReady().then(() => {
 
   ipcMain.handle('minigen:call', async (_event, cmd: string, args: Record<string, unknown>) => {
     if (!bridge) throw new Error('мост не запущен')
+    // ── локальная база «МиниГена» (промт #92): файлы выбирает оператор ──
+    // Выгрузка и импорт — это файлы с данными: их путь выбирает человек
+    // (диалог главного процесса), а сама база — моста. Окно на диск не ходит.
+    if (cmd === 'db.pick') {
+      const result = await dialog.showOpenDialog({
+        properties: ['openFile'],
+        filters: [
+          { name: 'Выгрузка базы «МиниГена»', extensions: ['json'] },
+          { name: 'Все файлы', extensions: ['*'] }
+        ]
+      })
+      if (result.canceled || result.filePaths.length === 0) {
+        return { ok: false, canceled: true }
+      }
+      return { ok: true, path: result.filePaths[0] }
+    }
+    if (cmd === 'db.export' && !args?.path) {
+      const result = await dialog.showSaveDialog({
+        defaultPath: defaultExportName(),
+        filters: [{ name: 'Выгрузка базы «МиниГена»', extensions: ['json'] }]
+      })
+      if (result.canceled || !result.filePath) {
+        return { ok: false, canceled: true }
+      }
+      return bridge.exportDatabase(result.filePath)
+    }
     return bridge.call(cmd, args ?? {})
   })
 
@@ -94,6 +135,24 @@ app.whenReady().then(() => {
   ipcMain.handle('minigen:open-external', async (_event, path: string) => {
     shell.openPath(path)
     return true
+  })
+
+  // Выбор файлов для чата (промт #90): диалог открывает главный процесс,
+  // окно получает настоящие пути и на диск само не ходит.
+  ipcMain.handle('minigen:pick-files', async () => {
+    const result = await dialog.showOpenDialog({
+      properties: ['openFile', 'multiSelections']
+    })
+    if (result.canceled) return []
+    return result.filePaths.map((path) => {
+      let size = 0
+      try {
+        size = statSync(path).size
+      } catch {
+        size = 0
+      }
+      return { path, name: basename(path), size }
+    })
   })
 
   // Перезапуск окна: раскатка меняет файлы на диске, а запущенное окно
