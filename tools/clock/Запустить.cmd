@@ -1,7 +1,9 @@
 @echo off
-rem clock - one-line date and time in the bottom-right corner. Comments are ASCII
-rem on purpose: .cmd is read in the OEM codepage, and Cyrillic here would show
-rem up as garbage in Notepad on another machine.
+rem clock - quiet launcher. The widget itself is started by clock.vbs through
+rem wscript.exe, so it runs in no console at all: closing any terminal does not
+rem kill it. This .cmd exists for the people who prefer to double-click a .cmd -
+rem the console here flashes for a fraction of a second and closes right away.
+rem Comments are ASCII on purpose: .cmd is read in the OEM codepage.
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
@@ -32,4 +34,5 @@ rem PowerShell does not ask about each file. The path is passed as an argument,
 rem so quotes and apostrophes in it cause no trouble.
 powershell -NoProfile -ExecutionPolicy Bypass -Command "param($p) Get-ChildItem -LiteralPath $p -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue" -args "%~dp0" >nul 2>&1
 
-start "" powershell -sta -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0clock.ps1"
+start "" "%SystemRoot%\System32\wscript.exe" "%~dp0clock.vbs"
+exit /b 0

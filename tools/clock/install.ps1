@@ -15,6 +15,7 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 $ToolsDir  = Join-Path $env:LOCALAPPDATA 'Programs\clock'
 $Target    = Join-Path $ToolsDir 'clock.ps1'
+$VbsTarget = Join-Path $ToolsDir 'clock.vbs'
 $Startup   = [Environment]::GetFolderPath('Startup')
 $Shortcut = Join-Path $Startup 'KompikClock.lnk'
 $Key       = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced'
@@ -28,6 +29,9 @@ if (-not (Test-Path $ToolsDir)) { New-Item -ItemType Directory -Force $ToolsDir 
 $source = Join-Path $PSScriptRoot 'clock.ps1'
 if (-not (Test-Path $source)) { throw "clock.ps1 not found next to the installer ($PSScriptRoot)." }
 Copy-Item -LiteralPath $source -Destination $Target -Force
+$vbsSource = Join-Path $PSScriptRoot 'clock.vbs'
+if (-not (Test-Path $vbsSource)) { throw "clock.vbs not found next to the installer ($PSScriptRoot)." }
+Copy-Item -LiteralPath $vbsSource -Destination $VbsTarget -Force
 Write-Host "  payload: $Target"
 
 # --- 2. stop a running copy so the new one can start ---
@@ -36,11 +40,13 @@ Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction Silen
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 Start-Sleep -Seconds 1
 
-# --- 3. autostart shortcut ---
+# --- 3. autostart shortcut: wscript, not powershell ---
+# The shortcut points at wscript.exe so that no console window appears at logon
+# and the widget does not belong to any console: closing a terminal cannot kill it.
 $WshShell = New-Object -ComObject WScript.Shell
 $lnk = $WshShell.CreateShortcut($Shortcut)
-$lnk.TargetPath       = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
-$lnk.Arguments        = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Target`""
+$lnk.TargetPath       = "$env:SystemRoot\System32\wscript.exe"
+$lnk.Arguments        = """$VbsTarget"""
 $lnk.WorkingDirectory = $ToolsDir
 $lnk.Description      = 'Kompik clock: one-line date and time'
 $lnk.WindowStyle      = 7
@@ -59,10 +65,9 @@ if ($null -eq $cur -or $cur -ne 0) {
     Write-Host '  native taskbar clock: already hidden'
 }
 
-# --- 5. start it ---
-Start-Process "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-    -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', "`"$Target`""
-Start-Sleep -Seconds 2
+# --- 5. start it (quiet: no console window) ---
+Start-Process "$env:SystemRoot\System32\wscript.exe" -ArgumentList "`"$VbsTarget`""
+Start-Sleep -Seconds 3
 
 $alive = Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
          Where-Object { $_.CommandLine -like '*clock.ps1*' }
