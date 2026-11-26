@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import struct
 import sys
 import tempfile
 import unittest
@@ -112,6 +113,47 @@ RTF_BYTES = (b"{\\rtf1\\ansi\\ansicpg1251 {\\fonttbl{\\f0 Arial;}}"
              b"\\f0\\fs24 \\u1055\\u1088\\u1080\\u1074\\u1077\\u1090? RTF\\par}")
 
 
+def _bmp_bytes(width: int = 2, height: int = 2,
+               pixels: bytes = b"", bits: int = 24,
+               compression: int = 0) -> bytes:
+    """Настоящий BMP (как его пишет Windows) — из настоящих байт.
+
+    ⚠️ В BMP пиксели хранятся в порядке **BGR**, а строки — снизу вверх.
+    """
+    if not pixels:
+        # 24 бита: по 3 байта на пиксель. Синий = (255, 0, 0) в BGR.
+        pixels = bytes((255, 0, 0, 0, 255, 0)) * height
+    stride = ((bits * width + 31) // 32) * 4
+    row_bytes = (bits * width + 7) // 8
+    rows = b""
+    for index in range(height):
+        chunk = pixels[index * row_bytes:(index + 1) * row_bytes]
+        rows += chunk + b"\x00" * (stride - len(chunk))
+    header = b"BM" + struct.pack("<IHHI", 54 + len(rows), 0, 0, 54)
+    dib = struct.pack("<IiiHHIIiiII", 40, width, height, 1, bits, compression,
+                      len(rows), 2835, 2835, 0, 0)
+    return header + dib + rows
+
+
+def _png_pixels(data: bytes) -> tuple[int, int, bytes]:
+    """Разобрать свой PNG: (ширина, высота, строки пикселей без фильтра)."""
+    width = int.from_bytes(data[16:20], "big")
+    height = int.from_bytes(data[20:24], "big")
+    at = 8
+    payload = b""
+    while at < len(data):
+        size = int.from_bytes(data[at:at + 4], "big")
+        tag = data[at + 4:at + 8]
+        if tag == b"IDAT":
+            payload += data[at + 8:at + 8 + size]
+        at += 12 + size
+    raw = zlib.decompress(payload)
+    stride = width * 3
+    rows = b"".join(raw[row * (stride + 1) + 1:(row + 1) * (stride + 1)]
+                    for row in range(height))
+    return width, height, rows
+
+
 class FilesTest(unittest.TestCase):
     """Чтение файлов каждого семейства форматов."""
 
@@ -172,6 +214,72 @@ class FilesTest(unittest.TestCase):
         out = files.read_for_context(str(path))
         self.assertFalse(out["ok"])
         self.assertIn("вендор", out["error"])
+
+    # ── картинки: только те, что вендор понимает (26.11) ────────────────
+    def test_bmp_is_converted_to_png(self) -> None:
+        """BMP вендор не принимает — мост переводит его в PNG сам."""
+        path = self._write("картинка.bmp", _bmp_bytes())
+        out = files.read_for_context(str(path))
+        self.assertTrue(out["ok"], out.get("error"))
+        self.assertEqual(out["kind"], "image")
+        self.assertEqual(out["media_type"], "image/png")
+        data = base64.b64decode(out["image"])
+        self.assertTrue(data.startswith(b"\x89PNG\r\n\x1a\n"), "не PNG")
+        width, height, _ = _png_pixels(data)
+        self.assertEqual((width, height), (2, 2))
+
+    def test_bmp_pixels_survive_the_conversion(self) -> None:
+        """Цвета BMP не перевраться: синий и зелёный остаются синим и зелёным."""
+        path = self._write("картинка.bmp", _bmp_bytes())
+        out = files.read_for_context(str(path))
+        self.assertTrue(out["ok"], out.get("error"))
+        _, _, rows = _png_pixels(base64.b64decode(out["image"]))
+        self.assertEqual(rows[:3], b"\x00\x00\xff", "первый пиксель не синий")
+        self.assertEqual(rows[3:6], b"\x00\xff\x00", "второй пиксель не зелёный")
+
+    def test_bmp_with_a_palette_is_converted(self) -> None:
+        """Палитровый BMP (8 бит) — тоже картинка."""
+        palette = bytes((0, 0, 255, 0)) + bytes((0, 255, 0, 0))
+        pixels = bytes((0, 1, 1, 0))
+        data = bytearray(_bmp_bytes(2, 2, pixels, bits=8))
+        # палитра идёт сразу после заголовка (54 байта)
+        data[54:54 + len(palette)] = palette
+        path = self._write("палитра.bmp", bytes(data))
+        out = files.read_for_context(str(path))
+        self.assertTrue(out["ok"], out.get("error"))
+        self.assertEqual(out["media_type"], "image/png")
+
+    def test_compressed_bmp_is_refused_honestly(self) -> None:
+        """BMP со сжатием (RLE) перевести нечем — честный отказ, а не мусор."""
+        path = self._write("сжатый.bmp", _bmp_bytes(compression=1))
+        out = files.read_for_context(str(path))
+        self.assertFalse(out["ok"])
+        self.assertIn("PNG", out["error"])
+
+    def test_a_picture_that_is_not_a_picture_is_refused_honestly(self) -> None:
+        """Текст с именем `.png` — вендору такое отдавать нельзя (убило бы ход)."""
+        path = self._write("обманка.png", "это не картинка, а текст".encode("utf-8"))
+        out = files.read_for_context(str(path))
+        self.assertFalse(out["ok"])
+        self.assertIn("не картинка", out["error"])
+
+    def test_the_side_of_a_picture_is_checked(self) -> None:
+        """Крупная картинка (больше 8000×8000) — честный отказ до отправки."""
+        head = (b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR"
+                + (9000).to_bytes(4, "big") + (9000).to_bytes(4, "big")
+                + bytes((8, 2, 0, 0, 0)))
+        path = self._write("огромная_сторона.png", head + b"\x00" * 64)
+        out = files.read_for_context(str(path))
+        self.assertFalse(out["ok"])
+        self.assertIn("8000", out["error"])
+
+    def test_the_size_of_a_picture_is_read_from_the_header(self) -> None:
+        self.assertEqual(files.image_size(PNG), (1, 1))
+        path = self._write("картинка.bmp", _bmp_bytes(3, 5))
+        out = files.read_for_context(str(path))
+        self.assertTrue(out["ok"], out.get("error"))
+        width, height, _ = _png_pixels(base64.b64decode(out["image"]))
+        self.assertEqual((width, height), (3, 5))
 
     # ── документы ───────────────────────────────────────────────────────
     def test_xlsx_is_read(self) -> None:
