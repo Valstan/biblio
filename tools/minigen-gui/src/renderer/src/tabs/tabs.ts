@@ -13,6 +13,7 @@ export type TabId =
   | 'chat'
   | 'journal'
   | 'genes'
+  | 'cuttings'
   | 'agents'
   | 'prompts'
   | 'update'
@@ -30,6 +31,7 @@ export const TABS: TabDef[] = [
   { id: 'chat', label: 'Управляющий' },
   { id: 'journal', label: 'Журнал' },
   { id: 'genes', label: 'Гены' },
+  { id: 'cuttings', label: 'Черенки' },
   { id: 'agents', label: 'Агенты' },
   { id: 'prompts', label: 'Промты' },
   { id: 'update', label: 'Обновление' },

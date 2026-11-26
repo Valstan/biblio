@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from 'electron'
 import { statSync, writeFileSync } from 'fs'
 import { basename, join } from 'path'
 import { Bridge } from './bridge'
@@ -169,6 +169,17 @@ app.whenReady().then(() => {
   ipcMain.handle('minigen:build-info', async () => ({
     commit: process.env.MINIGEN_COMMIT || ''
   }))
+
+  // Текст в буфер обмена: инструкцию по установке можно вставить в письмо
+  // знакомому прямо из окна (заказ владельца 26.11).
+  ipcMain.handle('minigen:copy-text', async (_event, text: string) => {
+    try {
+      clipboard.writeText(String(text ?? ''))
+      return true
+    } catch {
+      return false
+    }
+  })
 
   ipcMain.handle('minigen:save-text', async (_event, name: string, content: string) => {
     const result = await dialog.showSaveDialog({
