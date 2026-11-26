@@ -343,6 +343,10 @@ export interface Settings {
   councilEnabled: boolean
   /** сколько ролей совета реально отвечают на задачу (совет дорог) */
   councilMaxRoles: number
+  /** сколько раундов задачи может занять совет специалистов */
+  councilRounds: number
+  /** гарантированный запас шагов для работы после обсуждения совета */
+  councilWorkFloor: number
   /** режим копии: '' (не выбран), 'own', 'shared', 'local' */
   copyMode: CopyMode | ''
   /** репозиторий копии (в режиме «свой репозиторий») */
