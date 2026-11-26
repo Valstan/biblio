@@ -2,7 +2,15 @@ import { useCallback, useEffect, useState } from 'react'
 import type { CloneStatus, GeneMap, GeneRecord, GeneSuggestions } from '@shared/types'
 import { api } from '../api'
 import { formatDateTime } from '../time'
-import { adoptConfirmText, exchangeView, suggestionRows, type SuggestionRow } from './copy-view'
+import {
+  adoptConfirmText,
+  exchangeView,
+  localOfferView,
+  modeConfirmText,
+  SHARED_MODE_OPTION,
+  suggestionRows,
+  type SuggestionRow
+} from './copy-view'
 import { describeEdge, layoutMap, selfSummary, NODE_SIZE } from './gene-map'
 
 /**
@@ -31,7 +39,15 @@ import { describeEdge, layoutMap, selfSummary, NODE_SIZE } from './gene-map'
 /** Значок «нет данных» — тот же, что в остальном окне. */
 const DASH = '—'
 
-export default function GenesTab() {
+export default function GenesTab({
+  openWorks = false,
+  onWorksClosed
+}: {
+  /** окно позвало показать наработки (уведомление о новых) */
+  openWorks?: boolean
+  /** владелец закрыл панель наработок — окно снимает просьбу */
+  onWorksClosed?: () => void
+}) {
   const [map, setMap] = useState<GeneMap | null>(null)
   const [note, setNote] = useState('')
   const [mapError, setMapError] = useState('')
@@ -92,6 +108,42 @@ export default function GenesTab() {
     const timer = window.setInterval(() => void loadCopy(), 5000)
     return () => window.clearInterval(timer)
   }, [loadCopy])
+
+  /**
+   * Окно позвало показать наработки (уведомление о новых) — открываем панель.
+   *
+   * ⚠️ Панель открывается **по просьбе окна**, а не молча: владелец видит,
+   * что именно он рассматривает и откуда пришла наработка.
+   */
+  useEffect(() => {
+    if (!openWorks) return
+    setShowWorks(true)
+    void loadWorks()
+  }, [openWorks, loadWorks])
+
+  /**
+   * Перевести копию в режим «папка в общем репозитории».
+   *
+   * ⚠️ Это меняет то, как копия работает (правки и PR — в общий репозиторий),
+   * поэтому спрашиваем подтверждение — решение за владельцем.
+   */
+  const enableSharedMode = async () => {
+    if (!window.confirm(modeConfirmText(SHARED_MODE_OPTION))) return
+    setBusy(true)
+    try {
+      const res = await api.copyMode('shared')
+      if (res.ok === false) {
+        setNote(res.error || res.why || 'мост не сменил режим')
+        return
+      }
+      setNote(res.why || 'режим копии: папка в общем репозитории')
+      await loadCopy()
+    } catch (err) {
+      setNote(`режим не сменили: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
 
   /** Обновить пул наработок (клон и пул генов) — действие владельца. */
   const syncPool = async () => {
@@ -196,6 +248,7 @@ export default function GenesTab() {
   }
 
   const exchange = exchangeView(cloneStatus)
+  const localOffer = localOfferView(cloneStatus)
   const rows = suggestionRows(suggestions)
   const fits = rows.filter((row) => row.fits)
   const others = rows.filter((row) => !row.fits)
@@ -216,10 +269,15 @@ export default function GenesTab() {
               const next = !showWorks
               setShowWorks(next)
               if (next) void loadWorks()
+              else onWorksClosed?.()
             }}
             disabled={busy}
           >
-            {showWorks ? 'Скрыть наработки' : 'Наработки'}
+            {showWorks
+              ? 'Скрыть наработки'
+              : rows.length
+                ? `Наработки (${rows.length})`
+                : 'Наработки'}
           </button>
           <button className="ghost" onClick={() => void load()} disabled={busy}>
             Обновить карту
@@ -242,6 +300,24 @@ export default function GenesTab() {
           <span className={`chip ${exchange.tone}`}>{exchange.label}</span>{' '}
           <span className="muted small">{exchange.detail}</span>
         </p>
+        {/* ⚠️ Локальный режим: обмена нет — и это надо сказать прямо, а ещё
+            и предложить выход: вернуть копию в режим с репозиторием (план
+            промта #131, пункт 6). Молчаливое «пусто» выглядело бы как
+            «наработок нет». */}
+        {localOffer.local && (
+          <div className="banner warn">
+            <p className="muted small">{localOffer.text}</p>
+            <div className="row">
+              <button
+                className="ghost"
+                onClick={() => void enableSharedMode()}
+                disabled={busy}
+              >
+                Включить режим с репозиторием
+              </button>
+            </div>
+          </div>
+        )}
         <div className="row">
           <button className="ghost" onClick={() => void exportWorks()} disabled={busy}>
             Выгрузить папку

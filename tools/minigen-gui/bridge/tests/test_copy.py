@@ -184,6 +184,79 @@ class FirstRunTest(_CopyTestCase):
 _real_setup = clone_mod.setup
 
 
+class HonestAnswerTest(_CopyTestCase):
+    """Ответ владельца должен говорить правду о последствиях (промт #131).
+
+    ⚠️ Раньше `why` гласил «копия зарегистрирована в общем репозитории» **всегда**
+    — даже когда клона не взялось (нет сети) или локальный репозиторий не
+    поднялся. Окно обещало то, чего нет. Теперь неудачные шаги перечисляются.
+    """
+
+    def test_failed_setup_is_not_reported_as_registration(self) -> None:
+        clone_mod.setup = lambda **kwargs: {
+            "ok": False, "steps": [], "error": "сети нет — клон не взялся"}
+        try:
+            report = copy_mod.answer_first_run(agree=True)
+        finally:
+            clone_mod.setup = _real_setup
+        self.assertTrue(report.get("ok"), report)
+        self.assertTrue(report.get("failed"), report)
+        why = report.get("why", "")
+        self.assertNotIn("зарегистрирована в общем репозитории", why)
+        self.assertIn("не всё получилось", why)
+        self.assertIn("сети нет", why)
+
+    def test_failed_local_repo_is_not_reported_as_a_working_copy(self) -> None:
+        # отказ ⇒ локальный режим, но исходников на машине нет ⇒ локальный
+        # репозиторий не поднялся. Правда: сказать об этом, а не «всё в порядке».
+        copy_mod.source_candidates = lambda: []
+        try:
+            report = copy_mod.answer_first_run(agree=False)
+        finally:
+            copy_mod.source_candidates = _real_sources
+        self.assertTrue(report.get("ok"), report)
+        why = report.get("why", "")
+        self.assertIn("не всё получилось", why)
+        self.assertIn("локальный репозиторий", why)
+        self.assertNotIn("программа в порядке", why)
+
+    def test_successful_consent_still_says_it_worked(self) -> None:
+        clone_mod.setup = lambda **kwargs: {"ok": True, "steps": [],
+                                            "why": "подмена в тесте"}
+        try:
+            report = copy_mod.answer_first_run(agree=True)
+        finally:
+            clone_mod.setup = _real_setup
+        self.assertTrue(report.get("ok"), report)
+        self.assertEqual(report.get("failed"), [])
+        self.assertIn("зарегистрирована в общем репозитории", report.get("why", ""))
+
+    def test_failed_mode_switch_is_reported(self) -> None:
+        clone_mod.setup = lambda **kwargs: {
+            "ok": False, "steps": [], "error": "сети нет"}
+        try:
+            report = copy_mod.set_mode("shared")
+        finally:
+            clone_mod.setup = _real_setup
+        self.assertTrue(report.get("ok"), report)
+        self.assertTrue(report.get("failed"), report)
+        self.assertIn("не всё получилось", report.get("why", ""))
+
+    def test_answer_is_recorded_even_when_setup_failed(self) -> None:
+        clone_mod.setup = lambda **kwargs: {"ok": False, "steps": [],
+                                            "error": "сети нет"}
+        try:
+            copy_mod.answer_first_run(agree=True)
+        finally:
+            clone_mod.setup = _real_setup
+        # ответ владельца записан — вопрос второй раз не задаётся
+        saved = json.loads(self.instance_file.read_text(encoding="utf-8"))
+        self.assertTrue(saved["first_run"]["asked_at"])
+        again = copy_mod.answer_first_run(agree=False)
+        self.assertFalse(again.get("ok"))
+        self.assertIn("уже задан", again.get("error", ""))
+
+
 class LocalRepoTest(_CopyTestCase):
     def test_local_repo_is_created_with_history(self) -> None:
         sources = self.make_sources()
