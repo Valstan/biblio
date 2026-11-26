@@ -116,8 +116,10 @@ class AgentPendingTest(unittest.TestCase):
     def setUp(self) -> None:
         self.calls: list[tuple[str, dict]] = []
         self.responses: list[dict] = []
+        self.sent: list[list[dict]] = []
 
         def fake_chat(messages, system, tool_payload, cfg, timeout=120):
+            self.sent.append(messages)
             return self.responses.pop(0)
 
         self._orig_chat = agent.chat_completion
@@ -203,6 +205,102 @@ class AgentPendingTest(unittest.TestCase):
         second = self._agent()
         self.assertFalse(second.restore_pending({"tool": "risky.one", "args": {}}))
         self.assertIsNone(second.pending_view())
+
+    def test_the_snapshot_keeps_what_the_model_already_found(self) -> None:
+        """⚠️ Продолжение после перезапуска не должно начинаться **слепым**.
+
+        Ход модели до опасного вызова (её вопрос, её вызовы и их ответы)
+        уезжает в снимок: иначе после перезапуска окна модель не помнит, что
+        уже прочитала, и продолжает задачу вслепую.
+        """
+        self.responses = [
+            {"content": [_tool_use("s1", "safe.one", {})]},
+            {"content": [_tool_use("t1", "risky.one", {"slug": "brain"})]},
+        ]
+        cli = self._agent()
+        cli.ask([], "перезапусти область")
+        snapshot = cli.pending_snapshot()
+        payload = json.dumps(snapshot["messages"], ensure_ascii=False, default=str)
+        self.assertIn("перезапусти область", payload)
+        self.assertIn("tool_result", payload)
+        self.assertIn("s1", payload)
+
+    def test_attachments_do_not_survive_the_restart(self) -> None:
+        """Картинка и документ в снимок не попадают — но текст остаётся."""
+        self.responses = [
+            {"content": [_tool_use("t1", "risky.one", {"slug": "brain"})]},
+        ]
+        cli = self._agent()
+        cli.ask([], "посмотри на картинку", blocks=[
+            {"type": "image", "source": {"type": "base64", "data": "AAAA"}},
+            {"type": "document", "source": {"type": "base64", "data": "BBBB"}},
+        ])
+        snapshot = cli.pending_snapshot()
+        payload = json.dumps(snapshot["messages"], ensure_ascii=False, default=str)
+        self.assertNotIn("image", payload)
+        self.assertNotIn("document", payload)
+        self.assertIn("посмотри на картинку", payload)
+
+    def test_after_restart_the_model_keeps_its_findings(self) -> None:
+        """После перезапуска вендор получает **тот же** контекст хода."""
+        self.responses = [
+            {"content": [_tool_use("s1", "safe.one", {})]},
+            {"content": [_tool_use("t1", "risky.one", {"slug": "brain"})]},
+            {"content": [{"type": "text", "text": "Готово."}]},
+        ]
+        first = self._agent()
+        first.ask([], "перезапусти область")
+        snapshot = first.pending_snapshot()
+
+        second = self._agent()
+        second.restore_pending(snapshot)
+        second.confirm(True, [{"role": "user", "content": "перезапусти область"}])
+        payload = json.dumps(self.sent[-1], ensure_ascii=False, default=str)
+        self.assertIn("tool_result", payload)
+        self.assertIn("s1", payload)
+
+    def test_after_restart_every_call_gets_an_answer(self) -> None:
+        """⚠️ Протокол вендора: на **каждый** вызов хода нужен ответ.
+
+        В ходе были и безопасные вызовы (уже выполнены), и опасный
+        (подтверждён после перезапуска). Ответы на все должны уйти вендору —
+        иначе ход умирает с 400 «tool call and result not match».
+        """
+        self.responses = [
+            {"content": [_tool_use("s1", "safe.one", {})]},
+            {"content": [_tool_use("t1", "risky.one", {"slug": "brain"})]},
+            {"content": [{"type": "text", "text": "Готово."}]},
+        ]
+        first = self._agent()
+        first.ask([], "перезапусти область")
+        snapshot = first.pending_snapshot()
+
+        second = self._agent()
+        second.restore_pending(snapshot)
+        second.confirm(True, [{"role": "user", "content": "перезапусти область"}])
+        sent = self.sent[-1]
+        tool_use_ids: list[str] = []
+        result_ids: list[str] = []
+        for message in sent:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    tool_use_ids.append(str(block.get("id") or ""))
+                if block.get("type") == "tool_result":
+                    result_ids.append(str(block.get("tool_use_id") or ""))
+        self.assertIn("t1", tool_use_ids)
+        self.assertIn("t1", result_ids)
+        self.assertIn("s1", result_ids)
+        # ⚠️ Вендор сверяет вызов с ответом по id: ответ без вызова — 400
+        # («tool result's tool id not found», живая проба 26.11).
+        self.assertEqual([i for i in result_ids if i not in tool_use_ids], [],
+                         "ответ на вызов без самого вызова — вендор отвергнет ход")
+        self.assertEqual([i for i in tool_use_ids if i not in result_ids], [],
+                         "вызов без ответа — вендор отвергнет ход")
 
     def test_restore_without_a_snapshot_clears_the_pending(self) -> None:
         cli = self._agent()
