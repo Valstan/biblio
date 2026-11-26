@@ -834,8 +834,17 @@ class KarmanPromptStore:
                                      "archived": bool(archived)},
                                     token=token)
         if code != 200:
+            reason = karman.explain(code)
+            if code == 503:
+                # ⚠️ «Канал не настроен» — не причина, а молчание: сказать,
+                # **что делать**. Архивирует только канал раздела (токен
+                # раздела), а он 503, пока сервис не видит этот токен.
+                reason = ("%s. Архив ставит только канал раздела: его токен "
+                          "должен быть выдан сервису (выдача в комнату-получателя "
+                          "— её принимает получатель). Сами промты при этом "
+                          "читаются — по каналу библиотеки." % reason)
             return {"ok": False,
-                    "error": "раздел не принял: %s" % karman.explain(code)}
+                    "error": "раздел не принял: %s" % reason}
         return {"ok": True, "archived": bool(archived), "token_source": source}
 
     def status(self) -> dict[str, Any]:

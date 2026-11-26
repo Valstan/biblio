@@ -24,6 +24,20 @@
 11. каталог ключей дома утилит (`.biblio-keys`) — запасной источник того же
     токена на том же компьютере.
 
+И ещё (живая проверка 26.11, промт #100 — канал раздела отвечает 503, а
+раздел при этом **читается**):
+
+14. **два канала — один раздел**: канал раздела (токен раздела) и канал
+    библиотеки (общий секрет канала, как в самой программе). Раздел читается
+    по тому, что ответил, а состояние канала архива показывается **отдельно**;
+15. в каждый канал уходит **свой** токен: секрет канала не выдаёт себя за
+    токен раздела (и наоборот);
+16. **значение секрета канала не утекает** в отчёт и в вывод команды;
+17. архив при закрытом канале раздела говорит, **что делать**, а не «канал
+    не настроен» молча;
+18. без секрета канала клиент не выдумывает промты (503 честно, запроса в
+    канал библиотеки не было).
+
 Запуск: python tools/minimax-project-areas/test_minigen_karman_prompts.py
 """
 from __future__ import annotations
@@ -55,8 +69,12 @@ PROMPTS = [
 class Handler(BaseHTTPRequestHandler):
     """Подставной сервис: тот же контракт, что у КАРМАНА."""
 
-    mode = 200          # 200 | 403 | 503 — как отвечает сервис сейчас
+    mode = 200          # 200 | 403 | 503 — как отвечает сервис сейчас (канал раздела)
     calls: list = []    # журнал запросов: метод, путь, авторизация, тело
+    #: Секрет канала библиотеки (общий секрет сервиса) — им читается раздел.
+    CHANNEL_SECRET = "channel-secret"
+    #: Токен комнаты vault'а — им читается секрет канала.
+    ROOM_TOKEN = "room-token"
 
     def log_message(self, *args):  # тишина
         pass
@@ -69,16 +87,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def _prompts(self, archived: bool) -> list:
+        return [p for p in PROMPTS if bool(p["archived"]) == archived]
+
     def do_GET(self):
         auth = self.headers.get("Authorization") or ""
         Handler.calls.append(("GET", self.path, auth, None))
-        if Handler.mode != 200:
-            self._send(Handler.mode, {"error": "служебная ошибка"})
-            return
         if self.path.startswith("/api/prompts/section"):
-            wanted = "archived=1" in self.path
-            items = [p for p in PROMPTS if bool(p["archived"]) == wanted]
-            self._send(200, {"project": SECTION, "prompts": items})
+            if Handler.mode != 200:
+                self._send(Handler.mode, {"error": "служебная ошибка"})
+                return
+            self._send(200, {"project": SECTION,
+                              "prompts": self._prompts("archived=1" in self.path)})
+            return
+        if self.path.startswith("/api/prompts?"):
+            # Канал библиотеки: общий секрет канала — не токен раздела.
+            if auth != "Bearer " + Handler.CHANNEL_SECRET:
+                self._send(401, {"error": "unauthorized"})
+                return
+            self._send(200, {"prompts": self._prompts("archived=1" in self.path)})
+            return
+        if self.path.startswith("/api/secrets?"):
+            # Vault-комната проекта: секрет канала читает токен комнаты.
+            if auth != "Bearer " + Handler.ROOM_TOKEN:
+                self._send(403, {"error": "чужой токен"})
+                return
+            self._send(200, {"secrets": {
+                "PROMPTS_INGEST_SECRET": Handler.CHANNEL_SECRET}})
             return
         self._send(404, {"error": "нет такого пути"})
 
@@ -319,6 +354,74 @@ def main() -> int:
         check(Handler.calls and Handler.calls[0][2] == "Bearer token-from-own",
               "взялся не свой токен: %s" % (Handler.calls[:1],))
         os.environ["MINIGEN_KEYS_DIR"] = str(keys)
+
+        print("14) канал раздела 503 — а раздел всё равно читается")
+        # Секрет канала лежит в vault-комнате проекта; её открывает токен комнаты
+        # (как это делает программа). Кладём его в каталог дома утилит.
+        house_keys = pathlib.Path(tmp) / "home" / ".biblio-keys"
+        house_keys.mkdir(parents=True, exist_ok=True)
+        (house_keys / "room-token").write_text("room-token\n", encoding="utf-8")
+        Handler.mode = 503
+        Handler.calls = []
+        status = client.status()
+        check(status["ok"],
+              "раздел не прочитан при закрытом канале раздела: %s" % status["reason"])
+        check(status["http"] == 200, "код не 200: %s" % status["http"])
+        check(status["prompts"] == 2, "живых промтов не 2: %s" % status["prompts"])
+        check(status.get("read_path") == "library",
+              "прочитано не по каналу библиотеки: %s" % status.get("read_path"))
+        check(status.get("section_http") == 503,
+              "состояние канала раздела не показано: %s" % status.get("section_http"))
+        check("канал раздела" in status["reason"],
+              "причина не про канал раздела: %s" % status["reason"])
+
+        print("15) в каждый канал уходит свой токен")
+        pairs = [(c[1], c[2]) for c in Handler.calls]
+        section_calls = [p for p in pairs if p[0].startswith("/api/prompts/section")]
+        library_calls = [p for p in pairs if p[0].startswith("/api/prompts?")]
+        vault_calls = [p for p in pairs if p[0].startswith("/api/secrets")]
+        check(section_calls and section_calls[0][1] == "Bearer token-from-file",
+              "в канал раздела ушёл не токен раздела: %s" % (section_calls[:1],))
+        check(library_calls and library_calls[0][1] == "Bearer channel-secret",
+              "в канал библиотеки ушёл не секрет канала: %s" % (library_calls[:1],))
+        check(vault_calls and vault_calls[0][1] == "Bearer room-token",
+              "в vault ушёл не токен комнаты: %s" % (vault_calls[:1],))
+
+        print("16) значение секрета канала не утекает в отчёт")
+        blob = json.dumps(client.status(), ensure_ascii=False)
+        check("channel-secret" not in blob, "значение секрета канала попало в отчёт")
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            client.main(["status"])
+        check("channel-secret" not in printed.getvalue(),
+              "значение секрета канала попало в вывод команды")
+        check("token-from-file" not in printed.getvalue(),
+              "значение токена раздела попало в вывод команды")
+
+        print("17) архив при закрытом канале раздела говорит, что делать")
+        Handler.calls = []
+        code, payload = client.archive(90, done=True)
+        check(code == 503, "архив прошёл при закрытом канале раздела: %s" % code)
+        error = str(payload.get("error") or "")
+        check("канал раздела" in error, "причина не про канал раздела: %s" % error)
+        check("читаются" in error,
+              "причина не сказала, что промты читаются: %s" % error)
+        check(not any(c[0] == "POST" and c[2] != "Bearer token-from-file"
+                      for c in Handler.calls),
+              "запрос на архив ушёл не с токеном раздела: %s" % Handler.calls)
+
+        print("18) без секрета канала клиент не выдумывает промты")
+        (house_keys / "room-token").unlink()
+        Handler.calls = []
+        status = client.status()
+        check(not status["ok"], "канал «открылся» без секрета канала")
+        check(status["http"] == 503, "код не 503: %s" % status["http"])
+        check(status["prompts"] == 0, "промтов не 0: %s" % status["prompts"])
+        check("канал не настроен" in status["reason"],
+              "причина не про канал: %s" % status["reason"])
+        check(not any(c[1].startswith("/api/prompts?") for c in Handler.calls),
+              "запрос в канал библиотеки ушёл без секрета: %s" % Handler.calls)
+        Handler.mode = 200
     finally:
         server.shutdown()
         server.server_close()
