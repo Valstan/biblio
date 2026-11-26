@@ -651,7 +651,19 @@ def sync() -> dict[str, Any]:
                        CLONE_DIR, timeout=600)
             out["steps"].append({"what": "ветка копии", "ok": bool(push.get("ok")),
                                  "why": push.get("out") or push.get("err")})
+            if push.get("ok"):
+                # ⚠️ Живой случай 26.11: без слежения `git pull --ff-only` в
+                # клоне падает («There is no tracking information»), и
+                # владелец видит «обновление не прошло». Ветка копии — своя
+                # ветка копии в репозитории программы ⇒ следим за ней.
+                git(["branch", "--set-upstream-to=%s/%s" % (remote, branch),
+                     branch], CLONE_DIR)
     else:
+        if not _tracking(branch, CLONE_DIR):
+            # ветка без слежения: пробуем поставить (иначе pull ругается
+            # невнятной ошибкой git — говорим своим словом)
+            git(["branch", "--set-upstream-to=%s/%s" % (remote, branch),
+                 branch], CLONE_DIR)
         pull = git(["pull", "--ff-only"], CLONE_DIR, timeout=600)
         out["steps"].append({"what": "клон", "ok": bool(pull.get("ok")),
                              "why": pull.get("out") or pull.get("err")})

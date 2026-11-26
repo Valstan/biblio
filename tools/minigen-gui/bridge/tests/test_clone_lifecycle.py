@@ -178,6 +178,21 @@ class CopyLifecycleGitTest(unittest.TestCase):
         self.assertIn("локальные правки", reasons)
         self.assertTrue((self.clone / "моя правка.txt").is_file())
 
+    def test_sync_gives_the_copy_branch_tracking(self) -> None:
+        """⚠️ Живой случай 26.11: после обновления у ветки копии слежения не
+        было — `git pull --ff-only` в клоне падал, и владелец видел
+        «обновление не прошло»."""
+        report = clone_mod.register_folder("mg-probe1234", upstream="Valstan/biblio")
+        self.assertTrue(report.get("ok"), report)
+        # снимем слежение — как будто ветку завели «по-старому»
+        self._git("branch", "--unset-upstream", "copies/mg-probe1234", cwd=self.clone)
+        result = clone_mod.sync()
+        self.assertTrue(result.get("ok"), result)
+        tracking = self._git("rev-parse", "--abbrev-ref",
+                             "--symbolic-full-name",
+                             "copies/mg-probe1234@{u}", cwd=self.clone)
+        self.assertTrue(tracking, "sync должен оставить слежение за веткой копии")
+
     def test_sync_never_pushes_into_master(self) -> None:
         """Канон машины (ADR-0002): пуш — только в ветку, `master` программы
         копия не двигает."""
