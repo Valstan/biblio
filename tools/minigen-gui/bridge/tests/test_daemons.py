@@ -27,7 +27,9 @@ sys.path.insert(0, str(BRIDGE_DIR))
 
 import minigen_daemons as daemons   # noqa: E402
 import minigen_state as state       # noqa: E402
-
+def _reset_status_cache() -> None:
+    """Сбросить кэш статуса демонов (иначе тесты видели бы чужой ответ)."""
+    daemons._STATUS_CACHE.update({"at": 0.0, "value": None})
 
 class DaemonMatchingTest(unittest.TestCase):
     """Опознание демона и запрет дубля."""
@@ -50,15 +52,19 @@ class DaemonMatchingTest(unittest.TestCase):
         self.assertEqual(result["pids"], [4242])
 
     def test_status_shape(self) -> None:
-        original = daemons.daemon_pids
-        daemons.daemon_pids = lambda s: [1]
+        original = daemons.daemon_pids_all
+        daemons.daemon_pids_all = lambda: {"minimax-autheal.py": [1],
+                                           "minimax-netwatch.py": [1],
+                                           "minimax-sessionwatch.py": [1]}
         original_view = daemons.supervisor_view
         daemons.supervisor_view = lambda: None      # надзирателя нет — смотрим сами
+        _reset_status_cache()
         try:
             result = daemons.status()
         finally:
-            daemons.daemon_pids = original
+            daemons.daemon_pids_all = original
             daemons.supervisor_view = original_view
+            _reset_status_cache()
         self.assertEqual(result["total"], 3)
         self.assertEqual(result["alive_count"], 3)
         for item in result["daemons"]:
@@ -88,13 +94,15 @@ class SupervisorViewTest(unittest.TestCase):
     def setUp(self) -> None:
         self._view = daemons.supervisor_view
         self._ask = daemons._ask_supervisor
-        self._pids = daemons.daemon_pids
-        daemons.daemon_pids = lambda spec: []        # окно демонов не видит
+        self._pids = daemons.daemon_pids_all
+        daemons.daemon_pids_all = lambda: {}         # окно демонов не видит
+        _reset_status_cache()
 
     def tearDown(self) -> None:
         daemons.supervisor_view = self._view
         daemons._ask_supervisor = self._ask
-        daemons.daemon_pids = self._pids
+        daemons.daemon_pids_all = self._pids
+        _reset_status_cache()
 
     def test_status_takes_the_supervisor_view(self) -> None:
         daemons.supervisor_view = lambda: {
@@ -297,6 +305,104 @@ class ConfigWriteRaceTest(unittest.TestCase):
         self.assertTrue(ok, err)
         data = json.loads(self.core.CONFIG.read_text(encoding="utf-8"))
         self.assertEqual(data["projects"][0]["slug"], "x")
+
+
+class OneScanTest(unittest.TestCase):
+    """Демонов видно ОДНИМ вызовом PowerShell (26.11).
+
+    ⚠️ Живой замер на установленной программе: `state.snapshot` стоил
+    **12,6–28,2 с**, и виноват был не код окна, а три вызова WMI по одному на
+    демона (2,8 с на тихой машине). Теперь список процессов читается один раз,
+    а разбор делает Python.
+    """
+
+    FAKE = (
+        "100|python C:\\Users\\valstan\\bin\\minimax-autheal.py\n"
+        "200|python C:\\Users\\valstan\\bin\\minimax-netwatch.py\n"
+        "300|python C:\\Users\\valstan\\bin\\minimax-sessionwatch.py\n"
+        "400|python C:\\Users\\valstan\\bin\\minimax-sessionwatch.py "
+        "--send brain mvs_1 \"текст\"\n"
+        "500|python C:\\Users\\valstan\\bin\\minimax-orphans.py\n"
+    )
+
+    def setUp(self) -> None:
+        self._ps = daemons._ps
+        self._all = daemons.daemon_pids_all
+        self._view = daemons.supervisor_view
+        self.calls: list[str] = []
+        daemons.supervisor_view = lambda: None      # надзирателя нет — смотрим сами
+        _reset_status_cache()
+
+    def tearDown(self) -> None:
+        daemons._ps = self._ps
+        daemons.daemon_pids_all = self._all
+        daemons.supervisor_view = self._view
+        _reset_status_cache()
+
+    def fake_ps(self, cmd: str, timeout: int = 30) -> str:
+        self.calls.append(cmd)
+        return self.FAKE
+
+    def test_status_scans_once_for_all_daemons(self) -> None:
+        """Один вызов WMI на всех демонов, а не по одному на каждого."""
+        daemons._ps = self.fake_ps
+        result = daemons.status()
+        self.assertEqual(len(self.calls), 1,
+                         "статус демонов читается одним вызовом, а не тремя")
+        self.assertEqual(result["alive_count"], 3)
+        by_name = {item["name"]: item for item in result["daemons"]}
+        self.assertEqual(by_name["лечащий"]["pids"], [100])
+        self.assertEqual(by_name["сетевой сторож"]["pids"], [200])
+        self.assertEqual(by_name["сторож сессий"]["pids"], [300])
+
+    def test_one_shot_call_is_not_a_daemon(self) -> None:
+        """Разовый вызов с аргументом — не демон (правило из докстринга)."""
+        daemons._ps = self.fake_ps
+        found = daemons.daemon_pids_all()
+        self.assertEqual(found.get("minimax-sessionwatch.py"), [300],
+                         "разовый вызов --send не должен считаться демоном")
+        self.assertNotIn("minimax-orphans.py", found,
+                         "чужой скрипт не должен попадать в список демонов")
+
+    def test_quoted_path_is_still_a_daemon(self) -> None:
+        """Путь в кавычках (пробел в пути) — демон, а не «мёртвый»."""
+        lines = (
+            "700|python \"C:\\Program Files\\МиниГен\\bin\\minimax-autheal.py\"\n")
+        daemons._ps = lambda cmd, timeout=30: lines
+        found = daemons.daemon_pids_all()
+        self.assertEqual(found.get("minimax-autheal.py"), [700],
+                         "путь в кавычках — это демон")
+
+    def test_quoted_one_shot_is_not_a_daemon(self) -> None:
+        """Разовый вызов с кавычками в конце — всё равно не демон."""
+        lines = (
+            "700|python \"C:\\Program Files\\МиниГен\\bin\\minimax-autheal.py\" "
+            "--send brain mvs_1 \"текст\"\n")
+        daemons._ps = lambda cmd, timeout=30: lines
+        found = daemons.daemon_pids_all()
+        self.assertFalse(found.get("minimax-autheal.py"),
+                         "разовый вызов с аргументами демоном не считается")
+
+    def test_status_is_cached(self) -> None:
+        """Повторный вопрос про демонов не идёт в WMI (кэш `STATUS_TTL`)."""
+        daemons._ps = self.fake_ps
+        daemons.status()
+        daemons.status()
+        self.assertEqual(len(self.calls), 1,
+                         "второй вопрос должен взять кэш, а не WMI")
+        # кэш протух — идём в WMI снова
+        daemons._STATUS_CACHE["at"] = 0.0
+        daemons.status()
+        self.assertEqual(len(self.calls), 2)
+
+    def test_daemon_pids_is_never_cached(self) -> None:
+        """Проверка «жив ли демон» — всегда свежая (второй демон не поднимется)."""
+        daemons._ps = self.fake_ps
+        daemons.daemon_pids(daemons.DAEMONS[0])
+        daemons.daemon_pids(daemons.DAEMONS[0])
+        self.assertEqual(len(self.calls), 2,
+                         "проверка процессов обязана быть свежей: иначе "
+                         "может подняться второй демон (урок 22.11)")
 
 
 if __name__ == "__main__":
