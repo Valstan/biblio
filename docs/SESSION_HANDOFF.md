@@ -80,8 +80,11 @@ Updated: 2026-11-26 (тридцать первая смена: промт #129 �
   `src/renderer/src/tabs/chat-store.ts`, `src/renderer/src/tabs/chat-view.ts`,
   `src/renderer/src/styles.css`, `bridge/tests/test_agent_protocol.py` (новый),
   `tests/chat-store.test.ts`, `tests/chat-view.test.ts`,
-  `docs/LIVE-CHECK-REPORT.md` (новый), `docs/SESSION_HANDOFF.md` (этот блок).
-  **PR полосы: #194.**
+  `docs/LIVE-CHECK-REPORT.md` (новый), `docs/SESSION_HANDOFF.md` (этот блок),
+  `mailbox/to-brain/2026-11-26-chat-turn-protocol.md` (новый) — письмо Мозгу:
+  переносимое правило протокола хода (на каждый вызов модели — свой ответ).
+  **PR полосы: #194** (код, приёмка, отчёт) и отдельный docs-PR (письмо Мозгу и
+  этот блок handoff).
 - `bridge/minigen_code.py` **не трогал**: цепочка `code.*` на месте и отработала на
   живой задаче 25.11 (PR #161, зелёный гейт, отчёт `docs/SELFDEBUG-REPORT.md`).
 - `src/renderer/src/App.tsx` **не трогал**: состояние чата вынесено в модуль окна —
