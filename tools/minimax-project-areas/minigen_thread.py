@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -56,6 +57,18 @@ FINISH = "завершать"
 NEW_SESSION = "новая_сессия"
 ACTIONS = (CONTINUE, FINISH, NEW_SESSION)
 
+#: **Предел простоя** (часов): столько сессия может молчать без отчёта о
+#: выполнении, а потом нитка переносится в новую сессию (с паспортом).
+#:
+#: ⚠️ Это **решение владельца**, и значение здесь **НЕ выбрано**: 0 = предел
+#: выключен (поведение не меняется: нитка просто продолжается, как сейчас).
+#: Промт #172, «Риски и открытые вопросы»: «“Продолжать” без единого
+#: действия — сессия может стоять долго. Нужен предел (например, N часов без
+#: отчёта ⇒ перенос нитки) — это решение владельца, вынеси его явно и не
+#: выбирай сам». Вынесено явно: чтобы включить, владелец ставит число часов
+#: (и пересказывает, что перенос нитки пошёл по часам).
+STUCK_LIMIT_HOURS = 0
+
 #: Пометка в паспорте: чужие деревья не трогать (ADR-0011).
 FOREIGN_TREES_RULE = (
     "ЧУЖИЕ ДЕРЕВЬЯ НЕ ТРОГАТЬ: работа идёт только в своей ветке/worktree. "
@@ -72,6 +85,27 @@ RULES = (
     "Промт #172: отсутствие отчёта о выполнении — не повод требовать завершения.",
     "D-038: секреты в паспорт нитки не попадают.",
 )
+
+
+#: ────────────────────────────────────────────────────────── секреты (D-038)
+
+#: Паспорт нитки наполняется **текстом агента** (сводка, handoff, отчёт) — и
+#: агент иногда печатает токен или ключ. Паспорт лежит на диске машины, но
+#: секретов в нём быть не должно (D-038): эти находки вырезаются.
+SECRET_PATTERNS = (
+    (re.compile(r"(?i)\b(bearer|authorization|api[_-]?key|access[_-]?token|"
+                r"refresh[_-]?token|password|passwd|secret|private[_-]?key)\b"
+                r"\s*[:=]?\s*[\"']?[\w.\-]{8,}"), r"\1=***"),
+    (re.compile(r"(?i)\b(?:sk|ghp|gho|github_pat|xoxb|xoxp)-[\w\-]{10,}\b"), "***"),
+)
+
+
+def redact(text: str) -> str:
+    """Вырезать секреты из текста паспорта (D-038)."""
+    out = str(text or "")
+    for pattern, repl in SECRET_PATTERNS:
+        out = pattern.sub(repl, out)
+    return out
 
 
 # ────────────────────────────────────────────────────────── файл паспортов
@@ -354,10 +388,12 @@ def build_passport(area: dict, sess: dict, context: dict[str, Any],
         "files": git.get("files") or [],
         "commits": git.get("commits") or [],
         "prs": [],
-        "done": done[:4000],
-        "left": left[:4000],
-        "criteria": criteria[:4000],
-        "task": str(context.get("task") or "")[:4000],
+        # ⚠️ Текст паспорта — это текст агента (сводка, handoff, отчёт): в нём
+        # изредка проскакивает токен или ключ ⇒ вырезаем (D-038).
+        "done": redact(done)[:4000],
+        "left": redact(left)[:4000],
+        "criteria": redact(criteria)[:4000],
+        "task": redact(str(context.get("task") or ""))[:4000],
         "handoff_path": str(context.get("handoff_path") or ""),
         "merged": bool(git.get("merged")),
         "branch_exists": bool(git.get("branch_exists")),
@@ -366,7 +402,7 @@ def build_passport(area: dict, sess: dict, context: dict[str, Any],
         "rule": FOREIGN_TREES_RULE,
     }
     if report:
-        passport["report"] = report
+        passport["report"] = redact(str(report))
     return passport
 
 
@@ -499,6 +535,12 @@ def fallback_decision(facts: dict[str, Any]) -> dict[str, Any]:
     - отчёта нет ⇒ «продолжать» (продолжить работу по нитке). Перенос нитки
       без решения «Управляющего» не делаем: это большее действие, чем может
       решить правило.
+
+    ⚠️ **Предел простоя** (`STUCK_LIMIT_HOURS`) — единственное исключение,
+    и оно **выключено по умолчанию** (0): значение выбирает владелец, не мы
+    (промт #172, «Риски и открытые вопросы»). Когда владелец поставит число
+    часов, сессия, молчащая дольше этого без отчёта, переносится правилом
+    (паспорт → архив → новая сессия) — то есть нитка не стоит вечно.
     """
     has_report = bool((facts or {}).get("has_report"))
     if has_report:
@@ -506,6 +548,17 @@ def fallback_decision(facts: dict[str, Any]) -> dict[str, Any]:
                 "Работа закончена (есть отчёт о выполнении) — завершай сессию "
                 "итоговой сводкой.",
                 "reason": "правило-фолбэк: отчёт о выполнении есть",
+                "source": "правило"}
+    idle_min = float(((facts or {}).get("last_turn") or {}).get("idle_min") or 0)
+    if STUCK_LIMIT_HOURS and idle_min >= STUCK_LIMIT_HOURS * 60:
+        return {"ok": True, "action": NEW_SESSION,
+                "instruction": ("Сессия молчит %d ч без отчёта о выполнении "
+                                "(предел владельца %d ч) — переноси нитку: паспорт, "
+                                "архив, новая сессия в своей ветке."
+                                % (int(idle_min // 60), STUCK_LIMIT_HOURS)),
+                "reason": ("правило-фолбэк: сессия молчит %d ч (предел владельца "
+                           "%d ч) — переносим нитку"
+                           % (int(idle_min // 60), STUCK_LIMIT_HOURS)),
                 "source": "правило"}
     return {"ok": True, "action": CONTINUE, "instruction":
             "Продолжай работу по нитке: доделай то, что осталось, и напиши "
