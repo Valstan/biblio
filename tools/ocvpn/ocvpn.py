@@ -50,6 +50,9 @@ import urllib.request
 BASE = Path(__file__).resolve().parent
 STATE = BASE / "state"
 CORE_EXE = BASE / "core" / "ocvpn-core.exe"
+# Адаптер для reality: xray из установки Happ работает с Xray-core >= 26.9.8,
+# в отличие от sing-box (#4520). Используется как транспорт для reality-нод.
+XRAY_EXE = Path(r"C:\Program Files\FlyFrogLLC\Happ\core\xray.exe")
 CONFIG_PATH = BASE / "config.json"
 NODES_PATH = STATE / "nodes.json"
 CORE_CONFIG = STATE / "core.json"
@@ -727,6 +730,73 @@ class Core:
         except Exception:  # noqa: BLE001
             return ""
 
+    # --- адаптер xray для reality (SagerNet#4520) ---
+    # sing-box не проходит handshake с Xray-core >= 26.9.8 (требует X25519MLKEM768).
+    # xray из установки Happ работает — используем как транспорт для reality-нод.
+    def start_xray_adapter(self, node: "Node", port: int = 10811) -> bool:
+        if not XRAY_EXE.exists():
+            log(f"xray-адаптер: {XRAY_EXE} не найден — пропускаем")
+            return False
+        if not node or not node.outbound:
+            return False
+        tls = node.outbound.get("tls") or {}
+        if not (tls.get("reality") or {}).get("enabled"):
+            return False
+        ob = node.outbound
+        stream: dict = {"network": "tcp", "security": "reality", "realitySettings": {
+            "serverName": tls.get("server_name", ""),
+            "fingerprint": (tls.get("utls") or {}).get("fingerprint", "chrome"),
+            "publicKey": (tls.get("reality") or {}).get("public_key", ""),
+            "shortId": (tls.get("reality") or {}).get("short_id", ""),
+        }}
+        cfg = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [{"port": port, "listen": "127.0.0.1", "protocol": "http", "settings": {}}],
+            "outbounds": [{
+                "protocol": node.scheme or "vless",
+                "settings": {"vnext": [{
+                    "address": ob.get("server", node.host),
+                    "port": ob.get("server_port", node.port),
+                    "users": [{"id": ob.get("uuid", ""), "encryption": "none"}],
+                }]},
+                "streamSettings": stream,
+            }],
+        }
+        if node.flow and node.flow not in ("", "none"):
+            cfg["outbounds"][0]["settings"]["vnext"][0]["users"][0]["flow"] = node.flow
+        path = STATE / f"xray_adapter_{node.tag}.json"
+        path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+        proc = subprocess.Popen(
+            [str(XRAY_EXE), "run", "-c", str(path.resolve())],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", cwd=str(BASE),
+        )
+        self._xray_adapter = {"proc": proc, "path": path, "port": port, "node_tag": node.tag}
+        # Проверяем подъём через 3 с
+        time.sleep(3)
+        try:
+            ip = measure_ip(f"http://127.0.0.1:{port}", self.cfg.get("probe_url", "https://ifconfig.co/json"))
+            log(f"xray-адаптер: {node.tag} ({node.host}) поднят, egress={ip}")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log(f"xray-адаптер: {node.tag} поднялся, выход не проходит ({type(exc).__name__})")
+            return True  # процесс жив; проба может сработать позже
+
+    def stop_xray_adapter(self) -> None:
+        adapter = getattr(self, "_xray_adapter", None)
+        if adapter:
+            proc = adapter.get("proc")
+            path = adapter.get("path")
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            if path:
+                Path(path).unlink(missing_ok=True)
+            self._xray_adapter = None
+
 
 def measure_ip(proxy: str | None, url: str) -> str:
     text = http_get_text(url, proxy=proxy, timeout=15).strip()
@@ -1064,10 +1134,20 @@ class Controller:
                 raise RuntimeError("живых нод нет")
             candidates = [n for n in alive if n.tag != self.current_tag] or alive
             target = candidates[0]
+            # Если нода — reality, запускаем xray-адаптер (sing-box не проходит #4520)
+            adapter_active = False
+            if target.outbound.get("tls", {}).get("reality", {}).get("enabled"):
+                adapter_port = 10811 + len(getattr(self.core, "_xray_adapter", None) or {})  # простая ротация портов
+                # Останавливаем предыдущий адаптер
+                self.core.stop_xray_adapter()
+                adapter_active = self.core.start_xray_adapter(target, adapter_port)
+                if adapter_active:
+                    self.event("адаптер", f"xray-адаптер для reality-ноды {target.tag} (порт {adapter_port})")
             before = self.egress_ip
             self.core.select(target.tag)
             time.sleep(0.6)
-            proxy = f"http://127.0.0.1:{self.cfg['ports']['proxy']}"
+            adapter_port = getattr(getattr(self.core, "_xray_adapter", None), "port", None) if getattr(self.core, "_xray_adapter", None) else None
+            proxy = f"http://127.0.0.1:{adapter_port}" if adapter_port else f"http://127.0.0.1:{self.cfg['ports']['proxy']}"
             try:
                 self.egress_ip = measure_ip(proxy, self.cfg["probe_url"])
             except Exception as exc:  # noqa: BLE001
