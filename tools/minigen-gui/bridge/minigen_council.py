@@ -237,14 +237,41 @@ def _items(value: Any) -> list[str]:
     return out
 
 
+def _as_list(value: Any) -> list[Any]:
+    """Значение из ответа модели — списком (строка и объект тоже)."""
+    if isinstance(value, (str, dict)):
+        return [value]
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
+
+
+def slugs(value: Any) -> list[str]:
+    """Слаги из ответа модели: строка, один объект или список — всё это.
+
+    ⚠️ Модель отвечает не по схеме: вместо `["coder"]` присылает `"coder"`,
+    а вместо списка — один объект `{"slug": "coder"}`. Разобранное «как есть»
+    теряло назначенных исполнителей (и выбранные секретарём роли): строка
+    разбиралась на буквы, и решение совета оставалось без исполнителей, а
+    работа не делилась между ними — а это прямое требование приёмки промта
+    #132. Живая проба 26.11: судья назвал исполнителя строкой — исполнитель
+    исчез, решение осталось без работы.
+    """
+    out: list[str] = []
+    for item in _as_list(value):
+        if isinstance(item, dict):
+            text = str(item.get("slug") or item.get("title") or "").strip()
+        else:
+            text = str(item or "").strip()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
 def normalize_decision(raw: dict[str, Any], executor_slugs: list[str]) -> dict[str, Any]:
     """Решение судьи → единый вид (поля проверяет приёмка)."""
     executors_chosen: list[str] = []
-    for item in raw.get("executors") or []:
-        slug = (str(item.get("slug") or "").strip()
-                if isinstance(item, dict) else str(item or "").strip())
-        if not slug:
-            continue
+    for slug in slugs(raw.get("executors")):
         match = next((known for known in executor_slugs
                       if known.lower() == slug.lower()), "")
         if match and match not in executors_chosen:

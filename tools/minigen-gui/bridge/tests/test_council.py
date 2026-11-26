@@ -734,5 +734,65 @@ class NewSpecialistTest(unittest.TestCase):
         self.assertIn("slug", res["error"])
 
 
+class ParsingToleranceTest(unittest.TestCase):
+    """Ответ модели разбирается терпимо: список, строка или один объект.
+
+    ⚠️ Живая проба 26.11 (промт #132): модель отвечает не по схеме — вместо
+    `["coder"]` присылает `"coder"`, а вместо списка — один объект
+    `{"slug": "coder"}`. Разобранное «как есть» теряло назначенных
+    исполнителей (и выбранные секретарём роли): решение совета оставалось без
+    исполнителей, а работа не делилась между ними — а это прямое требование
+    приёмки промта #132.
+    """
+
+    def test_an_executor_named_as_a_string_is_kept(self) -> None:
+        decision = council.normalize_decision(
+            {"to_do": ["починить"], "executors": "coder"},
+            ["coder", "reviewer"])
+        self.assertEqual(decision["executors"], ["coder"])
+
+    def test_an_executor_named_as_an_object_is_kept(self) -> None:
+        decision = council.normalize_decision(
+            {"to_do": ["починить"], "executors": [{"slug": "coder"}]},
+            ["coder", "reviewer"])
+        self.assertEqual(decision["executors"], ["coder"])
+
+    def test_the_council_keeps_an_executor_named_as_a_string(self) -> None:
+        """Сквозная проверка: судья назвал исполнителя строкой."""
+        judge = json.dumps({"to_do": ["починить дефект"], "not_to_do": [],
+                            "executors": "coder", "ask_owner": []},
+                           ensure_ascii=False)
+        fake = FakeAgent(council_replies(judge=judge))
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = fake._council([{"role": "user", "content": TASK}], {},
+                                budget, {}, TASK)
+        decision = outcome.get("decision") or {}
+        self.assertEqual(decision.get("executors"), ["coder"],
+                         "названный исполнитель не должен теряться")
+        executor_turns = [turn for turn in fake.turns
+                          if "ты — исполнитель" in turn["system"].lower()]
+        self.assertEqual(len(executor_turns), 1,
+                         "названный исполнитель должен получить свою часть")
+
+    def test_the_secretary_role_named_as_a_string_is_heard(self) -> None:
+        """Секретарь назвал одну роль строкой — роль не теряется."""
+        replies = {
+            "секретарь": json.dumps({"roles": "ux"}, ensure_ascii=False),
+            "судья": JUDGE_JSON,
+            "UX/антропогенез": "Мнение UX: путь владельца спрятан.",
+            "Дизайнер": "Мнение дизайнера: цвета совпадают.",
+        }
+        fake = FakeAgent(replies)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = fake._council([{"role": "user", "content": TASK}], {},
+                                budget, {}, TASK)
+        self.assertIn("Мнение UX", outcome.get("council_text") or "",
+                      "роль, названная строкой, должна обсуждать задачу")
+        advisor_turns = [turn for turn in fake.turns
+                         if "ты — специалист совета" in turn["system"].lower()]
+        self.assertTrue(advisor_turns, "совет должен кого-то позвать")
+        self.assertIn("UX/антропогенез", advisor_turns[0]["system"])
+
+
 if __name__ == "__main__":
     unittest.main()

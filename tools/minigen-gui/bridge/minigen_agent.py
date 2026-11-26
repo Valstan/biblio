@@ -465,7 +465,12 @@ class Agent:
         if triage.get("status") != "done":
             give_back()
             return {"status": "done", "history": messages, "council_text": ""}
-        wanted = council.parse_json(triage.get("text") or "").get("roles") or []
+        # ⚠️ Ответ секретаря разбираем терпимо: модель может прислать одну
+        # роль строкой (`"roles": "ux"`). Разобранное «как есть» такая строка
+        # разбиралась бы на буквы, и названная роль терялась бы — совет
+        # обсуждал бы задачу не теми ролями (живая проба 26.11).
+        wanted = council.slugs(
+            council.parse_json(triage.get("text") or "").get("roles"))
         selected: list[dict[str, Any]] = []
         for slug in wanted:
             item = council.role(str(slug))
