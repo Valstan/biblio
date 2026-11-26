@@ -74,6 +74,11 @@ COUNCIL_FILE_CHARS = 20_000
 #: запросов к внешнему ресурсу не делается.
 PROMPT_DISPATCH_EVERY = 60
 
+#: Как часто повторять в журнале одну и ту же причину отказа раздачи
+#: (секунды). Цикл автораздачи ходит раз в минуту — без этого журнал забивался
+#: бы одной и той же строкой. Первое появление причины пишется сразу.
+PROMPT_NOTE_EVERY = 6 * 3600
+
 
 def _title_from(text: str) -> str:
     """Заголовок заявки из зачитки: первая строка, обрезанная до 90 знаков.
@@ -264,12 +269,38 @@ class Bridge:
                         self.core.log("ПРОМТЫ: промт %s отдан в область %s "
                                       "автоматически" % (item.get("id"),
                                                          item.get("area")))
+                    elif item.get("note"):
+                        self._log_prompt_note(item)
             except Exception as exc:  # noqa: BLE001
                 # Автораздача не должна ронять программу: сбой — в журнал.
                 try:
                     self.core.log("ПРОМТЫ: автораздача не прошла: %s" % exc)
                 except Exception:  # noqa: BLE001
                     pass
+
+    def _log_prompt_note(self, item: dict[str, Any]) -> None:
+        """Причина отказа раздачи — в журнал, но **без повторов**.
+
+        ⚠️ Цикл ходит раз в минуту: одно и то же сообщение каждую минуту
+        забило бы журнал. Пишем, когда причина изменилась или её не писали
+        давно (`PROMPT_NOTE_EVERY`).
+        """
+        text = str(item.get("why") or "").strip()
+        if not text:
+            return
+        now = time.time()
+        seen = getattr(self, "_prompt_notes", None)
+        if seen is None:
+            seen = {}
+            self._prompt_notes = seen
+        last = float(seen.get(text) or 0.0)
+        if now - last < PROMPT_NOTE_EVERY:
+            return
+        seen[text] = now
+        try:
+            self.core.log("ПРОМТЫ: %s (%s)" % (text, item.get("area") or "—"))
+        except Exception:  # noqa: BLE001
+            pass
 
     def start_daemon_supervision(self) -> None:
         """Следить за демонами: поднимать упавшего.
@@ -1533,12 +1564,18 @@ class Bridge:
             })
         return out
 
-    def _prompt_records(self, store: Any, project: str = "") -> list[dict[str, Any]]:
+    def _prompt_records(self, store: Any, project: str = "",
+                        include_archived: bool = False,
+                        only_archived: bool = False
+                        ) -> list[dict[str, Any]]:
         """Промты выбранного хранилища с пометками владельца."""
         try:
-            records = store.list_prompts(project)
+            records = store.list_prompts(project, include_archived=include_archived,
+                                         only_archived=only_archived)
         except prompts_mod.KarmanUnavailable as exc:
             raise ValueError("внешний ресурс не отдал промты: %s" % exc)
+        except prompts_mod.UnknownSection as exc:
+            raise ValueError("внешний ресурс: %s" % exc)
         for record in records:
             record["auto"] = prompts_mod.get_mark(
                 record.get("source", ""), record.get("project", ""),
@@ -1553,6 +1590,12 @@ class Bridge:
         settings = state.read_settings()
         store = self._prompt_store()
         project = str(args.get("project") or "").strip()
+        # Вид: `live` (живые), `archived` (архив) или `all` (и те и другие).
+        view = str(args.get("view") or "live").strip().lower()
+        if view not in ("live", "archived", "all"):
+            view = "live"
+        include_archived = view in ("archived", "all")
+        only_archived = view == "archived"
         info: dict[str, Any] = {
             "kind": store.kind,
             "label": store.label,
@@ -1567,10 +1610,18 @@ class Bridge:
             info["ok"] = bool(status.get("ok"))
             info["reason"] = str(status.get("reason") or "")
             info["sections"] = list(status.get("sections") or [])
-            prompts = self._prompt_records(store, project)
+            prompts = self._prompt_records(store, project,
+                                           include_archived=include_archived,
+                                           only_archived=only_archived)
         except prompts_mod.KarmanUnavailable as exc:
             info["ok"] = False
             info["reason"] = "внешний ресурс недоступен: %s" % exc
+        except prompts_mod.UnknownSection as exc:
+            info["ok"] = False
+            info["reason"] = "внешний ресурс: %s" % exc
+        except ValueError as exc:
+            info["ok"] = False
+            info["reason"] = str(exc)
         except Exception as exc:  # noqa: BLE001
             info["ok"] = False
             info["reason"] = "хранилище не отдало промты: %s" % exc
@@ -1579,6 +1630,7 @@ class Bridge:
             "prompts": prompts,
             "targets": self._prompt_targets(),
             "auto_dispatch": bool(settings.get("promptAutoDispatch")),
+            "view": view,
         }
 
     def cmd_prompts_save(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1592,12 +1644,19 @@ class Bridge:
         return res
 
     def cmd_prompts_archive(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Архивировать выполненный промт (архив = сделано)."""
+        """Архивировать выполненный промт (архив = сделано).
+
+        `archived: false` — вернуть из архива (архив не удаление: заданный
+        по ошибке промт должен вернуться в оборот).
+        """
         store = self._prompt_store()
+        archived = bool(args.get("archived", True))
         res = store.archive(str(args.get("id") or ""),
-                            str(args.get("project") or ""))
+                            str(args.get("project") or ""), archived=archived)
         if res.get("ok"):
-            self.core.log("ПРОМТЫ: промт архивирован (%s)" % (args.get("id") or ""))
+            self.core.log("ПРОМТЫ: промт %s %s"
+                          % (args.get("id") or "",
+                             "архивирован" if archived else "возвращён из архива"))
         return res
 
     def cmd_prompts_mark(self, args: dict[str, Any]) -> dict[str, Any]:

@@ -671,6 +671,14 @@ export interface KarmanChannel {
  */
 export type PromptStoreKind = 'local' | 'karman'
 
+/**
+ * Что показывает вкладка: живые промты, архивные или и те и другие.
+ *
+ * ⚠️ Архив виден **отдельно**: в КАРМАНЕ архив = «сделано», и заданный по
+ * ошибке промт должен быть виден и возвращаемым, а не исчезать из оборота.
+ */
+export type PromptsView = 'live' | 'archived' | 'all'
+
 /** Запись хранилища: промт или план (план идёт рядом с промтом). */
 export interface PromptRecord {
   id: string
@@ -713,6 +721,8 @@ export interface PromptsSnapshot {
   targets: PromptTarget[]
   /** автораздача без живого оператора включена ли */
   auto_dispatch: boolean
+  /** какой вид показан (живые / архив / все) — ответ моста */
+  view?: PromptsView
 }
 
 /**

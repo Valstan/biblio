@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { PromptRecord, PromptsSnapshot } from '../src/shared/types'
 import {
+  archiveActionLabel,
   archiveConfirmText,
   autoEligible,
   dispatchConfirmText,
@@ -9,7 +10,10 @@ import {
   promptRows,
   storeView,
   targetsFor,
-  validateDraft
+  unarchiveConfirmText,
+  validateDraft,
+  viewLabel,
+  visibleRows
 } from '../src/renderer/src/tabs/prompts-view'
 import { TABS } from '../src/renderer/src/tabs/tabs'
 
@@ -216,5 +220,30 @@ describe('вкладка «Хранилище промтов»', () => {
     expect(validateDraft({ project: 'biblio project', title: 'Заявка', body: 'Текст' })[0]).toContain(
       'раздел'
     )
+  })
+
+  it('архив виден отдельно, и промт из него можно вернуть', () => {
+    const rows = promptRows(
+      snapshot({
+        prompts: [prompt(), prompt({ id: 'p-2', title: 'Сделанный', archived: true })]
+      })
+    )
+    expect(visibleRows(rows, 'live').map((row) => row.id)).toEqual(['p-1'])
+    expect(visibleRows(rows, 'archived').map((row) => row.id)).toEqual(['p-2'])
+    expect(visibleRows(rows, 'all')).toHaveLength(2)
+
+    expect(archiveActionLabel(rows[0])).toBe('В архив')
+    expect(archiveActionLabel(rows[1])).toBe('Вернуть из архива')
+
+    const back = unarchiveConfirmText(rows[1])
+    expect(back).toContain('Сделанный')
+    expect(back).toContain('снова попадёт в выдачу')
+    expect(back).toContain('Продолжить?')
+  })
+
+  it('вид выдачи назван прямо — окно не гадает, что показывает', () => {
+    expect(viewLabel('live')).toBe('живые')
+    expect(viewLabel('archived')).toBe('архив')
+    expect(viewLabel('all')).toBe('живые и архив')
   })
 })

@@ -10,7 +10,13 @@
  * ⚠️ Никаких выдуманных данных: чего нет — показываем «—», а не догадку.
  */
 
-import type { PromptRecord, PromptStoreInfo, PromptTarget, PromptsSnapshot } from '@shared/types'
+import type {
+  PromptRecord,
+  PromptStoreInfo,
+  PromptTarget,
+  PromptsSnapshot,
+  PromptsView
+} from '@shared/types'
 
 /** Строка промта (или плана) для таблицы. */
 export interface PromptRow {
@@ -171,6 +177,44 @@ export function archiveConfirmText(row: PromptRow): string {
     'Архив = сделано: он перестанет выдаваться.\n\n' +
     'Продолжить?'
   )
+}
+
+/**
+ * Что скажет окно перед возвратом промта из архива.
+ *
+ * Архив — **не удаление**: заданный по ошибке промт должен вернуться в
+ * оборот, поэтому и действие это, и подтверждение называют последствия.
+ */
+export function unarchiveConfirmText(row: PromptRow): string {
+  return (
+    `Вернуть промт «${row.title}» из архива?\n\n` +
+    'Он снова попадёт в выдачу: живые промты уходят в область своего проекта.\n\n' +
+    'Продолжить?'
+  )
+}
+
+/** Подпись кнопки архива: архивировать или вернуть — по состоянию записи. */
+export function archiveActionLabel(row: PromptRow): string {
+  return row.archived ? 'Вернуть из архива' : 'В архив'
+}
+
+/**
+ * Вид выдачи: живые, архивные или и те и другие.
+ *
+ * ⚠️ Архив виден **отдельно**: заданный по ошибке промт не должен просто
+ * исчезнуть из оборота — его надо видеть и уметь вернуть.
+ */
+export function visibleRows(rows: PromptRow[], view: PromptsView): PromptRow[] {
+  if (view === 'archived') return rows.filter((row) => row.archived)
+  if (view === 'live') return rows.filter((row) => !row.archived)
+  return rows
+}
+
+/** Подпись вида выдачи — чтобы окно не гадало, что показывает. */
+export function viewLabel(view: PromptsView): string {
+  if (view === 'archived') return 'архив'
+  if (view === 'all') return 'живые и архив'
+  return 'живые'
 }
 
 /**

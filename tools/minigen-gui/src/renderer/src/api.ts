@@ -27,6 +27,7 @@ import type {
   NetworkState,
   ProgramVersion,
   PromptsSnapshot,
+  PromptsView,
   Settings,
   Snapshot,
   Stats,
@@ -133,11 +134,14 @@ export const api = {
   },
   karmanStatus: () => call<KarmanChannel>('karman.status'),
   // ── «Хранилище промтов» (вкладка «Промты», 25.11) ────────────────────────
-  promptsList: (project?: string) =>
-    call<PromptsSnapshot>('prompts.list', project ? { project } : {}),
+  promptsList: (project?: string, view?: PromptsView) =>
+    call<PromptsSnapshot>('prompts.list', {
+      ...(project ? { project } : {}),
+      ...(view ? { view } : {})
+    }),
   promptsSave: (payload: { project: string; title: string; body: string }) =>
     call<{ ok: boolean; error?: string; id?: string }>('prompts.save', payload),
-  promptsArchive: (payload: { id: string; project?: string }) =>
+  promptsArchive: (payload: { id: string; project?: string; archived?: boolean }) =>
     call<{ ok: boolean; error?: string }>('prompts.archive', payload),
   promptsMark: (payload: { id: string; project?: string; auto: boolean }) =>
     call<{ ok: boolean; error?: string }>('prompts.mark', payload),
