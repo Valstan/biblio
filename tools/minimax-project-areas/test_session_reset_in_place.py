@@ -102,14 +102,24 @@ def main() -> int:
     check(hasattr(watcher, "rotate_session"), "ротация-откат пропала")
     check(int(getattr(watcher, "RESET_COOLDOWN", 0)) > 0, "нет кулдауна на повторный сброс")
 
-    print("3) ветка решения предпочитает сброс, а ротация — откат")
-    src = (HERE / "minimax-sessionwatch.py").read_text(encoding="utf-8")
-    branch = src[src.find('if v["verdict"] in ("скомпактилась"'):][:1500]
-    check("reset_session(area, sess)" in branch,
-          "ветка вердиктов не вызывает reset_session")
-    check("rotate_session(area, sess)" in branch and "fallback" in branch,
-          "в ветке нет отката на ротацию")
-    check('state.setdefault("reset", {})' in branch, "нет отметки времени сброса")
+    print("3) ветка решения: сброс на месте больше не требует завершения сам")
+    # ⚠️ ПРОМТ #172 (26.11) изменил это правило: решение лечения принимает
+    # «Управляющий», и **отсутствие отчёта о выполнении — не повод требовать
+    # завершения**. Сброс на месте остался **ручным** инструментом (кнопка в
+    # окне, ключ `--reset`), а автоматический путь идёт через решение.
+    src = (HERE / "minimax-sessionwatch.py").read_text(encoding="utf-8-sig")
+    branch = src[src.find('if v["verdict"] in ("скомпактилась"'):][:2500]
+    check("treat_session(" in branch,
+          "ветка вердиктов не зовёт решение «Управляющего»")
+    check("reset_session(area, sess)" not in branch,
+          "ветка вердиктов по-прежнему требует завершения (reset_session)")
+    check("rotate_session(area, sess)" not in branch,
+          "ветка вердиктов по-прежнему ротирует без решения «Управляющего»")
+    check('state.setdefault("decision", {})' in branch,
+          "нет отметки времени решения (кулдаун на повторный вопрос модели)")
+    check(hasattr(watcher, "treat_session"), "в стороже нет решения о лечении")
+    check(int(getattr(watcher, "DECISION_COOLDOWN", 0)) > 0,
+          "нет кулдауна на повторный вопрос модели (очки аккаунта)")
 
     print("4) порог компактизации — постоянные 0.9 (решение владельца 24.11)")
     check(0 < float(getattr(watcher, "COMPACTION_TRIGGER", 0)) <= 1,
