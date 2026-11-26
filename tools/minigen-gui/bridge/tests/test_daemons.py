@@ -160,8 +160,19 @@ class ApiTest(unittest.TestCase):
         import urllib.request
 
         import minigen_api
+        import minigen_daemons as daemons
         old_token_file = minigen_api.TOKEN_FILE
         old_local = minigen_api.LOCAL
+        # ⚠️ Статус демонов — **живой** (WMI по всем процессам машины): он
+        # занимает 5–6 с, а клиентский таймаут в тесте — 5 с ⇒ тест был
+        # монеткой: на тихой машине проходил, под нагрузкой (живой случай
+        # 26.11: красный набор Python-тестов) падал «по времени», а не по
+        # существу. Проверяем **контракт API** (токен обязателен, с токоном
+        # 200), а не скорость WMI.
+        old_status = daemons.status
+        daemons.status = lambda: {"daemons": [], "alive_count": 0, "total": 3,
+                                  "supervisor": {"pid": 0, "alive": False,
+                                                 "is_self": False}}
         with tempfile.TemporaryDirectory() as tmp:
             minigen_api.LOCAL = Path(tmp)
             minigen_api.TOKEN_FILE = Path(tmp) / "bridge-token.txt"
@@ -195,6 +206,7 @@ class ApiTest(unittest.TestCase):
             finally:
                 minigen_api.TOKEN_FILE = old_token_file
                 minigen_api.LOCAL = old_local
+                daemons.status = old_status
 
     def test_no_instance_when_api_is_silent(self) -> None:
         import minigen_api
