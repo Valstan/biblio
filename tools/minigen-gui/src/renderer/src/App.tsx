@@ -39,6 +39,17 @@ export default function App() {
   const [busy, setBusy] = useState(false)
   const failures = useRef(0)
   const retryTimer = useRef<number | null>(null)
+  /**
+   * Снимок уже идёт — новый не начинаем.
+   *
+   * ⚠️ Мост обрабатывает запросы **по очереди**, а снимок состояния идёт
+   * 4–23 с (22 области ⇒ по вызову PowerShell на демонов каждой). Интервал
+   * опроса — 5 с ⇒ без запрета очередь моста растёт без предела, и вкладки
+   * получают «мост не ответил» (живой случай 26.11: приёмка окна падала на
+   * «Генах», «Настройках» и «Агентах» — их данные уходили в очередь за
+   * снимками).
+   */
+  const inFlight = useRef(false)
   // ── первый запуск копии (заказ владельца 25.11, промт #131) ──────────────
   const [copySnapshot, setCopySnapshot] = useState<CopyFirstRunSnapshot | null>(null)
   const [copyError, setCopyError] = useState('')
@@ -53,6 +64,10 @@ export default function App() {
   const lastPoolSync = useRef(0)
 
   const refresh = useCallback(async (): Promise<void> => {
+    // ⚠️ Снимок уже идёт — второй не запускаем (см. `inFlight`): иначе
+    // запросы копятся в очереди моста, и вкладки не получают своих данных.
+    if (inFlight.current) return
+    inFlight.current = true
     try {
       const snap = await api.snapshot()
       setSnapshot(snap)
@@ -71,6 +86,8 @@ export default function App() {
           void refresh()
         }, 700)
       }
+    } finally {
+      inFlight.current = false
     }
     // версия меняется только при раскатке — но пусть и в шапке будет видна
     void api.programVersion().then(setVersion).catch(() => undefined)

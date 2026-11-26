@@ -155,9 +155,13 @@ def live_check(failures: list[str], keep_dir: Path | None = None) -> None:
         env["MINIGEN_SMOKE_TEXT"] = str(text_path)
         env["MINIGEN_SMOKE_SHOTS"] = str(shots_dir)
         try:
+            # ⚠️ Таймаут 600 с, а не 180: дымовой режим ждёт **данных** вкладки
+            # (мост отвечает по очереди, а снимок состояния идёт 4–23 с), и под
+            # нагрузкой машины окно закрывается заметно позже (живой случай
+            # 26.11: на 180 с окно не успевало закрыться само).
             proc = subprocess.run(
                 [str(electron), str(app_dir)],
-                env=env, timeout=180,
+                env=env, timeout=600,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired:

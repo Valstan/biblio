@@ -237,11 +237,18 @@ app.whenReady().then(() => {
                 continue
               }
               // вкладка тянет свои данные с моста — дать им прийти
-              // ⚠️ 4 с, а не 1,5: снимок состояния идёт ~1,5 с (три вызова
-              // PowerShell на демонов), и данные вкладки встают в очередь за
-              // ним ⇒ на 1,5 с приёмка снимала пустые поля (живой случай
-              // 24.11: «Версия: неизвестна», «Родословная не прочитана»).
-              await new Promise((resolve) => setTimeout(resolve, 4000))
+              // ⚠️ Ждём **не фиксированное время**, а «забором» через очередь
+              // моста: мост обрабатывает запросы по очереди, поэтому ответ
+              // дешёвой команды ПОСЛЕ запросов вкладки означает, что её
+              // запросы уже обработаны (живой случай 26.11: снимок состояния
+              // идёт 3,9 с на простое машине и 22,7 с под нагрузкой ⇒
+              // фиксированные 4 с снимали пустые поля: «мост не ответил»).
+              await new Promise((resolve) => setTimeout(resolve, 800))
+              await bridge?.call('program.version')
+              await new Promise((resolve) => setTimeout(resolve, 800))
+              await bridge?.call('program.version')
+              // React должен успеть перерисовать вкладку полученными данными.
+              await new Promise((resolve) => setTimeout(resolve, 1200))
               const text = (await mainWindow.webContents.executeJavaScript(
                 'document.body.innerText')) as string
               const geometry = (await mainWindow.webContents.executeJavaScript(
