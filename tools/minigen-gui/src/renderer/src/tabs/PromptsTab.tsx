@@ -1,8 +1,9 @@
 import { Fragment, useCallback, useEffect, useState } from 'react'
-import type { PromptTarget, PromptsSnapshot } from '@shared/types'
+import type { PromptTarget, PromptsSnapshot, PromptsView } from '@shared/types'
 import { api } from '../api'
 import { TZ } from '../time'
 import {
+  archiveActionLabel,
   archiveConfirmText,
   autoEligible,
   dispatchConfirmText,
@@ -11,7 +12,10 @@ import {
   promptRows,
   storeView,
   targetsFor,
+  unarchiveConfirmText,
   validateDraft,
+  viewLabel,
+  visibleRows,
   type PromptRow
 } from './prompts-view'
 
@@ -53,17 +57,18 @@ export default function PromptsTab() {
   const [busy, setBusy] = useState(false)
   const [query, setQuery] = useState('')
   const [section, setSection] = useState('')
+  const [view, setView] = useState<PromptsView>('live')
   const [openId, setOpenId] = useState<string | null>(null)
   const [targetSlug, setTargetSlug] = useState('')
   const [draft, setDraft] = useState({ project: '', title: '', body: '' })
 
   const load = useCallback(async () => {
     try {
-      setSnapshot(await api.promptsList())
+      setSnapshot(await api.promptsList(undefined, view))
     } catch (err) {
       setNote(`хранилище не спросили: ${String((err as Error).message || err)}`)
     }
-  }, [])
+  }, [view])
 
   useEffect(() => {
     void load()
@@ -79,7 +84,9 @@ export default function PromptsTab() {
   const sections = snapshot?.store?.sections ?? []
   const targets = snapshot?.targets ?? []
   // Пока хранилище недоступно, список промтов пуст — не выдумываем записи.
-  const rows = store.tone === 'ok' ? promptRows(snapshot) : []
+  // Вид (живые / архив / все) фильтруется ещё раз на стороне окна: мост мог
+  // отдать и живые, и архивные, а показать надо то, что владелец выбрал.
+  const rows = store.tone === 'ok' ? visibleRows(promptRows(snapshot), view) : []
   const bySection = rows.filter(
     (row) => !section || row.project.toLowerCase() === section.toLowerCase()
   )
@@ -109,15 +116,20 @@ export default function PromptsTab() {
   }
 
   const archive = async (row: PromptRow) => {
-    if (!window.confirm(archiveConfirmText(row))) return
+    const back = row.archived
+    if (!window.confirm(back ? unarchiveConfirmText(row) : archiveConfirmText(row))) return
     setBusy(true)
     try {
-      const res = await api.promptsArchive({ id: row.id, project: projectOf(row) })
+      const res = await api.promptsArchive({
+        id: row.id,
+        project: projectOf(row),
+        archived: !back
+      })
       if (!res.ok) {
-        setNote(res.error || 'мост не архивировал промт')
+        setNote(res.error || (back ? 'мост не вернул промт из архива' : 'мост не архивировал промт'))
         return
       }
-      setNote(`промт «${row.title}» в архиве`)
+      setNote(back ? `промт «${row.title}» вернулся из архива` : `промт «${row.title}» в архиве`)
       await load()
     } catch (err) {
       setNote(String((err as Error).message || err))
@@ -223,6 +235,19 @@ export default function PromptsTab() {
             </select>
           </label>
           <label>
+            Выдача
+            <select
+              value={view}
+              onChange={(event) => setView(event.target.value as PromptsView)}
+            >
+              <option value="live">живые</option>
+              <option value="archived">архив</option>
+              <option value="all">живые и архив</option>
+            </select>
+          </label>
+        </div>
+        <div className="grid2">
+          <label>
             Поиск
             <input
               value={query}
@@ -231,6 +256,10 @@ export default function PromptsTab() {
             />
           </label>
         </div>
+        <p className="muted small">
+          Показаны: {viewLabel(view)}. Архив = «сделано»: архивный промт можно
+          вернуть в оборот.
+        </p>
 
         {visible.length === 0 ? (
           <p className="muted small">
@@ -283,7 +312,7 @@ export default function PromptsTab() {
                           {autoEligible(row) ? 'Снять авто' : 'Авто'}
                         </button>
                         <button className="ghost" onClick={() => void archive(row)} disabled={busy}>
-                          В архив
+                          {archiveActionLabel(row)}
                         </button>
                       </td>
                     </tr>

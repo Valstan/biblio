@@ -49,10 +49,12 @@ vault-комнаты или из файлов ключей, наружу ухо�
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sqlite3
 import time
+import urllib.parse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -87,8 +89,14 @@ MAX_TASK_TEXT = 20_000
 #: 5 секунд, разделов двадцать — без кэша это двадцать запросов за кадр.
 CACHE_TTL = 60.0
 #: Кэш внешнего ресурса в памяти процесса (значения секретов здесь нет).
-_cache: dict[str, Any] = {"at": 0.0, "records": [], "sections": [],
-                           "sections_at": 0.0}
+#:
+#: ⚠️ Списки разделов и промты кэшируются **по разделу**: окно спрашивает
+#: «все разделы» (и то же самое делает автораздача по каждой области), а
+#: разделы пересекаются — без общего кэша один и тот же раздел читался бы
+#: двадцать раз за кадр.
+_cache: dict[str, Any] = {"sections": [], "sections_at": 0.0,
+                           "sections_code": 0,
+                           "by_section": {}, "archived_by_section": {}}
 
 
 def now_ms() -> int:
@@ -528,8 +536,8 @@ class LocalPromptStore:
         names = {item["project"] for item in self._records() if item["project"]}
         return sorted(names)
 
-    def list_prompts(self, project: str = "", include_archived: bool = False
-                     ) -> list[dict[str, Any]]:
+    def list_prompts(self, project: str = "", include_archived: bool = False,
+                     only_archived: bool = False) -> list[dict[str, Any]]:
         out = []
         want = str(project or "").strip().lower()
         for item in self._records():
@@ -538,7 +546,10 @@ class LocalPromptStore:
             # учёта регистра, иначе раздел не найдётся никогда.
             if want and item["project"].strip().lower() != want:
                 continue
-            if not include_archived and item["archived"]:
+            if only_archived:
+                if not item["archived"]:
+                    continue
+            elif not include_archived and item["archived"]:
                 continue
             out.append(normalize_record(item, SOURCE_LOCAL))
         return out
@@ -562,7 +573,9 @@ class LocalPromptStore:
             con.close()
         return {"ok": True, "id": prompt_id, "project": name}
 
-    def archive(self, prompt_id: str, project: str = "") -> dict[str, Any]:
+    def archive(self, prompt_id: str, project: str = "",
+                archived: bool = True) -> dict[str, Any]:
+        """Архивировать (или вернуть из архива) — «сделано»."""
         con = connect(self.db_path)
         try:
             rec = (minigen_db.get_record(con, KIND_PROMPT, prompt_id)
@@ -570,7 +583,7 @@ class LocalPromptStore:
             if rec is None:
                 return {"ok": False, "error": "такого промта в базе нет"}
             payload = dict(rec.get("payload") or {})
-            payload["archived"] = True
+            payload["archived"] = bool(archived)
             minigen_db.put_record(con, str(rec.get("kind") or KIND_PROMPT),
                                   prompt_id, payload,
                                   version=int(rec.get("version") or 1),
@@ -578,7 +591,7 @@ class LocalPromptStore:
                                   updated_at=rec.get("updated_at"))
         finally:
             con.close()
-        return {"ok": True, "archived": True}
+        return {"ok": True, "archived": bool(archived)}
 
     def status(self) -> dict[str, Any]:
         try:
@@ -620,34 +633,101 @@ class KarmanPromptStore:
         host = base.rstrip("/").split("://", 1)[-1]
         return "%s (адрес из %s)" % (host, source or "—")
 
-    def sections(self) -> list[str]:
-        code, names = karman.list_sections()
-        if code != 200:
-            return []
-        _cache.update({"sections": list(names), "sections_at": time.time()})
-        return list(names)
+    def _sections_fetch(self) -> tuple[int, list[str]]:
+        """(код, разделы) — с кэшем на минуту.
 
-    def _read_section(self, project: str) -> list[dict[str, Any]]:
-        """Живые промты одного раздела (канал читает раздел по имени)."""
-        code, payload = karman.call("GET", "/api/prompts?project=%s" % project)
+        ⚠️ Окно спрашивает хранилище **раз в 5 секунд**, а разделов двадцать:
+        без кэша сервис получает двадцать запросов за кадр. Кэш на минуту —
+        компромисс: новый промт виден с задержкой до минуты, зато сервис не
+        засыпается запросами.
+        """
+        now = time.time()
+        if now - float(_cache.get("sections_at") or 0) < CACHE_TTL:
+            return int(_cache.get("sections_code") or 200), list(
+                _cache.get("sections") or [])
+        code, names = karman.list_sections()
+        if code == 200:
+            _cache.update({"sections": list(names), "sections_at": now,
+                           "sections_code": code})
+        return code, list(names)
+
+    def sections(self) -> list[str]:
+        return self._sections_fetch()[1]
+
+    def canonical_section(self, name: str) -> str:
+        """Каноническое имя раздела (регистр не важен).
+
+        ⚠️ Имя раздела в библиотеке **каноническое** (`MiniGen`, `MatricaRMZ`),
+        а у области — **слаг** (`minigen`, `matricarmz`) ⇒ читать надо по
+        каноническому имени. Иначе сервис отвечает «пусто» (имя не совпало),
+        а это выглядит как «промтов нет» — тишина вместо правды (живой случай
+        26.11, промт #94: по «minigen» приходило 0 записей, по «MiniGen» — 11).
+
+        Пустая строка — **такого раздела в библиотеке нет** (не «промтов
+        нет»). Если список разделов недоступен — возвращаем имя как есть:
+        тогда правду скажет сам сервис.
+        """
+        want = (name or "").strip()
+        if not want:
+            return ""
+        sections = self.sections()
+        if not sections:
+            return want
+        for section in sections:
+            if str(section).strip().lower() == want.lower():
+                return str(section).strip()
+        return ""
+
+    def _read_section(self, project: str, archived: bool = False
+                      ) -> list[dict[str, Any]]:
+        """Промты одного раздела (канал Мозга) — по каноническому имени."""
+        name = self.canonical_section(project)
+        if not name:
+            raise UnknownSection("раздела «%s» в библиотеке нет"
+                                  % (str(project or "—").strip() or "—"))
+        query = "&archived=1" if archived else ""
+        # ⚠️ Имя раздела — в адрес **экранированным**: кириллица в имени иначе
+        # роняет запрос (UnicodeEncodeError) — а это молчаливый отказ целой
+        # вкладки (живой случай 26.11).
+        code, payload = karman.call(
+            "GET", "/api/prompts?project=%s%s"
+            % (urllib.parse.quote(name, safe=""), query))
         if code != 200:
             raise KarmanUnavailable(karman.explain(code))
         out = []
         for item in payload.get("prompts") or []:
             if not isinstance(item, dict):
                 continue
-            archived = bool(item.get("archivedAt"))
+            archived_at = bool(item.get("archivedAt"))
             out.append(normalize_record({
                 "id": item.get("id"),
-                "project": item.get("project") or project,
+                "project": item.get("project") or name,
                 "title": item.get("title"),
                 "body": item.get("body"),
                 "createdAt": item.get("createdAt"),
-                "archived": archived,
+                "archived": archived_at,
             }, SOURCE_KARMAN))
         return out
 
-    def list_prompts(self, project: str = "", include_archived: bool = False
+    def _read_section_cached(self, project: str, archived: bool = False
+                             ) -> list[dict[str, Any]]:
+        """То же, но с кэшем по разделу (окно спрашивает раз в 5 секунд)."""
+        name = self.canonical_section(project)
+        if not name:
+            raise UnknownSection("раздела «%s» в библиотеке нет"
+                                  % (str(project or "—").strip() or "—"))
+        bucket = "archived_by_section" if archived else "by_section"
+        cache = _cache.setdefault(bucket, {})
+        hit = cache.get(name)
+        now = time.time()
+        if hit and now - float(hit[0]) < CACHE_TTL:
+            return list(hit[1])
+        items = self._read_section(project, archived=archived)
+        cache[name] = (now, list(items))
+        return items
+
+    def list_prompts(self, project: str = "", include_archived: bool = False,
+                     only_archived: bool = False
                      ) -> list[dict[str, Any]]:
         """Промты раздела (или всех разделов — с кэшем на минуту).
 
@@ -657,22 +737,28 @@ class KarmanPromptStore:
         засыпается запросами.
         """
         if project:
-            items = self._read_section(project)
+            items = self._read_section_cached(project)
+            if include_archived or only_archived:
+                items = items + self._read_section_cached(project, archived=True)
         else:
-            now = time.time()
-            if now - float(_cache.get("at") or 0) < CACHE_TTL:
-                items = list(_cache.get("records") or [])
-            else:
-                items = []
+            items = []
+            for section in self.sections():
+                try:
+                    items.extend(self._read_section_cached(section))
+                except (KarmanUnavailable, UnknownSection):
+                    continue
+            if include_archived or only_archived:
                 for section in self.sections():
                     try:
-                        items.extend(self._read_section(section))
-                    except KarmanUnavailable:
+                        items.extend(
+                            self._read_section_cached(section, archived=True))
+                    except (KarmanUnavailable, UnknownSection):
                         continue
-                _cache.update({"at": now, "records": list(items)})
-        if include_archived:
-            return items
-        return [item for item in items if not item.get("archived")]
+        if only_archived:
+            return [item for item in items if item.get("archived")]
+        if not include_archived:
+            return [item for item in items if not item.get("archived")]
+        return items
 
     def save(self, project: str, title: str, body: str) -> dict[str, Any]:
         name = (project or "").strip()
@@ -684,8 +770,9 @@ class KarmanPromptStore:
                     "error": "промт не записан: %s" % karman.explain(code)}
         return {"ok": True, "id": str(payload.get("id") or ""), "project": name}
 
-    def archive(self, prompt_id: str, project: str = "") -> dict[str, Any]:
-        """Архивировать в разделе — токеном раздела."""
+    def archive(self, prompt_id: str, project: str = "",
+                archived: bool = True) -> dict[str, Any]:
+        """Архивировать в разделе (или вернуть из архива) — токеном раздела."""
         name = (project or "").strip()
         if not name:
             return {"ok": False, "error": "не указан раздел"}
@@ -700,12 +787,13 @@ class KarmanPromptStore:
         except (TypeError, ValueError):
             return {"ok": False, "error": "плохой id промта"}
         code, payload = karman.call("POST", "/api/prompts/section",
-                                    {"project": name, "id": pid, "archived": True},
+                                    {"project": name, "id": pid,
+                                     "archived": bool(archived)},
                                     token=token)
         if code != 200:
             return {"ok": False,
                     "error": "раздел не принял: %s" % karman.explain(code)}
-        return {"ok": True, "archived": True, "token_source": source}
+        return {"ok": True, "archived": bool(archived), "token_source": source}
 
     def status(self) -> dict[str, Any]:
         secret, source = karman.read_secret()
@@ -714,7 +802,7 @@ class KarmanPromptStore:
             return {"ok": False,
                     "reason": "секрет канала не задан — внешний ресурс недоступен",
                     "sections": []}
-        code, names = karman.list_sections()
+        code, names = self._sections_fetch()
         if code != 200:
             return {"ok": False, "reason": karman.explain(code), "sections": []}
         return {"ok": True, "sections": list(names),
@@ -724,6 +812,15 @@ class KarmanPromptStore:
 
 class KarmanUnavailable(RuntimeError):
     """Внешний ресурс не отдал промты — честное сообщение, а не тишина."""
+
+
+class UnknownSection(RuntimeError):
+    """Такого раздела в библиотеке нет — молчать нельзя.
+
+    Отличается от `KarmanUnavailable`: ресурс **жив**, но раздела в нём нет.
+    Пустой список промтов в этом случае — тишина, а она обманывает: владелец
+    решит, что заданий нет, а их просто нет в этой библиотеке.
+    """
 
 
 def section_secret_name(section: str) -> str:
@@ -786,10 +883,18 @@ def build_task_text(record: dict[str, Any], plan: dict[str, Any] | None = None) 
 
 def find_plan(records: list[dict[str, Any]], record: dict[str, Any]
               ) -> dict[str, Any] | None:
-    """План рядом с промтом (тот же раздел, вид «план»)."""
+    """План рядом с промтом (тот же раздел, вид «план»).
+
+    ⚠️ План выбирается **ближайший по времени** к промту: в разделе может
+    лежать несколько промтов и несколько планов, и «первый попавшийся» план
+    мог принадлежать другому заданию (живой случай 26.11).
+    """
     if record.get("kind") == KIND_PLAN:
         return None
     project = (record.get("project") or "").strip()
+    want = str(record.get("createdAt") or "")
+    best: dict[str, Any] | None = None
+    best_gap = -1
     for item in records:
         if item.get("kind") != KIND_PLAN:
             continue
@@ -797,8 +902,44 @@ def find_plan(records: list[dict[str, Any]], record: dict[str, Any]
             continue
         if item.get("id") == record.get("id"):
             continue
-        return item
-    return None
+        stamp = str(item.get("createdAt") or "")
+        gap = _time_gap(want, stamp)
+        if best is None or gap < best_gap:
+            best = item
+            best_gap = gap
+    return best
+
+
+def _time_gap(left: str, right: str) -> int:
+    """Расстояние между двумя метками времени (мс). Метки не разобрались — 0."""
+    fmt = "%Y-%m-%dT%H:%M:%S"
+    try:
+        text = (left or "").strip().split(".")[0]
+        other = (right or "").strip().split(".")[0]
+        if not text or not other:
+            return 0
+        a = datetime.datetime.strptime(text, fmt)
+        b = datetime.datetime.strptime(other, fmt)
+        return abs(int((a - b).total_seconds() * 1000))
+    except (ValueError, TypeError):
+        return 0
+
+
+def area_busy(mods: dict[str, Any], area: dict[str, Any]) -> bool:
+    """Занята ли область живой сессией.
+
+    ⚠️ План промта #94: автораздача идёт «когда появилось новое задание **и
+    есть свободная область проекта**». Без этой проверки задание уходит в
+    область, где уже идёт работа, — лишние очки и сбитая нитка.
+    """
+    try:
+        verdicts = state.session_verdicts(mods, area) or []
+    except Exception:  # noqa: BLE001
+        return False
+    for verdict in verdicts:
+        if str(verdict.get("verdict") or "") in ("работает", "ход завис"):
+            return True
+    return False
 
 
 def dispatch_to_area(mods: dict[str, Any], area: dict[str, Any],
@@ -831,7 +972,12 @@ def auto_dispatch_scan(mods: dict[str, Any], store: Any,
 
     Раздаётся **только** то, что владелец пометил как «автоматическое»
     (`auto`), и только в область своего проекта. Занятая область ждёт
-    следующего прохода.
+    следующего прохода (план промта #94: «есть **свободная** область
+    проекта»).
+
+    ⚠️ Каждая причина отказа — **в ответе**, а не молчание: владелец должен
+    видеть, почему промт не ушёл (живой случай 26.11: раздел не читался, а
+    молчание выглядело как «заданий нет»).
     """
     out: list[dict[str, Any]] = []
     watcher = mods.get("sessionwatch")
@@ -845,15 +991,25 @@ def auto_dispatch_scan(mods: dict[str, Any], store: Any,
     except Exception:  # noqa: BLE001
         return out
     for area in areas:
+        slug = str(area.get("slug") or "")
         sections = area_sections(area)
         if not sections:
+            continue
+        if area_busy(mods, area):
+            out.append({"id": "", "project": "", "area": slug, "ok": False,
+                        "note": True,
+                        "why": "область занята живой сессией — задание ждёт"})
             continue
         records: list[dict[str, Any]] = []
         seen: set[str] = set()
         for section in sections:
             try:
                 found = store.list_prompts(section)
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                out.append({"id": "", "project": section, "area": slug,
+                            "ok": False, "note": True,
+                            "why": "раздел «%s» не прочитан: %s"
+                                   % (section, exc)})
                 continue
             for record in found:
                 # Раздел может совпасть со слагом и с полем `karman` — один и
@@ -862,11 +1018,6 @@ def auto_dispatch_scan(mods: dict[str, Any], store: Any,
                     continue
                 seen.add(str(record.get("id") or ""))
                 records.append(record)
-        plan = None
-        for record in records:
-            if record.get("kind") == KIND_PLAN:
-                plan = find_plan(records, record)
-                break
         for record in records:
             if record.get("kind") == KIND_PLAN:
                 continue
@@ -877,14 +1028,16 @@ def auto_dispatch_scan(mods: dict[str, Any], store: Any,
                                   record.get("project", ""),
                                   record.get("id", "")):
                 continue
+            # План идёт вместе со **своим** промтом (ближайший по времени).
+            plan = find_plan(records, record)
             res = dispatch_to_area(mods, area, record, plan)
             if res.get("ok"):
                 mark_dispatched(record.get("source", SOURCE_LOCAL),
                                 record.get("project", ""),
-                                record.get("id", ""), area.get("slug") or "")
+                                record.get("id", ""), slug)
             out.append({"id": record.get("id"),
                         "project": record.get("project"),
-                        "area": area.get("slug"),
+                        "area": slug,
                         "ok": bool(res.get("ok")),
                         "why": res.get("why") or res.get("error") or ""})
     return out

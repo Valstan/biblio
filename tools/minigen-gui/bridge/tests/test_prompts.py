@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -88,7 +89,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, {"sections": Handler.sections})
             return
         if self.path.startswith("/api/prompts"):
-            self._send(200, {"prompts": Handler.prompts})
+            # ⚠️ Как настоящий сервис: раздел и архив — **точное** имя и
+            # явный признак. Несовпадение регистра — это «нет промтов»,
+            # а не «все промты».
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            want = (query.get("project") or [""])[0]
+            archived = (query.get("archived") or [""])[0] == "1"
+            items = []
+            for item in Handler.prompts:
+                if want and str(item.get("project") or "") != want:
+                    continue
+                if bool(item.get("archivedAt")) != archived:
+                    continue
+                items.append(item)
+            self._send(200, {"prompts": items})
             return
         self._send(404, {"error": "нет такого пути"})
 
@@ -281,6 +295,49 @@ class DispatchTest(unittest.TestCase):
         self.assertFalse(prompts.already_dispatched("local", SECTION, record["id"],
                                                      self.db))
 
+    def test_auto_dispatch_takes_the_plan_with_the_prompt(self) -> None:
+        """План уходит вместе со своим промтом и в автораздаче тоже."""
+        self.store.save(SECTION, "План: хранилище промтов", "# План\n\nШаги плана.\n")
+        record = self._record()
+        prompts.set_mark("local", SECTION, record["id"], True, self.db)
+        done = prompts.auto_dispatch_scan(self.mods, self.store, {})
+        self.assertTrue([item for item in done if item.get("ok")], done)
+        self.assertEqual(len(self.watcher.sent), 1)
+        self.assertIn("Шаги плана", self.watcher.sent[0]["text"])
+
+    def test_auto_dispatch_skips_a_busy_area(self) -> None:
+        """Занятая область не получает задание — ждёт следующего прохода."""
+        record = self._record()
+        prompts.set_mark("local", SECTION, record["id"], True, self.db)
+        self.watcher.survey = lambda area, _args: [
+            {"verdict": "работает", "session_id": "s1"}]
+        done = prompts.auto_dispatch_scan(self.mods, self.store, {})
+        self.assertEqual(self.watcher.sent, [], "задание ушло в занятую область")
+        notes = [item for item in done if item.get("note")]
+        self.assertTrue(notes, done)
+        self.assertIn("занята", notes[0]["why"])
+
+    def test_auto_dispatch_reports_an_unreadable_section(self) -> None:
+        """Раздел не прочитан ⇒ причина в ответе, а не тишина."""
+
+        class BrokenStore:
+            kind = "karman"
+
+            def sections(self) -> list:
+                return [SECTION]
+
+            def list_prompts(self, project: str = "", **_kwargs) -> list:
+                raise prompts.UnknownSection("раздела «%s» в библиотеке нет"
+                                             % project)
+
+        record = self._record()
+        prompts.set_mark("local", SECTION, record["id"], True, self.db)
+        done = prompts.auto_dispatch_scan(self.mods, BrokenStore(), {})
+        notes = [item for item in done if item.get("note")]
+        self.assertTrue(notes, done)
+        self.assertIn("не прочитан", notes[0]["why"])
+        self.assertEqual(self.watcher.sent, [])
+
 
 # ────────────────────────────────────────────── внешний ресурс (Карман)
 
@@ -319,6 +376,9 @@ class KarmanStoreTest(unittest.TestCase):
 
     def _reset_cache(self) -> None:
         karman._secret_cache.update({"value": "", "source": "", "at": 0.0})
+        prompts._cache.update({"sections": [], "sections_at": 0.0,
+                               "sections_code": 0,
+                               "by_section": {}, "archived_by_section": {}})
 
     def test_store_choice_follows_the_setting(self) -> None:
         """Место хранения переключается настройкой окна."""
@@ -364,6 +424,119 @@ class KarmanStoreTest(unittest.TestCase):
         res = store.archive("95", SECTION)
         self.assertFalse(res["ok"])
         self.assertIn("токена раздела нет", res["error"])
+
+    def test_prompt_can_be_returned_from_the_archive(self) -> None:
+        """Архив — не удаление: заданный по ошибке промт возвращается."""
+        store = prompts.KarmanPromptStore()
+        res = store.archive("94", SECTION, archived=False)
+        self.assertTrue(res["ok"], res)
+        body = Handler.archive_calls[-1]
+        self.assertFalse(body["archived"])
+
+
+class KarmanSectionResolutionTest(unittest.TestCase):
+    """Имя раздела в библиотеке каноническое — слаг области ему не равен.
+
+    Живой случай 26.11 (промт #94): по имени «minigen» (слаг области)
+    приходило **0** промтов, а по каноническому «MiniGen» — 11. Тишина вместо
+    правды: автораздача не находила задания своего проекта.
+    """
+
+    def setUp(self) -> None:
+        Handler.calls = []
+        Handler.prompts = []
+        Handler.archive_calls = []
+        Handler.secret = SECRET
+        Handler.section_token = SECTION_TOKEN
+        Handler.sections = [SECTION, "MatricaRMZ"]
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.tmp = tempfile.TemporaryDirectory()
+        keys = Path(self.tmp.name)
+        (keys / "vault-url").write_text("http://127.0.0.1:%d" % self.port,
+                                        encoding="utf-8")
+        (keys / "room-token").write_text("skm_test-token", encoding="utf-8")
+        self._old_dir = os.environ.get("BIBLIO_KEYS_DIR")
+        os.environ["BIBLIO_KEYS_DIR"] = str(keys)
+        self._reset_cache()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+        if self._old_dir is None:
+            os.environ.pop("BIBLIO_KEYS_DIR", None)
+        else:
+            os.environ["BIBLIO_KEYS_DIR"] = self._old_dir
+        self._reset_cache()
+        self.tmp.cleanup()
+
+    def _reset_cache(self) -> None:
+        karman._secret_cache.update({"value": "", "source": "", "at": 0.0})
+        prompts._cache.update({"sections": [], "sections_at": 0.0,
+                               "sections_code": 0,
+                               "by_section": {}, "archived_by_section": {}})
+
+    def _paths(self) -> list:
+        return [path for method, path, _auth, _body in Handler.calls
+                if method == "GET" and path.startswith("/api/prompts?")]
+
+    def test_section_is_found_by_the_area_slug(self) -> None:
+        """Слаг области («minigen») находит канонический раздел («MiniGen»)."""
+        Handler.prompts.append({"id": 94, "title": TITLE, "body": BODY,
+                                 "project": SECTION,
+                                 "createdAt": "2026-11-24T07:34:00Z"})
+        store = prompts.KarmanPromptStore()
+        items = store.list_prompts("minigen")
+        self.assertEqual(len(items), 1, "по слагу раздел не нашёлся")
+        self.assertEqual(items[0]["id"], "94")
+        self.assertTrue(any("project=MiniGen" in path for path in self._paths()),
+                        "запрос ушёл не по каноническому имени: %s"
+                        % self._paths())
+
+    def test_canonical_section_name(self) -> None:
+        store = prompts.KarmanPromptStore()
+        self.assertEqual(store.canonical_section("minigen"), SECTION)
+        self.assertEqual(store.canonical_section(SECTION), SECTION)
+        self.assertEqual(store.canonical_section("НетТакого"), "")
+
+    def test_unknown_section_is_reported_not_silent(self) -> None:
+        """Раздела нет ⇒ честное сообщение, а не пустой список."""
+        store = prompts.KarmanPromptStore()
+        with self.assertRaises(prompts.UnknownSection):
+            store.list_prompts("НетТакого")
+
+    def test_cyrillic_section_name_does_not_break_the_request(self) -> None:
+        """Кириллица в имени раздела не роняет чтение (живой случай 26.11)."""
+        Handler.sections = ["Раздел"]
+        Handler.prompts.append({"id": 7, "title": "Промт", "body": BODY,
+                                 "project": "Раздел",
+                                 "createdAt": "2026-11-24T07:34:00Z"})
+        store = prompts.KarmanPromptStore()
+        items = store.list_prompts("Раздел")
+        self.assertEqual(len(items), 1, "кириллица в имени раздела уронила чтение")
+        self.assertTrue(any("%" in path for path in self._paths()),
+                        "имя раздела не экранировано: %s" % self._paths())
+
+    def test_archived_prompts_are_read_separately(self) -> None:
+        """Архив виден отдельно — и его можно вернуть в оборот."""
+        Handler.prompts.append({"id": 94, "title": TITLE, "body": BODY,
+                                 "project": SECTION,
+                                 "createdAt": "2026-11-24T07:34:00Z"})
+        Handler.prompts.append({"id": 93, "title": "Старый", "body": BODY,
+                                 "project": SECTION,
+                                 "createdAt": "2026-11-23T07:34:00Z",
+                                 "archivedAt": "2026-11-24T09:00:00Z"})
+        store = prompts.KarmanPromptStore()
+        live = store.list_prompts(SECTION)
+        self.assertEqual([item["id"] for item in live], ["94"])
+        both = store.list_prompts(SECTION, include_archived=True)
+        self.assertEqual(sorted(item["id"] for item in both), ["93", "94"])
+        archived = store.list_prompts(SECTION, include_archived=True,
+                                      only_archived=True)
+        self.assertEqual([item["id"] for item in archived], ["93"])
+        self.assertTrue(archived[0]["archived"])
 
 
 # ──────────────────────────────────────────────── секреты: не в репозитории
@@ -458,6 +631,29 @@ class BridgeCommandTest(unittest.TestCase):
         res = self.fake.cmd_prompts_dispatch({"id": prompt_id, "area": "sarafan"})
         self.assertFalse(res["ok"])
         self.assertIn("уедет не туда", res["error"])
+
+    def test_archive_is_visible_and_reversible(self) -> None:
+        """Архив виден отдельно, и промт из него можно вернуть."""
+        self.fake.cmd_prompts_save({"project": SECTION, "title": TITLE,
+                                    "body": BODY})
+        snap = self.fake.cmd_prompts_list({"project": SECTION})
+        prompt_id = snap["prompts"][0]["id"]
+
+        res = self.fake.cmd_prompts_archive({"id": prompt_id, "project": SECTION})
+        self.assertTrue(res["ok"], res)
+        live = self.fake.cmd_prompts_list({"project": SECTION, "view": "live"})
+        self.assertEqual(live["prompts"], [], "архивный промт остался в выдаче")
+        archive = self.fake.cmd_prompts_list({"project": SECTION,
+                                              "view": "archived"})
+        self.assertEqual(len(archive["prompts"]), 1)
+        self.assertTrue(archive["prompts"][0]["archived"])
+        self.assertEqual(archive["view"], "archived")
+
+        back = self.fake.cmd_prompts_archive({"id": prompt_id, "project": SECTION,
+                                               "archived": False})
+        self.assertTrue(back["ok"], back)
+        live = self.fake.cmd_prompts_list({"project": SECTION, "view": "live"})
+        self.assertEqual(len(live["prompts"]), 1, "промт не вернулся в оборот")
 
 
 if __name__ == "__main__":
