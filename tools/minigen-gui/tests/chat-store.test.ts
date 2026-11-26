@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest'
-import type { ChatMessage } from '../src/shared/types'
+import type { ChatMessage, PendingAction } from '../src/shared/types'
 import * as chatStore from '../src/renderer/src/tabs/chat-store'
 
 /**
@@ -60,5 +60,45 @@ describe('стор переписки', () => {
     off()
     chatStore.setMessages([user])
     expect(count).toBe(3)
+  })
+})
+
+describe('ожидающее подтверждение и занятость', () => {
+  const pending: PendingAction = {
+    tool: 'code.commit',
+    args: { branch: 'fix/defect' },
+    reason: 'нужно подтверждение владельца',
+    call_id: 't1'
+  }
+
+  it('подтверждение переживает размонтирование вкладки', () => {
+    const off = chatStore.subscribe(() => undefined)
+    chatStore.setPending(pending)
+    off()
+    // вкладку закрыли (уход на другую вкладку окна) и открыли снова
+    const again = chatStore.subscribe(() => undefined)
+    expect(chatStore.getPending()).toEqual(pending)
+    again()
+  })
+
+  it('занятость переживает размонтирование вкладки', () => {
+    chatStore.setBusy(true)
+    expect(chatStore.getBusy()).toBe(true)
+  })
+
+  it('reset чистит подтверждение и занятость', () => {
+    chatStore.setPending(pending)
+    chatStore.setBusy(true)
+    chatStore.reset()
+    expect(chatStore.getPending()).toBeUndefined()
+    expect(chatStore.getBusy()).toBe(false)
+  })
+
+  it('ссылка на подтверждение стабильна, пока его не сменили', () => {
+    chatStore.setPending(pending)
+    const first = chatStore.getPending()
+    expect(chatStore.getPending()).toBe(first)
+    chatStore.setPending(undefined)
+    expect(chatStore.getPending()).toBeUndefined()
   })
 })

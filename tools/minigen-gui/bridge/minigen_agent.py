@@ -275,6 +275,25 @@ class Agent:
     def _tool_by_name(self, name: str) -> dict[str, Any] | None:
         return next((tool for tool in self.tools if tool["name"] == name), None)
 
+    def _run_tool(self, call: dict[str, Any],
+                  allowed: set[str]) -> Any:
+        """Выполнить вызов инструмента и вернуть его результат.
+
+        Ошибка — тоже результат: модели нужен ответ на **каждый** вызов, и
+        ошибка честнее, чем «вызова не было» (вендор такой ход отвергает).
+        """
+        tool = self._tool_by_name(call["name"])
+        if tool is None:
+            return {"error": "неизвестный инструмент %s" % call["name"]}
+        if tool["name"] not in allowed:
+            # Голос совета работает со своим набором инструментов:
+            # чужой инструмент он не вызывает (даже если выдумал его).
+            return {"error": "инструмент %s в этом ходе недоступен" % call["name"]}
+        try:
+            return self.dispatch(tool["command"], call["input"])
+        except Exception as exc:  # noqa: BLE001
+            return {"error": str(exc)}
+
     # ── основной ход ──
     def ask(self, history: list[dict[str, Any]], user_text: str,
             area_slug: str = "minigen", model: str = "",
@@ -473,20 +492,46 @@ class Agent:
             if not tool_calls:
                 return {"status": "done", "text": text, "calls": calls,
                         "history": messages}
-            # Сначала проверяем все вызовы: если среди них опасный — не
-            # выполняем ничего и отдаём решение владельцу.
-            dangerous = next((call for call in tool_calls
-                              if (self._tool_by_name(call["name"]) or {}).get("dangerous")),
-                             None)
-            if dangerous is not None:
-                tool = self._tool_by_name(dangerous["name"]) or {}
+            # ⚠️ Протокол вендора (проверено живой пробой 26.11): на **каждый**
+            # вызов модели в ходе должен прийти ответ (`tool_result`). Если
+            # вызовов было два, а ответ один — вендор отвечает 400
+            # «tool call and result not match (2013)», и ход умирает.
+            # Опасные вызовы ждут владельца, поэтому ответ на них известен
+            # не сразу ⇒ ход модели уходит вендору только после того, как
+            # подтверждены (или отменены) **все** опасные вызовы.
+            dangerous = [call for call in tool_calls
+                         if (self._tool_by_name(call["name"]) or {}).get("dangerous")]
+            if dangerous:
+                # безопасные вызовы этого хода выполняем сейчас — они и не
+                # требуют подтверждения; опасные ждут.
+                results = []
+                for call in tool_calls:
+                    if any(call is item for item in dangerous):
+                        continue
+                    result = self._run_tool(call, allowed)
+                    calls.append({"tool": call["name"], "args": call["input"],
+                                  "result": _safe(result)})
+                    results.append((call, result))
+                tool = self._tool_by_name(dangerous[0]["name"]) or {}
                 self.pending = {
-                    "tool": dangerous["name"],
-                    "args": dangerous["input"],
+                    "tool": dangerous[0]["name"],
+                    "args": dangerous[0]["input"],
                     "reason": tool.get("confirm_hint") or
                               "действие требует подтверждения владельца",
-                    "call_id": dangerous["id"],
-                    "messages": messages,
+                    "call_id": dangerous[0]["id"],
+                    # ход модели целиком — его вернём вендору с ответами
+                    "blocks": blocks,
+                    # все опасные вызовы хода: подтверждаем по одному
+                    "dangerous": dangerous,
+                    # порядок вызовов модели: ответы на вызовы уходят вендору
+                    # в том же порядке, в каком модель их вызвала
+                    "tool_calls": tool_calls,
+                    # результаты безопасных вызовов (уже выполнены)
+                    "results": results,
+                    # история **без** хода модели: ход вернём вместе с
+                    # ответами на вызовы — иначе вендор увидит вызов без
+                    # ответа и откажет.
+                    "messages": list(messages[:-1]),
                     "cfg": cfg,
                     "calls": calls,
                 }
@@ -494,25 +539,14 @@ class Agent:
                         "calls": calls, "text": text, "history": messages}
             results = []
             for call in tool_calls:
-                tool = self._tool_by_name(call["name"])
-                if tool is None:
-                    result: Any = {"error": "неизвестный инструмент %s" % call["name"]}
-                elif tool["name"] not in allowed:
-                    # Голос совета работает со своим набором инструментов:
-                    # чужой инструмент он не вызывает (даже если выдумал его).
-                    result = {"error": "инструмент %s в этом ходе недоступен"
-                              % call["name"]}
-                else:
-                    try:
-                        result = self.dispatch(tool["command"], call["input"])
-                    except Exception as exc:  # noqa: BLE001
-                        result = {"error": str(exc)}
+                result = self._run_tool(call, allowed)
                 calls.append({"tool": call["name"], "args": call["input"],
-                              "result": _trim(result)})
+                              "result": _safe(result)})
                 results.append((call, result))
             messages.append({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": call["id"],
-                 "content": json.dumps(_trim(result), ensure_ascii=False)}
+                 "content": json.dumps(_trim(result), ensure_ascii=False,
+                                       default=str)}
                 for call, result in results
             ]})
         return {"status": "done",
@@ -524,28 +558,82 @@ class Agent:
 
     def confirm(self, approved: bool, history: list[dict[str, Any]],
                 area_slug: str = "minigen", model: str = "") -> dict[str, Any]:
-        """Владелец подтвердил (или отклонил) отложенное действие."""
+        """Владелец подтвердил (или отклонил) отложенное действие.
+
+        ⚠️ Опасных вызовов в ходе может быть несколько — подтверждаются по
+        одному (каждый отдельный ответ владельца). Ход модели уходит вендору
+        только когда подтверждены **все** опасные вызовы: на каждый вызов
+        модели нужен ответ, иначе вендор отвечает 400 «tool call and result
+        not match (2013)» (живая проба 26.11).
+
+        ⚠️ Отмена — без хода модели: действие не сделано, ход вендору не
+        уходит, владелец видит «действие отменено владельцем» и решает дальше
+        (проверено тестом `test_dangerous_tool_can_be_declined`).
+        """
         pending = self.pending
-        self.pending = None
         if not pending:
             return {"status": "error", "error": "нечего подтверждать", "calls": []}
-        if not approved:
+        queue = list(pending.get("dangerous") or [])
+        if not queue:
+            # отложенный вызов без очереди (старый вид) — подтверждаем один
+            queue = [{"name": pending.get("tool"), "input": pending.get("args") or {},
+                      "id": pending.get("call_id") or pending.get("tool")}]
+        current = queue[0]
+        rest = queue[1:]
+        results = list(pending.get("results") or [])
+        calls = list(pending.get("calls") or [])
+        if approved:
+            tool = self._tool_by_name(current["name"])
+            if tool is None:
+                result: Any = {"error": "инструмент исчез"}
+            else:
+                try:
+                    result = self.dispatch(tool["command"], current["input"])
+                except Exception as exc:  # noqa: BLE001
+                    result = {"error": str(exc)}
+            calls.append({"tool": current["name"], "args": current["input"],
+                          "result": _safe(result), "approved": True})
+        else:
+            # Отмена — ход модели вендору не уходит (ответ на вызов не нужен,
+            # если вызова не было). Опасные вызовы хода отменяются все.
+            for item in queue:
+                calls.append({"tool": item["name"], "args": item["input"],
+                              "result": {"cancelled": True,
+                                         "note": "владелец отменил действие"},
+                              "approved": False})
+            self.pending = None
             return {"status": "done", "text": "действие отменено владельцем",
-                    "calls": pending.get("calls") or [], "history": history}
-        tool = self._tool_by_name(pending["tool"])
-        if tool is None:
-            return {"status": "error", "error": "инструмент исчез", "calls": []}
-        try:
-            result = self.dispatch(tool["command"], pending["args"])
-        except Exception as exc:  # noqa: BLE001
-            result = {"error": str(exc)}
-        call = {"tool": pending["tool"], "args": pending["args"],
-                "result": _trim(result), "approved": True}
-        calls = list(pending.get("calls") or []) + [call]
+                    "calls": calls, "history": history}
+        results.append((current, result))
+        if rest:
+            # опасных вызовов было несколько — спрашиваем по одному.
+            # ⚠️ Баннер в окне показывает **текущий** вызов: имя, аргументы и
+            # причину берём у следующего в очереди, а не у первого.
+            nxt = rest[0]
+            nxt_tool = self._tool_by_name(nxt["name"]) or {}
+            self.pending = {**pending, "dangerous": rest, "results": results,
+                            "calls": calls,
+                            "tool": nxt["name"], "args": nxt["input"],
+                            "call_id": nxt["id"],
+                            "reason": nxt_tool.get("confirm_hint") or
+                                      pending.get("reason") or
+                                      "действие требует подтверждения владельца"}
+            return {"status": "confirm", "pending": _pending_view(self.pending),
+                    "calls": calls,
+                    "text": "ждёт подтверждения: %s" % self.pending["tool"],
+                    "history": history}
+        self.pending = None
+        # Собираем сообщение для вендора: ход модели и ответ на **каждый**
+        # его вызов (безопасные — уже выполнены, опасный — подтверждён).
+        # ⚠️ Порядок ответов — как порядок вызовов модели (живая проба 26.11:
+        # вендор сверяет вызов с ответом по порядку и по id).
+        ordered = _ordered_results(pending.get("tool_calls") or [], results)
         messages = list(pending.get("messages") or history)
+        messages.append({"role": "assistant", "content": pending.get("blocks") or []})
         messages.append({"role": "user", "content": [
-            {"type": "tool_result", "tool_use_id": pending.get("call_id") or pending["tool"],
-             "content": json.dumps(_trim(result), ensure_ascii=False)}
+            {"type": "tool_result", "tool_use_id": call["id"],
+             "content": json.dumps(_trim(result), ensure_ascii=False, default=str)}
+            for call, result in ordered
         ]})
         messages.append({"role": "user",
                          "content": "владелец подтвердил действие, продолжай."})
@@ -554,12 +642,47 @@ class Agent:
 
 
 def _pending_view(pending: dict[str, Any]) -> dict[str, Any]:
+    """Вид ожидающего подтверждения для окна.
+
+    ⚠️ Показывается **текущий** вызов очереди (первый), а не первый попавшийся.
+    """
+    queue = list(pending.get("dangerous") or [])
+    current = queue[0] if queue else {}
     return {
-        "tool": pending.get("tool"),
-        "args": pending.get("args") or {},
+        "tool": current.get("name") or pending.get("tool"),
+        "args": current.get("input") if current.get("input") is not None
+                else (pending.get("args") or {}),
         "reason": pending.get("reason") or "",
-        "call_id": pending.get("call_id") or "",
+        "call_id": current.get("id") or pending.get("call_id") or "",
     }
+
+
+def _ordered_results(tool_calls: list[dict[str, Any]],
+                     results: list[tuple[dict[str, Any], Any]]
+                     ) -> list[tuple[dict[str, Any], Any]]:
+    """Ответы на вызовы — в том же порядке, в каком модель их вызвала.
+
+    ⚠️ Вендор сверяет вызов с ответом (живая проба 26.11: «tool call and result
+    not match (2013)»). Безопасные вызовы выполняются раньше опасных, поэтому
+    порядок по умолчанию может не совпасть с порядком вызовов модели — здесь он
+    приводится к правильному.
+    """
+    if not tool_calls:
+        return list(results)
+    by_id: dict[Any, Any] = {}
+    for call, result in results:
+        by_id.setdefault(call.get("id"), (call, result))
+    ordered: list[tuple[dict[str, Any], Any]] = []
+    taken: set[Any] = set()
+    for call in tool_calls:
+        key = call.get("id")
+        if key in by_id and key not in taken:
+            ordered.append(by_id[key])
+            taken.add(key)
+    for call, result in results:
+        if call.get("id") not in taken:
+            ordered.append((call, result))
+    return ordered
 
 
 def _trim(value: Any, limit: int = TOOL_RESULT_LIMIT) -> Any:
@@ -573,3 +696,21 @@ def _trim(value: Any, limit: int = TOOL_RESULT_LIMIT) -> Any:
     if len(text) <= limit:
         return value
     return {"truncated": True, "preview": text[:limit]}
+
+
+def _safe(value: Any) -> Any:
+    """Значение, которое можно положить в JSON без потери формы.
+
+    ⚠️ Результат инструмента владелец видит **целиком** (промт #129: подробности
+    не выбрасываются), а обрезка живёт только в контексте модели. Поэтому здесь
+    значение приводится к JSON-безопасному виду: несериализуемое — строкой,
+    структура — сохраняется.
+    """
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except (TypeError, ValueError):
+        try:
+            return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+        except (TypeError, ValueError):
+            return str(value)

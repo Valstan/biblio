@@ -560,6 +560,25 @@ td.actions {
   color: var(--muted);
 }
 
+/* Подтверждение опасного действия: аргументы — в свёртке (промт #129), */
+/* сырой JSON по умолчанию не виден, а открывается по клику.             */
+.pending-args > summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 4px;
+}
+
+.pending-args pre.args {
+  margin: 4px 0 0;
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--muted);
+  max-height: 240px;
+  overflow: auto;
+}
+
 .chat-input input {
   flex: 1;
 }
