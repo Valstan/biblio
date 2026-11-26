@@ -7,6 +7,7 @@ import {
   callsSummary,
   greetingMessage,
   pendingArgs,
+  pendingNote,
   restoreMessages
 } from '../src/renderer/src/tabs/chat-view'
 
@@ -87,6 +88,23 @@ describe('подтверждение опасного действия', () => {
     expect(
       pendingArgs({ tool: 'code.pr', args: {}, reason: '', call_id: 't2' })
     ).toBe('{}')
+  })
+
+  it('действие, ждавшее ответа до перезапуска окна, помечено честно', () => {
+    const note = pendingNote({
+      tool: 'code.commit',
+      args: {},
+      reason: 'коммит требует подтверждения владельца',
+      call_id: 't1',
+      restored: true
+    })
+    expect(note).toContain('до перезапуска окна')
+  })
+
+  it('свежее действие не помечается: это не старый вопрос', () => {
+    expect(
+      pendingNote({ tool: 'code.commit', args: {}, reason: '', call_id: 't1' })
+    ).toBe('')
   })
 })
 

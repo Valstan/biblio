@@ -69,6 +69,17 @@ class _FakeAgent:
                 "calls": [{"tool": "code.pr", "args": {}, "result": {"ok": True}}],
                 "history": list(history)}
 
+    # ⚠️ Ожидающее подтверждение (промт #129): мост спрашивает у агента снимок
+    # после каждого хода — заглушка отвечает «ждать некого».
+    def pending_view(self):
+        return None
+
+    def pending_snapshot(self):
+        return None
+
+    def restore_pending(self, snapshot):
+        return False
+
 
 class _FakeCore:
     def refresh_env(self) -> None:
