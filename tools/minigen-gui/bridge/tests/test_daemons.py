@@ -364,6 +364,25 @@ class OneScanTest(unittest.TestCase):
         self.assertNotIn("minimax-orphans.py", found,
                          "чужой скрипт не должен попадать в список демонов")
 
+    def test_quoted_path_is_still_a_daemon(self) -> None:
+        """Путь в кавычках (пробел в пути) — демон, а не «мёртвый»."""
+        lines = (
+            "700|python \"C:\\Program Files\\МиниГен\\bin\\minimax-autheal.py\"\n")
+        daemons._ps = lambda cmd, timeout=30: lines
+        found = daemons.daemon_pids_all()
+        self.assertEqual(found.get("minimax-autheal.py"), [700],
+                         "путь в кавычках — это демон")
+
+    def test_quoted_one_shot_is_not_a_daemon(self) -> None:
+        """Разовый вызов с кавычками в конце — всё равно не демон."""
+        lines = (
+            "700|python \"C:\\Program Files\\МиниГен\\bin\\minimax-autheal.py\" "
+            "--send brain mvs_1 \"текст\"\n")
+        daemons._ps = lambda cmd, timeout=30: lines
+        found = daemons.daemon_pids_all()
+        self.assertFalse(found.get("minimax-autheal.py"),
+                         "разовый вызов с аргументами демоном не считается")
+
     def test_status_is_cached(self) -> None:
         """Повторный вопрос про демонов не идёт в WMI (кэш `STATUS_TTL`)."""
         daemons._ps = self.fake_ps
