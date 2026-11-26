@@ -238,6 +238,103 @@ def load_switch():
     return mod
 
 
+_points_cache = {}
+
+
+def load_points():
+    """Модуль watchdog'а очков (`minimax-points.py`) — **мягкая зависимость**.
+
+    Без него лечащий работает как раньше (реактивно, по 50110). С ним
+    появляется опережающий сигнал «расход близок к порогу» и проба аккаунта
+    при установке.
+
+    ⚠️ Модуль лежит рядом с лечащим: и в репозитории, и в боевой папке.
+    """
+    if "mod" in _points_cache:
+        return _points_cache["mod"]
+    path = Path(__file__).resolve().parent / "minimax-points.py"
+    if path.is_file():
+        try:
+            spec = importlib.util.spec_from_file_location("minimax_points", str(path))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _points_cache["mod"] = mod
+            return mod
+        except Exception as exc:  # noqa: BLE001
+            log("watchdog очков не подключился (%s: %s) — работаю без него" % (
+                type(exc).__name__, exc))
+    _points_cache["mod"] = False
+    return _points_cache["mod"]
+
+
+def points_probe(area_dir: Path) -> tuple:
+    """Проба аккаунта области: один дешёвый запрос к модели.
+
+    Возвращает (статус, пояснение): ``ok`` / ``exhausted`` / ``invalid`` /
+    ``unknown``. Сетевая ошибка — это ``unknown``, а НЕ «кончились очки»
+    (урок 21.11: «fetch failed» = мёртвый порт прокси, аккаунт при этом цел).
+    """
+    mod = load_points()
+    if not mod:
+        return "unknown", "watchdog очков не установлен"
+    try:
+        return mod.probe(area_dir)
+    except Exception as exc:  # noqa: BLE001
+        return "unknown", "проба не прошла: %s: %s" % (type(exc).__name__, exc)
+
+
+def points_low(area_dir: Path, slug: str) -> str:
+    """Расход аккаунта близок к порогу? Пусто — всё в порядке.
+
+    ⚠️ Без сети: в горячем пути (раз в 10 с на область) поход в панель вендора
+    встал бы в очередь всем областям. Номинал очков берётся из кэша, который
+    заполняется при установке аккаунта.
+    """
+    mod = load_points()
+    if not mod:
+        return ""
+    try:
+        info = mod.usage(area_dir, slug, network=False)
+    except Exception:  # noqa: BLE001
+        return ""
+    if str(info.get("verdict")) == "почти без очков":
+        return str(info.get("why") or "расход близок к порогу")
+    return ""
+
+
+def points_learn(area_dir: Path, slug: str) -> None:
+    """Запомнить расход аккаунта в момент отказа — порог учится на своих."""
+    mod = load_points()
+    if not mod:
+        return
+    try:
+        mod.learn_current(area_dir, slug)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def points_installed_at(area_dir: Path, slug: str) -> int:
+    """Когда текущий аккаунт встал в область (мс). 0 — неизвестно."""
+    mod = load_points()
+    if not mod:
+        return 0
+    try:
+        return int(mod.account_installed_at(area_dir, slug) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def points_remember(email: str, points: int) -> None:
+    """Запомнить номинал очков аккаунта (панель уже ответила)."""
+    mod = load_points()
+    if not mod:
+        return
+    try:
+        mod.remember_points(email, points)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _cfg_cache = {}
 
 
@@ -732,13 +829,29 @@ def pull_account(switch, area: dict):
         # Токен должен ещё и приниматься вендором: если Карман отдал «не тот»
         # токен (или мёртвый), панель вендора ответит 401 — такой не оставляем.
         tok = rec.get("accessToken") or ""
-        status, _payload = switch.panel(tok)
+        status, payload = switch.panel(tok)
         if status != 200:
             log("%s: вендор не принимает выданный токен (HTTP %s) — пробую следующий" % (
                 area["title"], status))
             continue
-        return 0, "аккаунт %s, токен жив ещё %.0f мин, вендор отвечает 200" % (
-            rec.get("email"), life)
+        # Номинал очков нового аккаунта — запоминаем: по нему выбирается порог
+        # расхода (400 или 1000 очков — разные пороги).
+        try:
+            cell = switch.today_cell(payload) if hasattr(switch, "today_cell") else {}
+            points_remember(str(rec.get("email") or ""), int(cell.get("points") or 0))
+        except Exception:  # noqa: BLE001
+            pass
+        # ⚠️ ПРОБА АККАУНТА. Панель показывает дневной **грант**, а не остаток:
+        # аккаунт, у которого очки уже кончились, от панели неотличим (проверено
+        # на живых данных 26.11). Один дешёвый запрос к модели отвечает честно.
+        # «unknown» (сеть/вендор недоступны) — не повод отвергать аккаунт.
+        probe_status, probe_why = points_probe(area["dir"])
+        if probe_status in ("exhausted", "invalid"):
+            log("%s: аккаунт негодный (проба: %s) — беру следующий" % (
+                area["title"], probe_why))
+            continue
+        return 0, "аккаунт %s, токен жив ещё %.0f мин, вендер отвечает 200, проба: %s" % (
+            rec.get("email"), life, probe_status)
     return 4, "Карман %d раз подряд отдал негодный токен — нужен живой аккаунт" % MAX_PULL_TRIES
 
 
@@ -802,6 +915,7 @@ def diagnose(area: dict) -> dict:
             out["failure"] = mem_at
             out["reason"] = mem.get("why") or "отказ по очкам (помечен ранее)"
             out["tier"] = "T1"
+            points_learn(area["dir"], area["slug"])
             return out
 
     hit = vendor_balance_failure(area["dir"], install, since)
@@ -811,6 +925,7 @@ def diagnose(area: dict) -> dict:
         out["reason"] = hit[1]
         out["tier"] = "T1"
         _remember_failure(area["slug"], hit[0], hit[1], hit[2] if len(hit) > 2 else "")
+        points_learn(area["dir"], area["slug"])
         return out
     # ⚠️ ПОРЯДОК ПРОВЕРОК (23.11, разбор «Матрицы РМЗ 2»): «потеря входа»
     # проверяется **ПЕРЕД** «подозрением». «Подозрение» — это про вендора/сеть, и
@@ -826,6 +941,16 @@ def diagnose(area: dict) -> dict:
         out["verdict"] = "ПОТЕРЯН ВХОД"
         out["reason"] = lost
         out["tier"] = "T3"
+        return out
+    # T4 (watchdog очков): расход аккаунта близок к порогу ⇒ меняем аккаунт
+    # ДО того, как провайдер откажет. Проверка локальная (счёт по базе
+    # рантайма), поэтому она идёт до «подозрения» (T2 — это про вендора/сеть)
+    # и не зависит от того, видит ли область интернет.
+    low = points_low(area["dir"], area["slug"])
+    if low:
+        out["verdict"] = "ПОЧТИ БЕЗ ОЧКОВ"
+        out["reason"] = low
+        out["tier"] = "T4"
         return out
     maybe = silent_failure(area["dir"], install, since)
     if maybe:
@@ -1730,7 +1855,7 @@ def heal(area: dict, switch, force: bool = False) -> bool:
     # Сначала — есть ли что лечить. Иначе в журнал идёт «пропуск — кулдаун»
     # даже для исправной области, и это выглядит как «автоматика пропустила».
     diag = diagnose(area)
-    if diag["verdict"] not in ("ОТКАЗ ПО ОЧКАМ", "ПОТЕРЯН ВХОД", "подозрение"):
+    if diag["verdict"] not in ("ОТКАЗ ПО ОЧКАМ", "ПОТЕРЯН ВХОД", "ПОЧТИ БЕЗ ОЧКОВ", "подозрение"):
         # Молчим, если ничего не изменилось: при паузе 15 с иначе журнал
         # забьётся одинаковыми строками и спрячет важное.
         prev = _last_verdict.get(slug)
@@ -1781,6 +1906,14 @@ def heal(area: dict, switch, force: bool = False) -> bool:
         # это случилось 17.11 с Мозгом: в 11:00 мы вылечили его (id=30), тот
         # аккаунт сдох за 5 минут, и ещё 25 минут лечащий молчал «кулдаун».
         fresh = (diag["verdict"] == "ПОТЕРЯН ВХОД") or (diag.get("failure", 0) > last * 1000)
+        if diag["verdict"] == "ПОЧТИ БЕЗ ОЧКОВ":
+            # ⚠️ T4 (watchdog): «почти без очков» — это про ТЕКУЩИЙ аккаунт.
+            # Если его поставили ПОСЛЕ нашего прошлого лечения, кулдаун ждать
+            # нельзя: этот аккаунт мы и так уже сожгли, следующий надо брать
+            # сейчас. Если аккаунт старый (поставлен до лечения) — расход мог
+            # набежать и до него, и кулдаун остаётся в силе.
+            inst = points_installed_at(area["dir"], area["slug"])
+            fresh = bool(inst and inst > last * 1000)
         if not (fresh and gap >= EARLY_REHEAL_GAP):
             log("%s: пропуск — кулдаун (лечили %d с назад, осталось %d с; вердикт: %s)" % (
                 area["title"], int(gap), int(COOLDOWN - gap), diag["verdict"]))
@@ -1814,7 +1947,7 @@ def heal(area: dict, switch, force: bool = False) -> bool:
             return False
         diag["verdict"] = "ОТКАЗ ПО ОЧКАМ"
 
-    if diag["verdict"] not in ("ОТКАЗ ПО ОЧКАМ", "ПОТЕРЯН ВХОД"):
+    if diag["verdict"] not in ("ОТКАЗ ПО ОЧКАМ", "ПОТЕРЯН ВХОД", "ПОЧТИ БЕЗ ОЧКОВ"):
         log("%s: лечить нечего (%s)" % (area["title"], diag["reason"]))
         return False
 
