@@ -4,6 +4,7 @@ import type {
   ChatAttachment,
   ChatMessage,
   ChatReply,
+  PendingAction,
   CloneStatus,
   CopyFirstRunSnapshot,
   CopyMode,
@@ -88,6 +89,10 @@ export const api = {
   chatConfirm: (approved: boolean) => call<ChatReply>('chat.confirm', { approved }),
   // История чата с диска машины: переписка не теряется при перезапуске окна.
   chatHistory: () => call<{ messages: ChatMessage[]; path?: string }>('chat.history'),
+  // Ожидающее подтверждение опасного действия: переживает перезапуск окна
+  // (промт #129) — иначе вопрос владельцу исчезает молча.
+  chatPending: () =>
+    call<{ pending?: PendingAction; restored?: boolean }>('chat.pending'),
   chatReset: () => call<{ ok: boolean }>('chat.reset'),
   daemonsStatus: () => call<DaemonStatus>('daemons.status'),
   programVersion: () => call<ProgramVersion>('program.version'),

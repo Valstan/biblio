@@ -50,6 +50,7 @@ import minigen_genes as genes_mod      # noqa: E402
 import minigen_copy as copy_mod        # noqa: E402
 import minigen_token as token_mod      # noqa: E402
 import minigen_chat_store as chat_store  # noqa: E402
+import minigen_pending as pending_store  # noqa: E402 — ожидающее подтверждение на диске
 import minigen_files as files_mod      # noqa: E402
 import minigen_map as map_mod          # noqa: E402
 import minigen_update as update_mod    # noqa: E402
@@ -201,6 +202,10 @@ class Bridge:
             self.chat_history = chat_store.agent_history(chat_store.load())
         except Exception:  # noqa: BLE001
             self.chat_history = []
+        # ⚠️ Ожидающее подтверждение опасного действия — тоже на диске
+        # (промт #129): иначе перезапуск окна **молча съедает** вопрос
+        # владельцу («подтвердите действие»), а действие не выполняется.
+        self._pending_from_disk = self.agent.restore_pending(pending_store.load())
         self._points: dict[str, dict[str, Any]] = {}
         self._points_at: dict[str, int] = {}
         self._points_lock = threading.Lock()
@@ -361,6 +366,9 @@ class Bridge:
             # видимая история чата с диска (промт #129): переписка не теряется
             # при перезапуске окна
             "chat.history": self.cmd_chat_history,
+            # ожидающее подтверждение опасного действия (промт #129): переживает
+            # перезапуск окна, иначе вопрос владельцу исчезает молча
+            "chat.pending": self.cmd_chat_pending,
             # файлы оператора: чтение файла, приложенного к чату (промт #90)
             "files.read": self.cmd_files_read,
             "app.open_folder": self.cmd_open_folder,
@@ -1198,7 +1206,25 @@ class Bridge:
                     "text": "", "calls": []}
         if result.get("status") == "done":
             self.chat_history = self._trim_history(result.get("history") or [])
+        self._save_pending()
         return state.jsonable(self._remember_reply(result))
+
+    def _save_pending(self) -> None:
+        """Ожидающее подтверждение — на диск (переживает перезапуск окна).
+
+        ⚠️ Пишем после **каждого** хода чата: подтверждение может появиться,
+        исчезнуть или смениться (опасных вызовов в ходе может быть несколько —
+        они подтверждаются по одному). Пустое ожидание ⇒ файл стирается.
+        """
+        snapshot = self.agent.pending_snapshot()
+        self._pending_from_disk = False
+        if snapshot is None:
+            pending_store.clear()
+            return
+        if not pending_store.save(snapshot):
+            # Честно: подтверждение не переживёт перезапуск — говорим в журнал.
+            self.core.log("ЧАТ: ожидающее подтверждение не сохранено на диск "
+                          "(ход велик) — после перезапуска окна его не будет")
 
     @staticmethod
     def _attachment_task(notes: list[dict[str, Any]]) -> str:
@@ -1358,13 +1384,30 @@ class Bridge:
         result = self.agent.confirm(approved, self.chat_history, area_slug, model)
         if result.get("status") == "done":
             self.chat_history = self._trim_history(result.get("history") or [])
+        self._save_pending()
         return state.jsonable(self._remember_reply(result))
+
+    def cmd_chat_pending(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Ожидающее подтверждение после перезапуска окна (или пусто).
+
+        ⚠️ Окно спрашивает это **один раз** при старте: если действие ждало
+        подтверждения и мост перезапустился, владелец снова увидит вопрос
+        (промт #129). `restored` — честная пометка: это действие ждало ответа
+        **до** перезапуска окна.
+        """
+        view = self.agent.pending_view()
+        if not view:
+            return {"pending": None, "restored": False}
+        return {"pending": state.jsonable(view),
+                "restored": bool(self._pending_from_disk)}
 
     def cmd_chat_reset(self, args: dict[str, Any]) -> dict[str, Any]:
         """Очистить переписку: и в памяти, и в файле на диске."""
         self.chat_history = []
         self.agent.pending = None
+        self._pending_from_disk = False
         chat_store.clear()
+        pending_store.clear()
         return {"ok": True}
 
     def cmd_chat_history(self, args: dict[str, Any]) -> dict[str, Any]:
