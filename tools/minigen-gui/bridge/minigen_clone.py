@@ -85,13 +85,41 @@ def copy_repo_name(instance_id: str = "") -> str:
     return "%s-%s" % (COPY_REPO_PREFIX, ident or "copy")
 
 
+def publish_settings(mode: str = "", repo: str = "", instance_id: str = "") -> dict[str, Any]:
+    """Опубликовать в настройках, кто эта копия и где она работает.
+
+    ⚠️ Это **правда о копии**, а не её секрет: режим работы, имя своего
+    репозитория (в режиме «свой репозиторий») и папка копии в общем
+    репозитории программы. Значения токена здесь нет и быть не должно —
+    токен лежит в сторе на машине, а в настройках только путь и отпечаток
+    (`copyTokenPath`, `copyTokenId` — их пишет модуль токена).
+
+    Настройки — не источник правды: режим живёт и в родословной копии
+    (`instance.json`), поэтому сброс настроек ничего не ломает.
+    """
+    patch = {
+        "copyMode": str(mode or ""),
+        "copyRepo": str(repo or ""),
+        "copyTokenFolder": lineage.copies_folder(instance_id),
+    }
+    try:
+        import minigen_state as state
+        state.write_settings(patch)
+    except Exception:  # noqa: BLE001
+        pass        # настройки — не критично: режим виден и в родословной
+    return patch
+
+
 def _safe_ident(value: str) -> str:
-    """Идентификатор копии, пригодный для пути (ветка и папка)."""
-    raw = "".join(ch for ch in str(value or "")
-                  if ch.isalnum() or ch in "-_.").strip()
-    if not raw or raw in (".", "..") or ".." in raw:
-        return "copy"
-    return raw
+    """Идентификатор копии, пригодный для пути (ветка и папка).
+
+    ⚠️ Правило — в родословной (`lineage.safe_ident`): папка копии в общем
+    репозитории и папка, под которую выпущен токен, — это **одна и та же
+    строка**. Если бы тут было другое правило, копия завела бы папку
+    `copies/copy`, а токен был бы выпущен под `copies/copy-<отпечаток>/` —
+    и доступ к своей же папке не сошёлся бы.
+    """
+    return lineage.safe_ident(value)
 
 
 def _owner_of(slug: str) -> str:
@@ -393,6 +421,7 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
     if mode == "local":
         import minigen_copy
         local = minigen_copy.ensure_local_repo()
+        publish_settings(mode="local", repo="")
         return {"ok": bool(local.get("ok")), "mode": "local",
                 "repo": local.get("repo") or "",
                 "steps": [{"what": "локальный репозиторий",
@@ -530,6 +559,11 @@ def setup(upstream: str = DEFAULT_UPSTREAM, pool: str = DEFAULT_POOL,
     data["fork_of"] = data.get("fork_of") or {"commit": "", "installed_at": 0}
     lineage._write_json(lineage.INSTANCE_FILE, data)
     lineage.record("clone", repo=repo_name, upstream=upstream, pool=pool, mode=mode)
+    # 5a) настройки программы: режим, свой репозиторий (если он есть) и
+    #     папка копии в общем репозитории. Значения токена здесь нет —
+    #     только путь и отпечаток (их пишет модуль токена).
+    publish_settings(mode=mode, repo=("" if shared else repo_name),
+                     instance_id=instance_id)
 
     # 6) копия появилась на карте: «в какой точке родилась» — это коммит форка.
     #    Пишем в пул, чтобы карта была общей: каждая копия дописывает в неё
