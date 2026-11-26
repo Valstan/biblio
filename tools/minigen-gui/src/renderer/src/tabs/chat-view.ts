@@ -9,7 +9,7 @@
  * приёмка правилом, а не «на глаз».
  */
 
-import type { ChatMessage, ChatReply, ToolCall } from '@shared/types'
+import type { ChatMessage, ChatReply, PendingAction, ToolCall } from '@shared/types'
 
 /**
  * Приветствие — локальное системное сообщение: всегда первое, на диск не
@@ -59,6 +59,16 @@ export function callDetails(call: ToolCall): { tool: string; args: string; resul
     args: stringify(call?.args ?? {}),
     result: stringify(call?.result)
   }
+}
+
+/**
+ * Подробности ожидающего подтверждения: аргументы опасного действия.
+ *
+ * ⚠️ Сырой JSON в лице баннера — это «технический блок» (промт #129): владелец
+ * видит, **что** требует подтверждения, а сами аргументы открывает по клику.
+ */
+export function pendingArgs(pending: PendingAction): string {
+  return stringify(pending?.args ?? {})
 }
 
 /**

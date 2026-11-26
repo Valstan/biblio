@@ -7,6 +7,7 @@ import {
   appendMessage,
   callDetails,
   callsSummary,
+  pendingArgs,
   restoreMessages
 } from './chat-view'
 import {
@@ -49,9 +50,13 @@ import {
 export default function ChatTab() {
   // Переписка — из стора модуля: размонтирование вкладки её не стирает.
   const messages = useSyncExternalStore(chatStore.subscribe, chatStore.getMessages)
+  // Ожидающее подтверждение и занятость — **тоже** в сторе (промт #129):
+  // уход на другую вкладку не должен молча съедать вопрос Управляющего
+  // владельцу («подтвердите действие») и не должен оставлять возможность
+  // слать вторую реплику, пока первая ещё думается.
+  const pending = useSyncExternalStore(chatStore.subscribe, chatStore.getPending)
+  const busy = useSyncExternalStore(chatStore.subscribe, chatStore.getBusy)
   const [input, setInput] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [pending, setPending] = useState<ChatReply['pending'] | undefined>(undefined)
   const [catalog, setCatalog] = useState<ModelCatalog | null>(null)
   const [model, setModel] = useState('')
   const [context, setContext] = useState(0)
@@ -68,6 +73,9 @@ export default function ChatTab() {
   // Глубина вложенности при перетаскивании: без неё подсветка мигает над
   // «детьми» зоны (счётчик растёт и падает на каждом элементе внутри).
   const dragDepth = useRef(0)
+  // Сеттеры стора — те же имена, чтобы код хода не менялся по сути.
+  const setBusy = chatStore.setBusy
+  const setPending = chatStore.setPending
 
   const loadCatalog = async () => {
     try {
@@ -272,7 +280,9 @@ export default function ChatTab() {
     const text = input.trim()
     const files = attachments
     // Отправить можно и без текста: задачу сформулирует мост (промт #90).
-    if ((!text && files.length === 0) || busy) return
+    // ⚠️ Пока переписка восстанавливается — отправлять нельзя: ответ моста
+    // вернул бы историю и **затёр** бы реплику, которую владелец уже отправил.
+    if ((!text && files.length === 0) || busy || loadingHistory) return
     setInput('')
     setAttachments([])
     // Реплика владельца попадает в переписку сразу — не дожидаясь моста.
@@ -425,8 +435,13 @@ export default function ChatTab() {
 
       {pending && (
         <div className="banner warn">
-          Требуется подтверждение: <b>{pending.tool}</b> — {pending.reason}{' '}
-          <span className="muted small">{JSON.stringify(pending.args)}</span>
+          Требуется подтверждение: <b>{pending.tool}</b> — {pending.reason}
+          {/* ⚠️ Аргументы — в свёртке (промт #129): владелец видит, **что**
+              требует подтверждения, а технический JSON открывает по клику. */}
+          <details className="pending-args">
+            <summary>Что именно выполняется</summary>
+            <pre className="args">{pendingArgs(pending)}</pre>
+          </details>
           <div className="row">
             <button className="primary" onClick={() => void confirm(true)} disabled={busy}>
               Выполнить
