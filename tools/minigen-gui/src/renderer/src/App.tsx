@@ -15,6 +15,7 @@ import NetworkTab from './tabs/NetworkTab'
 import ChatTab from './tabs/ChatTab'
 import JournalTab from './tabs/JournalTab'
 import GenesTab from './tabs/GenesTab'
+import CuttingsTab from './tabs/CuttingsTab'
 import AgentsTab from './tabs/AgentsTab'
 import PromptsTab from './tabs/PromptsTab'
 import SettingsTab from './tabs/SettingsTab'
@@ -333,6 +334,7 @@ export default function App() {
         {tab === 'genes' && (
           <GenesTab openWorks={openWorks} onWorksClosed={() => setOpenWorks(false)} />
         )}
+        {tab === 'cuttings' && <CuttingsTab onOpenGenes={() => setTab('genes')} />}
         {tab === 'agents' && <AgentsTab />}
         {tab === 'prompts' && <PromptsTab />}
         {tab === 'update' && <UpdateTab />}
