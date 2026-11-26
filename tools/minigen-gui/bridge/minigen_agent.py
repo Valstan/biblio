@@ -45,11 +45,29 @@ DEFAULT_TIMEOUT = 120
 # читаются целиком — иначе модель видит только начало модуля и не может
 # найти нестыковку (окно модели — 1 млн токенов, места хватает).
 TOOL_RESULT_LIMIT = 24_000
-#: Бюджет совета — **свой**, работа его не съедает (живой случай 25.11, проба
-#: самоотладки: при общем бюджете на работу оставалось 4 шага, а задача «найди
-#: дефект и почини» столько не занимает). Совет обсуждает — работа делает;
-#: одно не отменяет другого.
-COUNCIL_ROUNDS = 16
+#: Бюджет совета — **часть бюджета задачи**, а не отдельный счёт.
+#:
+#: ⚠️ Живой случай 25.11 (проба самоотладки): бюджет был общий, и совет съедал
+#: его целиком — на работу оставалось 4 шага, а задача «найди дефект и почини»
+#: (поиск → чтение → ветка → правка → проверки → коммит → PR) столько не
+#: занимает: проба остановилась на «достигнут лимит шагов» и PR не открыла.
+#:
+#: Теперь: совет занимает не больше `COUNCIL_ROUNDS`, работа получает остаток,
+#: но не меньше `WORK_FLOOR`. Итог — раундов на задачу **не больше
+#: `MAX_ROUNDS`** (совет + работа вместе), и работа никогда не остаётся без
+#: шагов. Это и есть приёмка промта #132: «число раундов на задачу не выходит
+#: за `MAX_ROUNDS`».
+#:
+#: ⚠️ Числа — из живых проб 26.11 (см. `docs/SESSION_HANDOFF.md`): работа по
+#: задаче «объясни, как устроен совет» без совета занимает **12** раундов, а
+#: полный совет (3 голоса + 3 исполнителя + судья + секретарь) — не меньше 14.
+#: На 24 раундах обе части не помещаются ⇒ совет получает 12, работа — не
+#: меньше 12. Голосов в бюджет совета помещается два (по два раунда: прочитать
+#: и ответить) — поэтому секретарь зовёт не больше, чем бюджет выдерживает.
+COUNCIL_ROUNDS = 12
+#: Гарантированный запас работы: сколько шагов хода остаётся на работу, сколько
+#: бы совет ни занял. Живой случай 25.11 оставил 4 — этого не хватало.
+WORK_FLOOR = 12
 
 
 class ModelUnavailable(RuntimeError):
@@ -307,6 +325,10 @@ class Agent:
         Продолжения нитки («Продолжай») совет не зовёт — он по этой задаче уже
         отработал.
 
+        ⚠️ Бюджет: совет и работа делят **один** бюджет задачи (`MAX_ROUNDS`).
+        Совет занимает часть и оставляет работе гарантированный запас
+        (`WORK_FLOOR`) — см. `COUNCIL_ROUNDS`.
+
         ⚠️ `note` — подсказка на **один ход** (сводка отчётов сторожей, заказ
         24.11). Она попадает в системную подсказку хода, а **не** в историю
         сообщений: отчёты сторожей — не реплики владельца, и в переписке им
@@ -376,25 +398,42 @@ class Agent:
 
         Если совет не сложился (модель недоступна, реестр не прочитан, решения
         нет) — работа продолжается **без** совета, и в чате это сказано прямо.
+
+        **Бюджет.** Совет занимает часть бюджета задачи (`COUNCIL_ROUNDS`), работа
+        получает остаток, но не меньше `WORK_FLOOR` — итого раундов на задачу не
+        больше `MAX_ROUNDS` (живой случай 25.11 — см. `COUNCIL_ROUNDS`).
         """
         cohort = council.roles()
         if not cohort:
             return {"status": "done", "history": messages, "council_text": ""}
         limit = council.max_roles(settings)
-        # ⚠️ Живой случай 25.11 (проба самоотладки, промт #129): бюджет был
-        # общим, и совет съедал его целиком — на работу оставалось 4 шага, а
-        # задача «найди дефект и почини» (поиск → чтение → ветка → правка →
-        # проверки → коммит → PR) столько не занимает. Теперь у совета **свой**
-        # предел (COUNCIL_ROUNDS), а работа получает весь MAX_ROUNDS: совет
-        # обсуждает, а работу он не отменяет.
-        initial = max(2, min(COUNCIL_ROUNDS, budget.get("left", MAX_ROUNDS)))
-        used = {"left": initial}
+        task_left = int(budget.get("left", MAX_ROUNDS))
+        # Сколько совет может занять: не больше COUNCIL_ROUNDS и не больше
+        # того, что останется работе (WORK_FLOOR — гарантированный запас).
+        cap = max(2, min(COUNCIL_ROUNDS, task_left - WORK_FLOOR))
+        used = {"left": cap}
+
+        # ⚠️ Сколько голосов бюджет совета выдерживает: секретарь не должен
+        # звать больше, чем совет потом оплатит (иначе часть голосов не
+        # говорит — и это видно владельцу в переписке).
+        voices_pool = max(0, cap - council.JUDGE_ROUNDS - council.EXECUTOR_POOL - 1)
+        limit = max(1, min(limit, voices_pool // council.MIN_VOICE_ROUNDS))
+
+        def spent() -> int:
+            """Сколько раундов занял совет к этому моменту."""
+            return max(0, cap - used["left"])
+
+        def give_back() -> None:
+            """Отдать бюджету задачи то, что занял совет (и раундов не
+            осталось лишних — работа получает остаток, но не меньше запаса)."""
+            budget["left"] = max(WORK_FLOOR, task_left - spent())
 
         # 1) секретарь отбирает, кто нужен на задачу
         triage = self._role_turn(
             council.triage_prompt(task, cohort, limit),
             [{"role": "user", "content": task}], [], cfg, 1, used)
         if triage.get("status") != "done":
+            give_back()
             return {"status": "done", "history": messages, "council_text": ""}
         wanted = council.parse_json(triage.get("text") or "").get("roles") or []
         selected: list[dict[str, Any]] = []
@@ -408,18 +447,34 @@ class Agent:
                 break
 
         # 2) обсуждение: каждый специалист — по своей роли и своими инструментами
+        #
+        # ⚠️ Резерв под судью и исполнителей: без решения совета обсуждение
+        # бессмысленно, и голоса не должны съесть весь бюджет совета. Резерв
+        # откладывается **до** голосов, а доля голоса делится поровну между
+        # оставшимися специалистами: один голос не съедает бюджет остальных.
+        reserve = council.JUDGE_ROUNDS + council.EXECUTOR_POOL
+        voices = {"left": voices_pool}
         opinions: list[dict[str, Any]] = []
-        for item in selected:
+        for index, item in enumerate(selected):
+            if voices["left"] < council.MIN_VOICE_ROUNDS:
+                break              # бюджет голосов исчерпан — совет без шума
+            # Доля голоса: остаток поровну на оставшихся, но не меньше двух
+            # раундов (голос должен успеть прочитать и ответить).
+            share = max(council.MIN_VOICE_ROUNDS,
+                        min(council.ROLE_ROUNDS,
+                            voices["left"] // (len(selected) - index)))
+            share = min(share, voices["left"])
             turn = self._role_turn(
                 council.role_prompt(item, task),
                 [{"role": "user", "content": task}],
-                item.get("tools") or [], cfg, council.ROLE_ROUNDS, used)
+                item.get("tools") or [], cfg, share, voices)
             if turn.get("status") == "unavailable":
                 break
             opinions.append({"slug": item.get("slug"),
                              "title": item.get("title") or item.get("slug"),
                              "text": (turn.get("text") or "").strip()
                              [:council.ROLE_TEXT_LIMIT]})
+        used["left"] = voices["left"] + reserve
 
         # 3) решение судьи
         judge = self._role_turn(
@@ -430,32 +485,48 @@ class Agent:
             council.parse_json(judge.get("text") or ""),
             [str(item.get("slug")) for item in council.executors()])
         if not decision.get("to_do") and not decision.get("executors"):
+            give_back()
             return {"status": "done", "history": messages,
                     "council_text": "Совет специалистов: решение не сложилось — "
                                     "работаю без него."}
 
         # 4) исполнители: у каждого своя часть и свои инструменты
         outputs: list[dict[str, Any]] = []
-        for slug in decision.get("executors") or []:
+        makers = {"left": min(council.EXECUTOR_POOL, used["left"])}
+        wanted = list(decision.get("executors") or [])
+        for index, slug in enumerate(wanted):
+            if makers["left"] < council.MIN_VOICE_ROUNDS:
+                break              # бюджет исполнителей исчерпан
             item = council.role(slug)
             if item is None:
                 continue
+            # Доля исполнителя — та же поровну (приёмка: работа делится между
+            # исполнителями, а не делается одним — каждому нужны свои шаги).
+            share = max(council.MIN_VOICE_ROUNDS,
+                        min(council.EXECUTOR_ROUNDS,
+                            makers["left"] // (len(wanted) - index)))
+            share = min(share, makers["left"])
+            before = makers["left"]
             turn = self._role_turn(
                 council.executor_prompt(item, decision),
                 [{"role": "user",
                   "content": council.executor_input(task, decision, outputs)}],
-                item.get("tools") or [], cfg, council.EXECUTOR_ROUNDS, used)
+                item.get("tools") or [], cfg, share, makers)
+            used["left"] -= before - makers["left"]
             outputs.append({"slug": slug, "title": item.get("title") or slug,
                             "text": (turn.get("text") or "").strip()
                             [:council.ROLE_TEXT_LIMIT]})
 
-        # ⚠️ Бюджет работы **не трогаем**: у совета свой предел (COUNCIL_ROUNDS),
-        # и работа получает все MAX_ROUNDS (живой случай 25.11 — см. выше).
+        # ⚠️ Бюджет задачи: совет занял часть, работа получает остаток — но не
+        # меньше WORK_FLOOR. Итого раундов на задачу не больше MAX_ROUNDS.
+        consumed = spent()
+        give_back()
         context = council.context_block(decision, opinions, outputs)
         return {"status": "done",
                 "history": list(messages) + [{"role": "user", "content": context}],
                 "council_text": council.format_discussion(opinions, decision),
-                "decision": decision}
+                "decision": decision,
+                "rounds": consumed}
 
     def _loop(self, messages: list[dict[str, Any]], cfg: dict[str, Any],
               calls: list[dict[str, Any]],
@@ -466,9 +537,10 @@ class Agent:
         """Рабочий цикл: модель → инструменты → модель.
 
         `system` и `tools` позволяют прогнать голос совета (свой промпт и
-        свой набор инструментов). `budget` — общий счётчик раундов задачи:
-        совет и работа считаются вместе, поэтому лимит `MAX_ROUNDS` на задачу
-        не превышается.
+        свой набор инструментов). `budget` — счётчик раундов: у совета он
+        свой (`_council` считает свой расход и уменьшает общий), у работы —
+        общий. Поэтому раундов на задачу — не больше `MAX_ROUNDS`, а работа
+        никогда не остаётся без шагов (`WORK_FLOOR`).
         """
         prompt = system if system is not None else system_prompt()
         payload = self._tool_payload(tools)
