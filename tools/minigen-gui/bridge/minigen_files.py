@@ -16,7 +16,12 @@ XML, XLS, DOC и так далее, все самые популярные фо�
 - **нечитаемое — честно**: битый, зашифрованный или неподдерживаемый файл даёт
   сообщение с полным путём, а не пустоту («файл прочитан, вот он»);
 - формат определяется по расширению **и** по содержимому (файл `.xls`, который
-  на самом деле zip, читается как книга Excel).
+  на самом деле zip, читается как книга Excel);
+- **картинку вендор принимает не всякую**: протокол `/messages` (Anthropic-совместимый)
+  берёт только JPEG, PNG, GIF и WebP, а отвергнутый запрос убивает **весь** ход.
+  Поэтому мост проверяет картинку **до** отправки: BMP переводит в PNG сам,
+  неподдерживаемый формат и слишком крупную картинку отдаёт оператору
+  честным сообщением — ход продолжается.
 
 Форматы:
 
@@ -24,7 +29,8 @@ XML, XLS, DOC и так далее, все самые популярные фо�
 |---|---|
 | текст (txt, md, csv, json, xml, код и прочие) | как есть, с потолком длины |
 | текст без расширения (`README`, `Makefile`) | определяется по содержимому — и читается |
-| картинки (png, jpg, gif, bmp, webp) | **блок изображения** (base64), а не текст |
+| картинки (png, jpg, gif, webp) | **блок изображения** (base64), а не текст |
+| картинки (bmp) | переводятся в PNG: вендор BMP не принимает, а ход из-за него не должен умирать |
 | картинка с чужим расширением (`.txt`) | определяется по содержимому — и всё равно картинка |
 | xlsx / xlsm | zip + разбор XML: разделители и общие строки |
 | docx / docm | zip + `word/document.xml`: абзацы |
@@ -68,7 +74,8 @@ TEXT_EXTS = {
     ".tex", ".env",
 }
 
-#: Картинки: расширение → тип содержимого (его же ждёт вендор).
+#: Картинки: расширение → тип содержимого (по расширению — только подсказка:
+#: настоящий тип определяется по байтам, см. `image_media_by_content`).
 IMAGE_MEDIA = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
@@ -77,6 +84,14 @@ IMAGE_MEDIA = {
     ".bmp": "image/bmp",
     ".webp": "image/webp",
 }
+
+#: Типы картинок, которые **принимает вендор** (`/messages`, Anthropic-совместимый
+#: протокол): только JPEG, PNG, GIF и WebP. Остальное он отвергает — и тогда
+#: умирает **весь** ход, вместе с репликой владельца.
+#:
+#: ⚠️ Проверено по документации протокола (26.11): `media_type` картинки может
+#: быть только `image/jpeg`, `image/png`, `image/gif` или `image/webp`.
+VENDOR_MEDIA = ("image/jpeg", "image/png", "image/gif", "image/webp")
 
 #: Документы (текст извлекается).
 DOC_EXTS = {
@@ -89,7 +104,16 @@ DOC_EXTS = {
 #: Потолок размера файла, который вообще читаем (байт).
 MAX_FILE_BYTES = 20 * 1024 * 1024
 #: Потолок картинки (байт). Платформа объявляет 10 МБ (`max_image_bytes_inline`).
+#:
+#: ⚠️ Считается **закодированная** картинка (base64) — именно её размер видит
+#: вендор. Сырой файл вчетверо тяжелее не пройдёт: 8 МБ на диске — это 10,7 МБ
+#: в запросе, и вендор такой отвергает (проверено по документации протокола,
+#: 26.11: потолок 10 МБ на картинку, сторона — 8000×8000).
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+#: Сырой потолок: base64 тяжелее исходника в 4/3 раза ⇒ заведомо непройдёт.
+MAX_IMAGE_RAW_BYTES = MAX_IMAGE_BYTES * 3 // 4
+#: Потолок стороны картинки (пикселей): протокол отвергает крупнее 8000×8000.
+MAX_IMAGE_SIDE = 8000
 #: Потолок текста, который уходит в контекст (символов).
 MAX_TEXT_CHARS = 200_000
 #: Потолок строк таблицы (xlsx) и абзацев (docx).
@@ -287,6 +311,206 @@ def human_size(size: int) -> str:
     return "%d Б" % size
 
 
+# ───────────────────────────────────────────────────────── картинки: путь
+
+def image_size(data: bytes) -> tuple[int, int] | None:
+    """Размер картинки в пикселях по её заголовку ((ширина, высота)).
+
+    ⚠️ Читается **только заголовок** — сама картинка не распаковывается (для
+    этого нужен был бы ImageMagick, а он в программе не нужен).
+
+    Возвращает `(0, 0)`, если размер выяснить не удалось: тогда потолок по
+    стороне не проверяем, но картинка всё равно уйдёт вендору как есть.
+    """
+    try:
+        if data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) >= 24:
+            width = int.from_bytes(data[16:20], "big")
+            height = int.from_bytes(data[20:24], "big")
+            return width, height
+        if data.startswith(b"GIF8") and len(data) >= 10:
+            width = int.from_bytes(data[6:8], "little")
+            height = int.from_bytes(data[8:10], "little")
+            return width, height
+        if data.startswith(b"\xff\xd8\xff"):
+            # JPEG: идём по маркерам до кадра (SOF0..SOF15, кроме служебных)
+            index = 2
+            while index + 9 < len(data):
+                if data[index] != 0xFF:
+                    index += 1
+                    continue
+                marker = data[index + 1]
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    index += 2
+                    continue
+                if marker == 0xD9:
+                    break
+                length = int.from_bytes(data[index + 2:index + 4], "big")
+                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                              0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                    height = int.from_bytes(data[index + 5:index + 7], "big")
+                    width = int.from_bytes(data[index + 7:index + 9], "big")
+                    return width, height
+                index += 2 + max(2, length)
+            return 0, 0
+        if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
+            chunk = data[12:16]
+            if chunk == b"VP8X" and len(data) >= 30:
+                width = 1 + int.from_bytes(data[24:27], "little")
+                height = 1 + int.from_bytes(data[27:30], "little")
+                return width, height
+            if chunk == b"VP8 " and len(data) >= 30:
+                width = int.from_bytes(data[26:28], "big") & 0x3FFF
+                height = int.from_bytes(data[28:30], "big") & 0x3FFF
+                return width, height
+            if chunk == b"VP8L" and len(data) >= 25:
+                bits = int.from_bytes(data[21:25], "little")
+                return (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+            return 0, 0
+    except (IndexError, ValueError):
+        return 0, 0
+    return 0, 0
+
+
+def _png_chunk(tag: bytes, payload: bytes) -> bytes:
+    """Один кусок PNG (тип + данные + контрольная сумма)."""
+    return (len(payload).to_bytes(4, "big") + tag + payload
+            + (zlib.crc32(tag + payload) & 0xFFFFFFFF).to_bytes(4, "big"))
+
+
+def bmp_to_png(data: bytes) -> bytes:
+    """BMP → PNG (без внешних библиотек).
+
+    ⚠️ Вендор принимает только JPEG, PNG, GIF и WebP: BMP он отвергает, и
+    тогда умирает **весь** ход (вместе с репликой владельца). Поэтому мост
+    переводит BMP в PNG сам — оператор прислал картинку, значит модель её видит.
+
+    Поддержаны 24-битные, 32-битные и палитровые (8/4/1 бит) BMP без сжатия —
+    это всё, что пишет Windows и Paint. Остальное — честный отказ.
+    """
+    if len(data) < 54 or not data.startswith(b"BM"):
+        raise FileError("это не BMP — перевести в PNG не выйдет")
+    pixels_at = int.from_bytes(data[10:14], "little")
+    header_size = int.from_bytes(data[14:18], "little")
+    if header_size < 40 or len(data) < 14 + header_size:
+        raise FileError("у BMP нестандартный заголовок — пришлите PNG или JPEG")
+    width = int.from_bytes(data[18:22], "little", signed=True)
+    height = int.from_bytes(data[22:26], "little", signed=True)
+    bits = int.from_bytes(data[28:30], "little")
+    compression = int.from_bytes(data[30:34], "little")
+    if compression != 0:
+        raise FileError("BMP со сжатием (RLE) — вендор такие не принимает, "
+                        "пришлите PNG или JPEG")
+    if width <= 0 or height == 0:
+        raise FileError("у BMP нечитаемый размер — пришлите PNG или JPEG")
+    bottom_up = height > 0
+    height = abs(height)
+    if bits == 16:
+        raise FileError("16-битный BMP — пришлите PNG или JPEG")
+    if bits not in (1, 4, 8, 24, 32):
+        raise FileError("BMP на %d бит — пришлите PNG или JPEG" % bits)
+    stride = ((bits * width + 31) // 32) * 4
+    need = pixels_at + stride * height
+    if len(data) < need:
+        raise FileError("BMP обрезан — пришлите PNG или JPEG")
+    # Палитра (для 1/4/8 бит) — записи по 4 байта: B, G, R, запасной.
+    palette: list[tuple[int, int, int]] = []
+    if bits <= 8:
+        colors = 1 << bits
+        for index in range(colors):
+            at = 14 + header_size + index * 4
+            if at + 3 > len(data):
+                break
+            blue, green, red = data[at], data[at + 1], data[at + 2]
+            palette.append((red, green, blue))
+        if not palette:
+            raise FileError("у BMP нет палитры — пришлите PNG или JPEG")
+    rows: list[bytes] = []
+    for row_index in range(height):
+        source_row = (height - 1 - row_index) if bottom_up else row_index
+        at = pixels_at + source_row * stride
+        line = bytearray()
+        if bits == 24:
+            for column in range(width):
+                pixel = at + column * 3
+                blue, green, red = data[pixel], data[pixel + 1], data[pixel + 2]
+                line += bytes((red, green, blue))
+        elif bits == 32:
+            for column in range(width):
+                pixel = at + column * 4
+                blue, green, red = data[pixel], data[pixel + 1], data[pixel + 2]
+                line += bytes((red, green, blue))
+        else:
+            for column in range(width):
+                if bits == 8:
+                    index = data[at + column]
+                elif bits == 4:
+                    byte = data[at + column // 2]
+                    index = (byte >> 4) if column % 2 == 0 else (byte & 0x0F)
+                else:
+                    byte = data[at + column // 8]
+                    index = (byte >> (7 - column % 8)) & 0x01
+                if index >= len(palette):
+                    index = 0
+                line += bytes(palette[index])
+        rows.append(bytes(line))
+    raw = b"".join(b"\x00" + row for row in rows)      # фильтр 0 — «None»
+    header = (width.to_bytes(4, "big") + height.to_bytes(4, "big")
+              + bytes((8, 2, 0, 0, 0)))                # 8 бит, truecolor RGB
+    return (b"\x89PNG\r\n\x1a\n"
+            + _png_chunk(b"IHDR", header)
+            + _png_chunk(b"IDAT", zlib.compress(raw, 6))
+            + _png_chunk(b"IEND", b""))
+
+
+def image_payload(data: bytes, media: str) -> tuple[str, str, list[str]]:
+    """Картинка → `(media_type, base64, предупреждения)`.
+
+    ⚠️ Порядок проверок — от «дешёвого» к «дорогому», и **каждый** отказ
+    честный: вендор (`/messages`) принимает только JPEG, PNG, GIF и WebP, и
+    отвергает **весь** запрос, если картинка не та. Значит, проверять надо на
+    мосте — там оператор ещё может получить внятное сообщение, а не отказ
+    вендора на весь ход.
+    """
+    warnings: list[str] = []
+    # ⚠️ Содержимое важнее расширения: картинка, переименованная в `.png`,
+    # должна уйти тем типом, который она есть на самом деле.
+    by_content = image_media_by_content(data[:16])
+    if by_content:
+        if media and media != by_content:
+            warnings.append("тип картинки определён по содержимому (%s), "
+                            "а не по расширению" % by_content)
+        media = by_content
+    elif media:
+        # Расширение обещает картинку, а по содержимому это не картинка.
+        # Отдать её вендору как картинку нельзя: вендор отвергнет **весь**
+        # запрос, поэтому говорим честно здесь.
+        if looks_like_text(data[:4096]):
+            raise FileError("это не картинка, а текст (расширение врёт) — "
+                            "пришлите PNG, JPEG, GIF или WebP")
+        raise FileError("формат картинки вендор не принимает — пришлите "
+                        "PNG, JPEG, GIF или WebP")
+    if not media:
+        raise FileError("это не картинка — пришлите PNG, JPEG, GIF или WebP")
+    if media == "image/bmp":
+        data = bmp_to_png(data)
+        media = "image/png"
+        warnings.append("BMP переведён в PNG: вендор принимает только JPEG, "
+                        "PNG, GIF и WebP")
+    if media not in VENDOR_MEDIA:
+        raise FileError("формат картинки вендор не принимает (%s) — пришлите "
+                        "PNG, JPEG, GIF или WebP" % media)
+    width, height = image_size(data)
+    if width and height and (width > MAX_IMAGE_SIDE or height > MAX_IMAGE_SIDE):
+        raise FileError("картинка %d×%d — вендор такие не принимает "
+                        "(потолок %d×%d)"
+                        % (width, height, MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+    payload = base64.b64encode(data).decode("ascii")
+    if len(payload) > MAX_IMAGE_BYTES:
+        raise FileError("картинка больше %s (в закодированном виде) — вендор "
+                        "такие не принимает" % human_size(MAX_IMAGE_BYTES))
+    return media, payload, warnings
+
+
 # ──────────────────────────────────────────────────────────────── чтение
 
 def read_for_context(path: str) -> dict[str, Any]:
@@ -334,16 +558,24 @@ def read_for_context(path: str) -> dict[str, Any]:
     result["kind"] = kind
     result["media_type"] = media
     if kind == "image":
-        if size > MAX_IMAGE_BYTES:
+        if size > MAX_IMAGE_RAW_BYTES:
             result["error"] = ("картинка больше %s — вендор такие не принимает"
-                               % human_size(MAX_IMAGE_BYTES))
+                               % human_size(MAX_IMAGE_RAW_BYTES))
             return result
         try:
             data = target.read_bytes()
         except OSError as exc:
             result["error"] = "не читается: %s" % exc
             return result
-        result["image"] = base64.b64encode(data).decode("ascii")
+        try:
+            media, payload, warnings = image_payload(data, media)
+        except FileError as exc:
+            result["error"] = str(exc)
+            return result
+        result["kind"] = "image"
+        result["media_type"] = media
+        result["image"] = payload
+        result["warnings"] = warnings
         result["ok"] = True
         return result
     if kind == "unknown":
@@ -351,16 +583,23 @@ def read_for_context(path: str) -> dict[str, Any]:
         result["kind"] = kind
         result["media_type"] = media
         if kind == "image":
-            if size > MAX_IMAGE_BYTES:
+            if size > MAX_IMAGE_RAW_BYTES:
                 result["error"] = ("картинка больше %s — вендор такие не принимает"
-                                   % human_size(MAX_IMAGE_BYTES))
+                                   % human_size(MAX_IMAGE_RAW_BYTES))
                 return result
             try:
                 data = target.read_bytes()
             except OSError as exc:
                 result["error"] = "не читается: %s" % exc
                 return result
-            result["image"] = base64.b64encode(data).decode("ascii")
+            try:
+                media, payload, warnings = image_payload(data, media)
+            except FileError as exc:
+                result["error"] = str(exc)
+                return result
+            result["media_type"] = media
+            result["image"] = payload
+            result["warnings"] = warnings
             result["ok"] = True
             return result
     if kind == "unknown":
@@ -386,16 +625,21 @@ def read_for_context(path: str) -> dict[str, Any]:
             image_media = image_media_by_content(data[:16])
             magic = _magic_document(data)
             if image_media:
-                result["kind"] = "image"
-                result["media_type"] = image_media
-                if size > MAX_IMAGE_BYTES:
+                if size > MAX_IMAGE_RAW_BYTES:
                     result["error"] = ("картинка больше %s — вендор такие "
                                        "не принимает"
-                                       % human_size(MAX_IMAGE_BYTES))
+                                       % human_size(MAX_IMAGE_RAW_BYTES))
                     return result
-                result["image"] = base64.b64encode(data).decode("ascii")
-                result["warnings"] = ["формат определён по содержимому, "
-                                      "а не по расширению"]
+                result["kind"] = "image"
+                try:
+                    media, payload, warnings = image_payload(data, image_media)
+                except FileError as exc:
+                    result["error"] = str(exc)
+                    return result
+                result["media_type"] = media
+                result["image"] = payload
+                result["warnings"] = warnings + [
+                    "формат определён по содержимому, а не по расширению"]
                 result["ok"] = True
                 return result
             if magic:
