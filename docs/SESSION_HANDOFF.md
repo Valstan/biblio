@@ -116,7 +116,8 @@ Updated: 2026-11-26 (двадцать девятая смена: промт #100
   `tools/minigen-gui/bridge/minigen_prompts.py`,
   `tools/minigen-gui/bridge/minigen_bridge.py` (передача хранилища),
   `tools/minigen-gui/bridge/tests/test_prompts.py`,
-  `AGENTS.md`, `docs/SESSION_HANDOFF.md`, `mailbox/to-brain/…` — один PR.
+  `AGENTS.md`, `docs/SESSION_HANDOFF.md`, `mailbox/to-brain/…` — один PR (**#187**,
+   смержен в `master`: `9e30a98`; гейт: `gate pass 46s`, `panel pass 3m6s`).
 - **Правок в репозитории `karman` не потребовалось**: контракт раздела уже
   есть (`GET/POST /api/prompts/section`, `section-auth.ts`, `runtime-secrets.ts`,
   `vault-client.ts`) — прочитан и проверен; блокер не в коде, а в непринятой
