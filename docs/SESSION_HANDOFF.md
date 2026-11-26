@@ -94,6 +94,7 @@ Updated: 2026-11-26 (тридцать шестая смена: промт #132 �
   `docs/LIVE-CHECK-REPORT.md` (формулировки бюджета), `docs/SESSION_HANDOFF.md`
   (этот блок), письмо Мозгу
   `mailbox/to-brain/2026-11-26-council-budget-is-a-setting.md`.
+  **PR полосы: #206** (код, приёмка, документация, письмо Мозгу).
 - **`src/shared/types.ts` и `SettingsTab.tsx` — граница проверена заново:** в
   прошлой смене они были помечены как «правят чужие незалитые ветки»
   (`origin/feat/minigen-model-settings`, `origin/feat/council-of-specialists`,
