@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import base64
 import io
+import struct
 import sys
 import tempfile
 import unittest
@@ -54,6 +55,21 @@ def _docx_bytes() -> bytes:
                          "<w:p><w:r><w:t>Строка документа</w:t></w:r></w:p>"
                          "</w:body></w:document>")
     return buffer.getvalue()
+
+
+def _bmp_bytes(width: int = 2, height: int = 2) -> bytes:
+    """Настоящий BMP: 24 бита, пиксели в порядке BGR."""
+    pixels = bytes((255, 0, 0, 0, 255, 0)) * height   # синий, зелёный
+    stride = ((24 * width + 31) // 32) * 4
+    rows = b""
+    row_bytes = 24 * width // 8
+    for index in range(height):
+        chunk = pixels[index * row_bytes:(index + 1) * row_bytes]
+        rows += chunk + b"\x00" * (stride - len(chunk))
+    header = b"BM" + struct.pack("<IHHI", 54 + len(rows), 0, 0, 54)
+    dib = struct.pack("<IiiHHIIiiII", 40, width, height, 1, 24, 0,
+                      len(rows), 2835, 2835, 0, 0)
+    return header + dib + rows
 
 
 class _FakeAgent:
@@ -152,6 +168,27 @@ class ChatFilesTest(unittest.TestCase):
         self.assertEqual(block["source"]["type"], "base64")
         self.assertEqual(block["source"]["media_type"], "image/png")
         self.assertEqual(base64.b64decode(block["source"]["data"]), PNG)
+
+    def test_bmp_goes_to_the_context_as_a_png(self) -> None:
+        """BMP вендор не принимает — мост переводит его в PNG (26.11)."""
+        path = self._write("картинка.bmp", _bmp_bytes())
+        self.bridge.cmd_chat_send({"text": "что на картинке?",
+                                   "attachments": [{"path": str(path)}]})
+        block = self.bridge.agent.blocks[0]
+        self.assertEqual(block["type"], "image")
+        self.assertEqual(block["source"]["media_type"], "image/png")
+        self.assertTrue(base64.b64decode(block["source"]["data"])
+                        .startswith(b"\x89PNG\r\n\x1a\n"))
+
+    def test_a_fake_picture_does_not_break_the_turn(self) -> None:
+        """Текст с именем `.png` — ход должен продолжиться, а не упасть."""
+        path = self._write("обманка.png", "это не картинка".encode("utf-8"))
+        self.bridge.cmd_chat_send({"text": "посмотри",
+                                   "attachments": [{"path": str(path)}]})
+        block = self.bridge.agent.blocks[0]
+        self.assertEqual(block["type"], "text")
+        self.assertIn("не прочитан", block["text"])
+        self.assertIn(str(path), block["text"])
 
     # ── видимая переписка ───────────────────────────────────────────────
     def test_the_reply_shows_the_attachment(self) -> None:
