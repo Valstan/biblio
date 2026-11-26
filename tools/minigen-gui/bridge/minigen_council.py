@@ -270,13 +270,26 @@ def normalize_decision(raw: dict[str, Any], executor_slugs: list[str]) -> dict[s
 
 
 def format_discussion(opinions: list[dict[str, Any]],
-                      decision: dict[str, Any]) -> str:
-    """Как совет виден владельцу в чате."""
+                      decision: dict[str, Any],
+                      skipped: list[str] | None = None) -> str:
+    """Как совет виден владельцу в чате.
+
+    ⚠️ `skipped` — исполнители, которым **не досталось шагов**: решение их
+    назвало, а бюджет совета не оплатил. Молчать об этом нельзя: владелец
+    видит в решении «Исполнители: …» и считает, что работа сделана (живая
+    проба 26.11: судья назвал двоих, шагов хватило на одного).
+    """
     lines = ["Совет специалистов"]
     if not opinions:
         lines.append("• по этой задаче никого не позвали — обсуждения не было")
     for item in opinions:
-        text = (item.get("text") or "").strip() or "мнения нет"
+        text = (item.get("text") or "").strip()
+        if not text:
+            # ⚠️ Молчание голоса — это не мнение: владелец должен видеть, что
+            # обсуждение осталось пустым (живая проба 26.11: голос прочитал
+            # четыре места и не ответил, а решение вынесено).
+            text = ("не ответил — мнение в обсуждении пустое"
+                    if not item.get("answered", True) else "мнения нет")
         lines.append("• %s: %s" % (item.get("title") or item.get("slug"), text))
     lines.append("")
     lines.append("Решение совета")
@@ -296,12 +309,27 @@ def format_discussion(opinions: list[dict[str, Any]],
         lines.append("Вне рамок ролей: нужен новый специалист — %s (%s). %s"
                      % (proposal.get("title") or "—", proposal.get("role") or "—",
                         proposal.get("why") or ""))
+    if skipped:
+        lines.append("Без шагов остались: %s — бюджет совета кончился, их часть "
+                     "работы не сделана"
+                     % ", ".join(role_title(slug) for slug in skipped))
     return "\n".join(lines)
 
 
+def role_title(slug: str) -> str:
+    """Название роли по слагу (для владельца — слово, а не идентификатор)."""
+    item = role(slug)
+    return str((item or {}).get("title") or slug)
+
+
 def context_block(decision: dict[str, Any], opinions: list[dict[str, Any]],
-                  outputs: list[dict[str, Any]]) -> str:
-    """Что совет решил — это входит в контекст основного хода агента."""
+                  outputs: list[dict[str, Any]],
+                  skipped: list[str] | None = None) -> str:
+    """Что совет решил — это входит в контекст основного хода агента.
+
+    ⚠️ `skipped` — исполнители без шагов: основной ход должен знать, что их
+    часть работы **не сделана**, иначе он отчитается о готовом, чего нет.
+    """
     parts = ["Совет специалистов обсудил задачу. Решение совета:"]
     parts.append("Что делать: %s" % ("; ".join(decision.get("to_do") or []) or "—"))
     parts.append("Что не делать: %s"
@@ -325,6 +353,12 @@ def context_block(decision: dict[str, Any], opinions: list[dict[str, Any]],
         for item in outputs:
             parts.append("— %s: %s" % (item.get("title") or item.get("slug"),
                                        (item.get("text") or "").strip() or "—"))
+    if skipped:
+        parts.append("")
+        parts.append("⚠️ Исполнители без шагов: %s — совет их не оплатил, их "
+                     "часть работы НЕ сделана. Сделай её сам (своими "
+                     "инструментами) или скажи владельцу прямо."
+                     % ", ".join(role_title(slug) for slug in skipped))
     parts.append("")
     parts.append("Работай по решению совета. Если оно противоречит прямой "
                  "просьбе владельца — спрашивай владельца (приоритет: владелец → "
@@ -395,16 +429,55 @@ def role_prompt(item: dict[str, Any], task: str, rounds: int = 0) -> str:
     )
 
 
-def judge_prompt(cohort: list[dict[str, Any]]) -> str:
-    """Системный промпт судьи: сводит обсуждение в решение."""
+def voice_answer_prompt(item: dict[str, Any], task: str) -> str:
+    """Промпт последнего шага голоса: **ответ**, а не чтение.
+
+    ⚠️ Живая проба 26.11 (промт #132): голос, которому досталось четыре шага,
+    прочитал четыре места и **не ответил** — мнение в обсуждении оказалось
+    пустым, а решение вынесено по одному пустому мнению. Поэтому последний
+    шаг голоса отдан ответу: в этом ходе инструментов **нет** — читать уже
+    нечего, осталось сказать.
+    """
+    return (
+        "%s\n\n"
+        "Ты — специалист совета программы «МиниГен» и отвечаешь ТОЛЬКО по своей "
+        "роли.\n\n"
+        "Ты уже прочитал то, что тебе нужно. **Сейчас только ответь** — коротко "
+        "(3–6 пунктов), по своей роли, с опорой на прочитанное. Больше ничего не "
+        "читай и ничего не делай: в этом ходе инструментов нет. Если "
+        "чего-то не хватает — так и скажи, чего именно, и закончи ответом. "
+        "Молчание хуже неполного мнения: пустое мнение в обсуждении — это как "
+        "его нет.\n\n"
+        "Задание владельца:\n%s"
+        % (brief_of(item).strip(), task.strip())
+    )
+
+
+def judge_prompt(cohort: list[dict[str, Any]],
+                 max_executors: int = 0) -> str:
+    """Системный промпт судьи: сводит обсуждение в решение.
+
+    ⚠️ `max_executors` — сколько исполнителей совет **может оплатить**
+    (каждому — минимум `MIN_EXECUTOR_ROUNDS` шагов). Судья должен знать предел:
+    иначе решение обещает то, что совет не оплатит, и владелец видит в
+    переписке трёх исполнителей, а отработал один (живая проба 26.11).
+    """
     executors_list = ", ".join("%s (%s)" % (item.get("title"), item.get("slug"))
                                for item in cohort
                                if str(item.get("kind")) == "executor")
+    budget_line = ""
+    if max_executors > 0:
+        budget_line = ("\n\n⚠️ Бюджет совета: исполнителей, которым хватит "
+                       "шагов, — **не больше %d**. Назови не больше %d: решение "
+                       "не должно обещать то, что совет не оплатит. Если работы "
+                       "больше — выбери, кто важнее, а остальное скажи в "
+                       "«что не делать»." % (max_executors, max_executors))
     return (
         "Ты — судья совета специалистов программы «МиниГен».\n\n"
         "Ты сводишь обсуждение специалистов в решение. Приоритет при конфликте: "
         "владелец → судья → совет. Если в обсуждении есть противоречие прямой "
-        "просьбе владельца — это уходит в «уточнить у владельца».\n\n"
+        "просьбе владельца — это уходит в «уточнить у владельца»."
+        "%s\n\n"
         "Исполнители (их назначаешь ты): %s\n\n"
         "Ответь ТОЛЬКО объектом JSON без пояснений:\n"
         '{"to_do": ["..."], "not_to_do": ["..."], "executors": ["slug"], '
@@ -419,7 +492,7 @@ def judge_prompt(cohort: list[dict[str, Any]]) -> str:
         "ясно);\n"
         "- new_role — null. Если задача выходит за рамки ролей совета, заполни "
         '{"title": "...", "role": "...", "why": "..."} — это ПРЕДЛОЖЕНИЕ, решение '
-        "за владельцем." % executors_list
+        "за владельцем." % (budget_line, executors_list)
     )
 
 
@@ -427,8 +500,12 @@ def judge_input(task: str, opinions: list[dict[str, Any]]) -> str:
     """Что видит судья: задача и мнения специалистов."""
     parts = ["Задание владельца:\n%s" % task.strip(), "", "Мнения специалистов:"]
     for item in opinions:
-        parts.append("— %s: %s" % (item.get("title") or item.get("slug"),
-                                   (item.get("text") or "").strip() or "—"))
+        text = (item.get("text") or "").strip()
+        if not text:
+            # ⚠️ Голос, который не ответил, — это **пустое** мнение: судья
+            # должен знать, что обсуждения было меньше, чем кажется.
+            text = "не ответил" if not item.get("answered", True) else "—"
+        parts.append("— %s: %s" % (item.get("title") or item.get("slug"), text))
     if not opinions:
         parts.append("— никого не позвали: обсуждения не было.")
     return "\n".join(parts)

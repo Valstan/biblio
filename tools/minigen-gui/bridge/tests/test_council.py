@@ -89,7 +89,11 @@ class FakeAgent(agent_mod.Agent):
             if marker in system:
                 text = value
                 break
-        return {"status": "done", "text": text, "calls": [], "history": messages}
+        # ⚠️ `answered` — подставной голос **отвечает** (как живая модель,
+        # которая не исчерпала шаги на чтении). Иначе совет решил бы, что
+        # голос молчит, и звал бы его на ответ ещё раз.
+        return {"status": "done", "text": text, "calls": [],
+                "answered": True, "history": messages}
 
 
 def council_replies(judge: str = JUDGE_JSON) -> dict[str, str]:
@@ -99,6 +103,28 @@ def council_replies(judge: str = JUDGE_JSON) -> dict[str, str]:
         "UX": "Кнопки лучше собрать в одну группу.",
         "Дизайнер": "Цвета совпадают с остальным окном.",
     }
+
+
+class SilentVoiceAgent(FakeAgent):
+    """Голос, который **не ответил**: шаги кончились на чтении.
+
+    ⚠️ Живая проба 26.11 (промт #132): голос, которому досталось четыре
+    шага, прочитал четыре места и не ответил — мнение в обсуждении вышло
+    пустым, а решение вынесено. Ответ приходит отдельным ходом (инструментов
+    в нём нет) — его и проверяет этот подставной агент.
+    """
+
+    def _role_turn(self, system, messages, tool_names, cfg, rounds, budget):
+        turn = super()._role_turn(system, messages, tool_names, cfg, rounds,
+                                   budget)
+        if "ты — специалист совета" in system.lower():
+            if tool_names:          # ход чтения — голос молчит
+                turn["text"] = ""
+                turn["answered"] = False
+            else:                   # зарезервированный ход ответа
+                turn["text"] = "Ответ голоса: место найдено, править там."
+                turn["answered"] = True
+        return turn
 
 
 # ───────────────────────────────────────────────────────── роли и реестр
@@ -328,6 +354,58 @@ class PipelineTest(unittest.TestCase):
             self.assertGreaterEqual(turn["rounds"], council.MIN_EXECUTOR_ROUNDS,
                                     "исполнитель должен успеть ответить")
 
+    def test_the_judge_knows_how_many_executors_the_council_can_pay(self) -> None:
+        """Судья знает предел: решение не обещает больше, чем совет оплатит.
+
+        ⚠️ Живая проба 26.11 (промт #132): при `councilRounds = 8` судья назвал
+        двух исполнителей, а шагов хватило на одного — и в переписке не было ни
+        слова: владелец видел «Исполнители: …» и думал, что работа сделана.
+        """
+        greedy = FakeAgent(council_replies(), cost=99)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        greedy._council([{"role": "user", "content": TASK}], {}, budget,
+                        {"councilRounds": 8, "councilWorkFloor": 12}, TASK)
+        judge_turns = [turn for turn in greedy.turns
+                       if "ты — судья" in turn["system"].lower()]
+        self.assertEqual(len(judge_turns), 1, "судья должен высказаться")
+        self.assertIn("не больше", judge_turns[0]["system"],
+                      "судья должен знать предел по исполнителям")
+
+    def test_the_owner_sees_who_got_no_steps(self) -> None:
+        """Кого решение назвало, но совет не оплатил — владелец видит.
+
+        ⚠️ Молчание выглядит как «всё сделано»: решение обещало трёх
+        исполнителей, отработал один, а в чате не было ни слова.
+        """
+        greedy = FakeAgent(council_replies(), cost=99)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = greedy._council([{"role": "user", "content": TASK}], {},
+                                  budget,
+                                  {"councilRounds": 8, "councilWorkFloor": 12},
+                                  TASK)
+        text = outcome.get("council_text") or ""
+        self.assertIn("Без шагов остались", text)
+        self.assertIn("Специалист по проверке кода", text)
+        self.assertIn("Специалист по презентациям", text)
+        self.assertEqual(outcome.get("skipped"), ["reviewer", "presenter"])
+
+    def test_a_voice_that_did_not_answer_gets_a_step_to_answer(self) -> None:
+        """Голос, не успев ответить, получает отдельный шаг ответа.
+
+        ⚠️ Живая проба 26.11: голос прочитал четыре места и не ответил — его
+        мнение в обсуждении было пустым, а решение вынесено по нему. Теперь
+        последний шаг доли голоса зарезервирован под ответ: инструментов в
+        этом ходе нет, читать уже нечего — осталось сказать.
+        """
+        silent = SilentVoiceAgent(council_replies())
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = silent._council([{"role": "user", "content": TASK}], {},
+                                  budget, {}, TASK)
+        text = outcome.get("council_text") or ""
+        self.assertIn("Ответ голоса", text,
+                      "мнение голоса должно прозвучать")
+        self.assertNotIn("мнение в обсуждении пустое", text)
+
     def test_a_council_without_a_decision_gives_its_rounds_back(self) -> None:
         """Совет без решения — работа всё равно получает бюджет задачи."""
         empty = json.dumps({"to_do": [], "not_to_do": [], "executors": [],
@@ -346,6 +424,11 @@ class PipelineTest(unittest.TestCase):
         ⚠️ Иначе часть голосов остаётся без слова («не уложился в 2 шагов») —
         и это видно владельцу в переписке: совет вроде обсуждал, а говорил
         один.
+
+        ⚠️ Голос получает шаги на **чтение и ответ**: последний шаг доли
+        зарезервирован под ответ (живая проба 26.11: голос прочитал четыре
+        места и не ответил — мнение вышло пустым). Поэтому на чтение — на
+        шаг меньше минимума голоса, а шаг ответа прибавляется.
         """
         greedy = FakeAgent(council_replies(), cost=99)
         budget = {"left": agent_mod.MAX_ROUNDS}
@@ -355,7 +438,7 @@ class PipelineTest(unittest.TestCase):
                          if "ты — специалист совета" in turn["system"].lower()]
         self.assertTrue(advisor_turns, "совет должен кого-то позвать")
         for turn in advisor_turns:
-            self.assertGreaterEqual(turn["rounds"], council.MIN_VOICE_ROUNDS,
+            self.assertGreaterEqual(turn["rounds"] + 1, council.MIN_VOICE_ROUNDS,
                                     "голос должен успеть прочитать и ответить")
 
     def test_council_can_be_switched_off(self) -> None:

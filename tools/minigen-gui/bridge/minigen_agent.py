@@ -505,21 +505,50 @@ class Agent:
                         min(council.ROLE_ROUNDS,
                             voices["left"] // (len(selected) - index)))
             share = min(share, voices["left"])
+            # ⚠️ Последний шаг доли голоса — **ответ**, а не чтение (живая
+            # проба 26.11: голос, которому досталось четыре шага, прочитал
+            # четыре места и не ответил — мнение в обсуждении оказалось
+            # пустым, а решение вынесено по пустому мнению). Поэтому чтение
+            # получает `share - 1` шагов, а один шаг зарезервирован под ответ:
+            # в этом ходе инструментов нет — читать уже нечего.
+            reads = max(1, share - 1)
             turn = self._role_turn(
                 council.role_prompt(item, task, share),
                 [{"role": "user", "content": task}],
-                item.get("tools") or [], cfg, share, voices)
+                item.get("tools") or [], cfg, reads, voices)
             if turn.get("status") == "unavailable":
                 break
+            opinion = (turn.get("text") or "").strip()
+            answered = bool(turn.get("answered"))
+            if not answered and voices["left"] > 0:
+                # Голос не ответил — шаги кончились на чтении. Отдаём ему
+                # зарезервированный шаг ответа (инструментов в нём нет).
+                answer = self._role_turn(
+                    council.voice_answer_prompt(item, task),
+                    turn.get("history") or [{"role": "user", "content": task}],
+                    [], cfg, 1, voices)
+                if answer.get("status") == "unavailable":
+                    break
+                opinion = (answer.get("text") or "").strip()
+                answered = bool(answer.get("answered"))
             opinions.append({"slug": item.get("slug"),
                              "title": item.get("title") or item.get("slug"),
-                             "text": (turn.get("text") or "").strip()
-                             [:council.ROLE_TEXT_LIMIT]})
+                             "answered": answered,
+                             "text": opinion[:council.ROLE_TEXT_LIMIT]})
         used["left"] = voices["left"] + reserve
 
         # 3) решение судьи
+        #
+        # ⚠️ Судья должен знать, сколько исполнителей совет **оплатит**:
+        # каждому нужно `MIN_EXECUTOR_ROUNDS` шагов. Иначе решение обещает
+        # больше, чем совет может сделать, и владелец видит в переписке
+        # исполнителей, которые не отработали (живая проба 26.11: судья назвал
+        # двоих, шагов хватило на одного — и молчание).
+        makers_budget = max(0, min(council.EXECUTOR_POOL,
+                                   used["left"] - council.JUDGE_ROUNDS))
+        max_executors = makers_budget // council.MIN_EXECUTOR_ROUNDS
         judge = self._role_turn(
-            council.judge_prompt(cohort),
+            council.judge_prompt(cohort, max_executors),
             [{"role": "user", "content": council.judge_input(task, opinions)}],
             [], cfg, council.JUDGE_ROUNDS, used)
         decision = council.normalize_decision(
@@ -558,15 +587,25 @@ class Agent:
                             "text": (turn.get("text") or "").strip()
                             [:council.ROLE_TEXT_LIMIT]})
 
+        # ⚠️ Кого решение назвало, но совет не оплатил: об этом владелец
+        # должен знать (живая проба 26.11: решение обещало двоих, отработал
+        # один, а в переписке не было ни слова — молчание выглядит как
+        # «всё сделано»).
+        done_slugs = [str(item.get("slug")) for item in outputs]
+        skipped = [slug for slug in wanted
+                   if slug not in done_slugs and council.role(slug) is not None]
+
         # ⚠️ Бюджет задачи: совет занял часть, работа получает остаток — но не
         # меньше WORK_FLOOR. Итого раундов на задачу не больше MAX_ROUNDS.
         consumed = spent()
         give_back()
-        context = council.context_block(decision, opinions, outputs)
+        context = council.context_block(decision, opinions, outputs, skipped)
         return {"status": "done",
                 "history": list(messages) + [{"role": "user", "content": context}],
-                "council_text": council.format_discussion(opinions, decision),
+                "council_text": council.format_discussion(opinions, decision,
+                                                          skipped),
                 "decision": decision,
+                "skipped": skipped,
                 "rounds": consumed}
 
     def _loop(self, messages: list[dict[str, Any]], cfg: dict[str, Any],
@@ -603,8 +642,12 @@ class Agent:
             blocks, text, tool_calls = parse_message(raw)
             messages.append({"role": "assistant", "content": blocks})
             if not tool_calls:
+                # ⚠️ `answered` — модель **ответила** (а не исчерпала шаги):
+                # голосу совета нужен этот признак, чтобы отличить ответ от
+                # «не уложился в N шагов» (живая проба 26.11: голос прочитал
+                # четыре места и не ответил — мнение вышло пустым).
                 return {"status": "done", "text": text, "calls": calls,
-                        "history": messages}
+                        "answered": True, "history": messages}
             # ⚠️ Протокол вендора (проверено живой пробой 26.11): на **каждый**
             # вызов модели в ходе должен прийти ответ (`tool_result`). Если
             # вызовов было два, а ответ один — вендор отвечает 400
