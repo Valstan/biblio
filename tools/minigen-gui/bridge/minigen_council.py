@@ -533,14 +533,16 @@ def budget(settings: dict[str, Any], task_cap: int) -> dict[str, int]:
     **эффективная** доля совета, а не просьба владельца.
     """
     cap = max(MIN_COUNCIL_ROUNDS, int(task_cap or 0))
+    # Запас работы ограничен так, чтобы совету осталось хотя бы
+    # `MIN_COUNCIL_ROUNDS`: иначе совет выйдет за свою долю, а раундов на
+    # задачу станет больше предела. При очень маленьком пределе гарантия
+    # работы уступает жёсткому лимиту (иначе не помещается ни то, ни другое).
+    work_high = max(0, cap - MIN_COUNCIL_ROUNDS)
     work_floor = _number(settings, "councilWorkFloor", DEFAULT_WORK_FLOOR,
-                         MIN_WORK_FLOOR,
-                         max(MIN_WORK_FLOOR, cap - MIN_COUNCIL_ROUNDS))
+                         min(MIN_WORK_FLOOR, work_high), work_high)
     council_rounds = _number(settings, "councilRounds",
                              DEFAULT_COUNCIL_ROUNDS, MIN_COUNCIL_ROUNDS,
-                             max(MIN_COUNCIL_ROUNDS, cap - MIN_WORK_FLOOR))
-    council_rounds = min(council_rounds,
-                         max(MIN_COUNCIL_ROUNDS, cap - work_floor))
+                             max(MIN_COUNCIL_ROUNDS, cap - work_floor))
     return {"council": council_rounds, "work": work_floor, "cap": cap}
 
 

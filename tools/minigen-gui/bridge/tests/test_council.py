@@ -474,6 +474,19 @@ class BudgetSettingsTest(unittest.TestCase):
         self.assertGreaterEqual(plan["council"], council.MIN_COUNCIL_ROUNDS)
         self.assertGreaterEqual(plan["work"], council.MIN_WORK_FLOOR)
 
+    def test_the_cap_holds_even_for_a_tiny_task_budget(self) -> None:
+        """Предел мал — совет и работа всё равно не выходят за него.
+
+        ⚠️ Гарантия запаса работы при очень маленьком пределе уступает
+        жёсткому лимиту: иначе не помещается ни совет, ни работа.
+        """
+        for cap in (2, 3, 4, 6, 8, 24):
+            plan = council.budget({"councilRounds": 99,
+                                   "councilWorkFloor": 99}, cap)
+            self.assertLessEqual(plan["council"] + plan["work"], plan["cap"],
+                                 "совет и работа не влезают в предел %d" % cap)
+            self.assertGreaterEqual(plan["council"], council.MIN_COUNCIL_ROUNDS)
+
     def test_the_council_spends_no_more_than_the_owner_allowed(self) -> None:
         """Владелец урезал совет — совет занимает меньше, работа — не меньше."""
         greedy = FakeAgent(council_replies(), cost=99)
