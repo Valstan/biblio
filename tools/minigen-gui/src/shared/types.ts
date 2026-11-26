@@ -373,6 +373,13 @@ export interface PendingAction {
   args: Record<string, unknown>
   reason: string
   call_id: string
+  /**
+   * Действие ждало подтверждения **до** перезапуска окна (промт #129).
+   *
+   * ⚠️ Честная пометка для владельца: он отвечает на вопрос, заданный до
+   * перезапуска, — а не на новый.
+   */
+  restored?: boolean
 }
 
 export interface ChatReply {

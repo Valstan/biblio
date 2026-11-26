@@ -812,6 +812,174 @@ class Agent:
         cfg = pending.get("cfg") or self._model_config(area_slug, model)
         return self._loop(messages, cfg, calls)
 
+    # ─────────────────────────────── ожидающее подтверждение (промт #129)
+
+    def pending_view(self) -> dict[str, Any] | None:
+        """Вид ожидающего подтверждения для окна (или None — ждать некого)."""
+        if not self.pending:
+            return None
+        return _pending_view(self.pending)
+
+    def pending_snapshot(self) -> dict[str, Any] | None:
+        """Снимок ожидающего подтверждения — для хранения на диске.
+
+        ⚠️ **Конфиг запроса в снимок не попадает**: в нём токен вендора, а
+        секрет на диске — это лишний след (D-038). При подтверждении конфиг
+        соберётся заново: у области свой живой токен.
+
+        ⚠️ Результаты безопасных вызовов обрезаются так же, как их видел
+        вендор (`_trim`): продолжение хода после перезапуска должно уйти
+        вендору тем же, что и до перезапуска.
+        """
+        if not self.pending:
+            return None
+        pending = self.pending
+        results = []
+        for item in pending.get("results") or []:
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            call, result = item
+            results.append([_call_view(call), _trim(result)])
+        return {
+            "tool": str(pending.get("tool") or ""),
+            "args": pending.get("args") or {},
+            "reason": str(pending.get("reason") or ""),
+            "call_id": str(pending.get("call_id") or ""),
+            "blocks": pending.get("blocks") or [],
+            "dangerous": [_call_view(item)
+                          for item in (pending.get("dangerous") or [])],
+            "tool_calls": [_call_view(item)
+                           for item in (pending.get("tool_calls") or [])],
+            "results": results,
+            "messages": _pending_messages(pending.get("messages") or []),
+            "calls": list(pending.get("calls") or []),
+        }
+
+    def restore_pending(self, snapshot: dict[str, Any] | None) -> bool:
+        """Восстановить ожидающее подтверждение из снимка (после перезапуска).
+
+        ⚠️ **Ход модели до опасного вызова восстанавливается из снимка** —
+        текстом. Без него продолжение после перезапуска окна начинается
+        **слепо**: модель не помнит, что уже прочитала и узнала (файлы,
+        состояние области) и продолжает задачу вслепую (живая проба 26.11:
+        после перезапуска модель всё перечитывала заново). Видимая переписка
+        (`minigen_chat_store`) хранит только слова — ходы модели и результаты
+        её вызовов живут здесь.
+
+        ⚠️ **Вложения не переживают перезапуск** (картинка, документ): в
+        снимке остаётся текст сообщения, тяжёлые блоки — нет. Это честно, а
+        не тихо.
+
+        ⚠️ Снимок без очереди опасных вызовов — не подтверждение: значит,
+        подтверждать нечего, и мы честно его не восстанавливаем.
+        """
+        if not snapshot:
+            self.pending = None
+            return False
+        queue = []
+        for item in snapshot.get("dangerous") or []:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            queue.append({"name": str(item.get("name") or ""),
+                          "input": item.get("input") or {},
+                          "id": item.get("id")})
+        if not queue:
+            self.pending = None
+            return False
+        results = []
+        for item in snapshot.get("results") or []:
+            if isinstance(item, (list, tuple)) and len(item) == 2:
+                results.append((item[0], item[1]))
+        self.pending = {
+            "tool": str(snapshot.get("tool") or queue[0].get("name") or ""),
+            "args": snapshot.get("args") or {},
+            "reason": str(snapshot.get("reason") or ""),
+            "call_id": str(snapshot.get("call_id") or queue[0].get("id") or ""),
+            "blocks": snapshot.get("blocks") or [],
+            "dangerous": queue,
+            "tool_calls": list(snapshot.get("tool_calls") or []),
+            "results": results,
+            # ход модели до опасного вызова — из снимка (см. выше); если его
+            # нет (старый снимок) — мост отдаст подтверждению историю чата
+            "messages": _pending_messages(snapshot.get("messages") or []),
+            "cfg": None,         # конфиг соберётся при подтверждении
+            "calls": list(snapshot.get("calls") or []),
+        }
+        return True
+
+
+def _pending_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ход модели до опасного вызова — текстом (для снимка и восстановления).
+
+    ⚠️ Остаётся **текст**, вызовы модели и ответы на них: без них
+    продолжение после перезапуска окна начинается слепой — модель не знает,
+    что уже нашла.
+
+    ⚠️ **Вызов и его ответ — всегда вместе.** Вендор сверяет вызов с ответом
+    по id и отвергает ход с 400 «tool result's tool id not found» (живая
+    проба 26.11). Поэтому, если ответ на вызов остаётся, остаётся и сам
+    вызов: выбрасывать только лишь одно из двух нельзя.
+
+    ⚠️ **Вложения отбрасываются** (картинка, документ): они тяжёлые и не
+    переживают перезапуск — об этом владельцу сказано прямо.
+    """
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "")
+        content = message.get("content")
+        if isinstance(content, str):
+            if content:
+                out.append({"role": role, "content": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        blocks: list[dict[str, Any]] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            kind = str(block.get("type") or "")
+            if kind == "text":
+                text = str(block.get("text") or "")
+                if text:
+                    blocks.append({"type": "text", "text": text})
+            elif kind == "tool_use":
+                # вызов модели: нужен его ответ — значит, нужен и он
+                blocks.append({"type": "tool_use",
+                               "id": str(block.get("id") or ""),
+                               "name": str(block.get("name") or ""),
+                               "input": block.get("input") if
+                               isinstance(block.get("input"), (dict, list))
+                               else {}})
+            elif kind == "tool_result":
+                blocks.append({"type": "tool_result",
+                               "tool_use_id": str(block.get("tool_use_id") or ""),
+                               "content": str(block.get("content") or "")})
+        if blocks:
+            out.append({"role": role, "content": blocks})
+    return out
+
+
+def _call_view(call: Any) -> dict[str, Any]:
+    """Вызов модели — в виде, который можно положить в JSON и в снимок.
+
+    ⚠️ Только то, что нужно для ответа вендору: имя вызова, его вход и id.
+    Вход должен быть JSON — если нет, он становится строкой.
+    """
+    if not isinstance(call, dict):
+        return {"name": str(call or ""), "input": {}, "id": ""}
+    raw = call.get("input")
+    if raw is None:
+        raw = call.get("args")
+    try:
+        json.dumps(raw)
+    except (TypeError, ValueError):
+        raw = str(raw)
+    return {"name": str(call.get("name") or call.get("tool") or ""),
+            "input": raw if raw is not None else {},
+            "id": str(call.get("id") or call.get("call_id") or "")}
+
 
 def _pending_view(pending: dict[str, Any]) -> dict[str, Any]:
     """Вид ожидающего подтверждения для окна.

@@ -8,6 +8,7 @@ import {
   callDetails,
   callsSummary,
   pendingArgs,
+  pendingNote,
   restoreMessages
 } from './chat-view'
 import {
@@ -110,8 +111,28 @@ export default function ChatTab() {
     }
   }
 
+  /**
+   * Ожидающее подтверждение — спросить у моста (промт #129).
+   *
+   * ⚠️ Мост перезапускался вместе с окном, а действие опасное ждало ответа
+   * владельца: без этого вопрос исчезал **молча**, и действие не
+   * выполнялось. Теперь владелец снова видит, на что его ждали.
+   */
+  const loadPending = async () => {
+    try {
+      const res = await api.chatPending()
+      const action = res?.pending
+      if (action) {
+        setPending({ ...action, restored: Boolean(res?.restored) })
+      }
+    } catch {
+      // Мост не ответил — подтверждения нет (как и раньше): молча не врём.
+    }
+  }
+
   useEffect(() => {
     void loadCatalog()
+    void loadPending()
     // Историю спрашиваем, только если переписки ещё нет: вернувшись на
     // вкладку, владелец видит ту же переписку, а не пустоту.
     if (chatStore.getMessages().length === 0) {
@@ -436,6 +457,11 @@ export default function ChatTab() {
       {pending && (
         <div className="banner warn">
           Требуется подтверждение: <b>{pending.tool}</b> — {pending.reason}
+          {/* ⚠️ Действие ждало ответа **до** перезапуска окна (промт #129) —
+              владелец должен знать, что отвечает на старый вопрос. */}
+          {pendingNote(pending) && (
+            <div className="muted small">{pendingNote(pending)}</div>
+          )}
           {/* ⚠️ Аргументы — в свёртке (промт #129): владелец видит, **что**
               требует подтверждения, а технический JSON открывает по клику. */}
           <details className="pending-args">
