@@ -311,6 +311,41 @@ python tools/minimax-project-areas/karman_prompts.py unarchive 12
 После раскатки клиент лежит и в `C:\Users\valstan\bin\karman_prompts.py` —
 его можно звать отовсюду, не только из дерева репозитория.
 
+## Канал промтов раздела MiniGen (`minigen_karman_prompts.py`) — D-190, программа
+
+**Разделы у проектов свои.** Клиент выше читает раздел `biblio` — это **дом
+утилит**. Программа «МиниГен» — свой проект и свой раздел: `MiniGen`, токен
+раздела `PROMPTS_TOKEN_MINIGEN` (по канону «один проект — один раздел»;
+имя секрета — по правилу сервиса `sectionSecretName`).
+
+```powershell
+python tools/minimax-project-areas/minigen_karman_prompts.py status   # читается раздел или нет
+python tools/minimax-project-areas/minigen_karman_prompts.py list     # живые промты и планы
+python tools/minimax-project-areas/minigen_karman_prompts.py plans    # только планы
+python tools/minimax-project-areas/minigen_karman_prompts.py archived # архивные
+python tools/minimax-project-areas/minigen_karman_prompts.py show 100
+python tools/minimax-project-areas/minigen_karman_prompts.py archive 100 --done
+python tools/minimax-project-areas/minigen_karman_prompts.py unarchive 100
+```
+
+| Что | Файл (первый источник) | Переменная (запасная) |
+|---|---|---|
+| токен раздела | `%USERPROFILE%\.minigen-keys\prompts-token` | `PROMPTS_TOKEN_MINIGEN` |
+| адрес сервиса | `%USERPROFILE%\.minigen-keys\vault-url`, затем `%USERPROFILE%\.biblio-keys\vault-url` | `KARMAN_URL` |
+
+⚠️ **Токен берётся только из своего каталога.** В `%USERPROFILE%\.biblio-keys`
+лежит токен **другого** раздела (`PROMPTS_TOKEN_BIBLIO`); подставить его сюда —
+значит спросить не свой раздел и получить 403. Каталог дома утилит — запасной
+источник **адреса** (адрес сервиса один для всех), но не токена.
+
+Правила те же, что у клиента дома: **нет токена ⇒ ни одного запроса наружу**;
+**архив — только после выполнения** (`--done`); значение токена и путь каталога
+ключей в отчёте не печатаются — только источник (`file`/`env`).
+
+Приёмка: `python tools/minimax-project-areas/test_minigen_karman_prompts.py`
+(13 блоков, гоняется гейтом CI). После раскатки клиент лежит и в
+`C:\Users\valstan\bin\minigen_karman_prompts.py`.
+
 ## Грабли (см. также пул brain_matrica)
 
 - **PowerShell 5.1 читает `.ps1` без BOM как ANSI** — кириллица в скрипте ломает
