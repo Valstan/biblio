@@ -119,6 +119,20 @@ ARCHIVE_HINT = ("Архив ставит только канал раздела:
                 "Сами промты при этом читаются — по каналу библиотеки.")
 
 
+def with_archive_hint(text: str = "") -> str:
+    """Причина + подсказка «что делать» — **двумя предложениями**.
+
+    ⚠️ Живой случай 26.11 (промт #100): склейка через пробел читалась как
+    «не настроен Архив ставит только канал раздела…» — два утверждения в
+    одном предложении. Причина и подсказка — разные мысли, и читатель должен
+    видеть, где кончается первая.
+    """
+    base = (text or "").strip() or REASONS.get(503, "")
+    if base and not base.endswith((".", "!", "?", ":", ";")):
+        base += "."
+    return ("%s %s" % (base, ARCHIVE_HINT)).strip()
+
+
 # ────────────────────────────────────────────────────────── имя секрета раздела
 
 def section_secret_name(section: str) -> str:
@@ -497,8 +511,7 @@ def archive(prompt_id: int, done: bool = False) -> tuple[int, dict]:
                          {"project": PROJECT, "id": int(prompt_id), "archived": True})
     if code == 503:
         payload = dict(payload or {})
-        payload["error"] = "%s %s" % (payload.get("error") or REASONS.get(503, ""),
-                                     ARCHIVE_HINT)
+        payload["error"] = with_archive_hint(payload.get("error") or "")
     return code, payload
 
 
@@ -508,8 +521,7 @@ def unarchive(prompt_id: int) -> tuple[int, dict]:
                          {"project": PROJECT, "id": int(prompt_id), "archived": False})
     if code == 503:
         payload = dict(payload or {})
-        payload["error"] = "%s %s" % (payload.get("error") or REASONS.get(503, ""),
-                                     ARCHIVE_HINT)
+        payload["error"] = with_archive_hint(payload.get("error") or "")
     return code, payload
 
 

@@ -422,6 +422,14 @@ def main() -> int:
         check(not any(c[1].startswith("/api/prompts?") for c in Handler.calls),
               "запрос в канал библиотеки ушёл без секрета: %s" % Handler.calls)
         Handler.mode = 200
+
+        print("19) причина и подсказка — двумя предложениями")
+        hint = client.with_archive_hint("канал не настроен")
+        check(hint.startswith("канал не настроен.") and ". Архив ставит" in hint,
+              "причина и подсказка слиплись в одно предложение: %s" % hint)
+        check(client.with_archive_hint("уже с точкой.").count(". Архив") == 1,
+              "перед подсказкой лишняя точка: %s"
+              % client.with_archive_hint("уже с точкой."))
     finally:
         server.shutdown()
         server.server_close()
