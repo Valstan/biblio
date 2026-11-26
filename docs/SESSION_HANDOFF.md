@@ -81,6 +81,7 @@ Updated: 2026-11-26 (двенадцатая смена: промт #174 «Два
 | `python -m unittest discover -s bridge/tests -t .` (`tools/minigen-gui`) | **508 тестов — OK** (в том числе новая `bridge/tests/test_driver.py`) |
 | `npm run typecheck` (`tools/minigen-gui`) | **зелёный** |
 | `npm test` (`tools/minigen-gui`) | **201 тест**, 22 файла — зелёные (новый `tests/driver-view.test.ts`) |
+| гейт PR **#230** | **зелёный**: `gate` (программа) и `panel` (приёмки сторожей), включая две новые приёмки #174 на CI |
 
 ### Открытые вопросы (владельцу)
 
