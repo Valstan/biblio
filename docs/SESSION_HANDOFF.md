@@ -79,7 +79,10 @@ Updated: 2026-11-26 (тридцать четвёртая смена: промт 
   `docs/TOOLS.md` (каталог: инструменты совета и `council.add_role` в списке
   опасных), `docs/SELFDEBUG-REPORT.md` и `docs/LIVE-CHECK-REPORT.md` (старая
   формулировка бюджета), `docs/SESSION_HANDOFF.md` (этот блок). **PR полосы:
-  #200**.
+  #200** (код, приёмка) и **#201** (письмо Мозгу
+  `mailbox/to-brain/2026-11-26-council-one-budget-for-the-task.md` — три
+  переносимых правила: резерв под результат откладывается **до**; общий лимит —
+  одна сумма; числа ограничений — из живых проб).
 - **`src/shared/types.ts` не трогал**: его правят чужие незалитые ветки
   (`origin/feat/minigen-model-settings`, `origin/feat/prompt-storage`,
   `origin/feature/minigen-shows-version`). Новых полей не понадобилось: настройки
