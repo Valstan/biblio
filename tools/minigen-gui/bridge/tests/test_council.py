@@ -81,7 +81,7 @@ class FakeAgent(agent_mod.Agent):
 
     def _role_turn(self, system, messages, tool_names, cfg, rounds, budget):
         self.turns.append({"system": system, "tools": list(tool_names),
-                           "rounds": rounds})
+                           "rounds": rounds, "messages": list(messages)})
         budget["left"] = max(0, int(budget.get("left", 1))
                              - min(rounds, self.cost))
         text = ""
@@ -94,6 +94,23 @@ class FakeAgent(agent_mod.Agent):
         # голос молчит, и звал бы его на ответ ещё раз.
         return {"status": "done", "text": text, "calls": [],
                 "answered": True, "history": messages}
+
+
+class DeafVoiceAgent(FakeAgent):
+    """Голос, который молчит **даже** в зарезервированном шаге ответа.
+
+    ⚠️ Живая проба 26.11: в шаге ответа модель продолжила звать инструменты —
+    ответ не прозвучал. Молчание должно быть видно, а не спрятано под
+    служебную строку про лимит шагов.
+    """
+
+    def _role_turn(self, system, messages, tool_names, cfg, rounds, budget):
+        turn = super()._role_turn(system, messages, tool_names, cfg, rounds,
+                                   budget)
+        if "ты — специалист совета" in system.lower():
+            turn["text"] = ""
+            turn["answered"] = False
+        return turn
 
 
 def council_replies(judge: str = JUDGE_JSON) -> dict[str, str]:
@@ -405,6 +422,27 @@ class PipelineTest(unittest.TestCase):
         self.assertIn("Ответ голоса", text,
                       "мнение голоса должно прозвучать")
         self.assertNotIn("мнение в обсуждении пустое", text)
+
+    def test_a_silent_voice_is_said_plainly(self) -> None:
+        """Молчание голоса видно: и владельцу, и судье.
+
+        ⚠️ Живая проба 26.11: голос не ответил — а в чате стояла служебная
+        строка «не уложился в N шагов», она выглядит как мнение. Теперь в
+        чате — честное «не ответил», и судья тоже видит, что обсуждение было
+        неполным.
+        """
+        deaf = DeafVoiceAgent(council_replies())
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = deaf._council([{"role": "user", "content": TASK}], {}, budget,
+                                {}, TASK)
+        text = outcome.get("council_text") or ""
+        self.assertIn("не ответил", text)
+        self.assertIn("мнение в обсуждении пустое", text)
+        self.assertNotIn("не уложился", text)
+        judge_turns = [turn for turn in deaf.turns
+                       if "ты — судья" in turn["system"].lower()]
+        self.assertEqual(len(judge_turns), 1)
+        self.assertIn("не ответил", judge_turns[0]["messages"][0]["content"])
 
     def test_a_council_without_a_decision_gives_its_rounds_back(self) -> None:
         """Совет без решения — работа всё равно получает бюджет задачи."""

@@ -523,14 +523,25 @@ class Agent:
             if not answered and voices["left"] > 0:
                 # Голос не ответил — шаги кончились на чтении. Отдаём ему
                 # зарезервированный шаг ответа (инструментов в нём нет).
+                history = list(turn.get("history")
+                               or [{"role": "user", "content": task}])
+                # ⚠️ Подсказка нужна: без неё модель продолжала звать
+                # инструменты и в шаге ответа (живая проба 26.11) — цепочка
+                # чтения не рвалась, и ответ не прозвучал снова.
+                history.append({"role": "user",
+                                "content": council.VOICE_ANSWER_NUDGE})
                 answer = self._role_turn(
                     council.voice_answer_prompt(item, task),
-                    turn.get("history") or [{"role": "user", "content": task}],
-                    [], cfg, 1, voices)
+                    history, [], cfg, 1, voices)
                 if answer.get("status") == "unavailable":
                     break
                 opinion = (answer.get("text") or "").strip()
                 answered = bool(answer.get("answered"))
+                if not answered:
+                    # ⚠️ Даже отдельный шаг ответа не помог — мнения нет.
+                    # В чат идёт честное «не ответил», а не служебная строка
+                    # про лимит шагов: она выглядит как мнение.
+                    opinion = ""
             opinions.append({"slug": item.get("slug"),
                              "title": item.get("title") or item.get("slug"),
                              "answered": answered,
