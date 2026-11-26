@@ -230,7 +230,35 @@ class PipelineTest(unittest.TestCase):
         advisor_turns = [turn for turn in fake.turns
                          if "ты — специалист совета" in turn["system"].lower()]
         # исполнителя секретарь не зовёт — его назначает судья
-        self.assertEqual(len(advisor_turns), 2)
+        self.assertTrue(advisor_turns, "совет должен кого-то позвать")
+        for turn in advisor_turns:
+            self.assertNotIn("исполнитель", turn["system"].lower())
+        # сколько голосов прозвучит — решает бюджет совета, а не фантазия
+        self.assertLessEqual(len(advisor_turns), council.max_roles({}))
+
+    def test_a_bigger_budget_gives_more_voices(self) -> None:
+        """Лестница владельца: больше раундов у совета — больше голосов.
+
+        ⚠️ Раундов на голос нужно минимум четыре (живая проба 26.11: при двух
+        голос успевал только читать, а ответ не прозвучал — мнение пустое).
+        Поэтому при дефолтном бюджете (12) прозвучит **один** голос, а при
+        20 раундах совета и запасе работы 4 — **два** (второго не даёт
+        подборка: секретарь зовёт двух советников, третий — исполнитель).
+        """
+
+        def voices(settings: dict) -> int:
+            greedy = FakeAgent(council_replies(), cost=99)
+            budget = {"left": agent_mod.MAX_ROUNDS}
+            greedy._council([{"role": "user", "content": TASK}], {}, budget,
+                            settings, TASK)
+            return len([turn for turn in greedy.turns
+                        if "ты — специалист совета" in turn["system"].lower()])
+
+        self.assertEqual(voices({}), 1)
+        self.assertEqual(voices({"councilRounds": 8,
+                                 "councilWorkFloor": 12}), 1)
+        self.assertEqual(voices({"councilRounds": 20,
+                                 "councilWorkFloor": 4}), 2)
 
     def test_rounds_stay_within_the_limit(self) -> None:
         """Число раундов на задачу не выходит за MAX_ROUNDS."""
@@ -297,7 +325,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(len(executor_turns), 3,
                          "все три исполнителя должны получить свою часть")
         for turn in executor_turns:
-            self.assertGreaterEqual(turn["rounds"], council.MIN_VOICE_ROUNDS,
+            self.assertGreaterEqual(turn["rounds"], council.MIN_EXECUTOR_ROUNDS,
                                     "исполнитель должен успеть ответить")
 
     def test_a_council_without_a_decision_gives_its_rounds_back(self) -> None:
@@ -386,6 +414,156 @@ class CouncilFileTaskTest(unittest.TestCase):
             "status": "done", "text": "ок", "calls": [], "history": messages}
         fake.ask([], TASK, "minigen", "")
         self.assertEqual(captured.get("task"), TASK)
+
+
+# ──────────────────────────────────────────────── бюджет совета (настройка)
+
+class BudgetSettingsTest(unittest.TestCase):
+    """Бюджет совета — настройка владельца, а не число в коде.
+
+    ⚠️ Риск промта #132, названный владельцем: «шесть специалистов × раунды =
+    долго и дорого. Нужен предел (сколько ролей реально отвечает на задачу,
+    сколько раундов) — числа предлагает исполнитель, решение за владельцем».
+    Числа из живых проб 26.11 — дефолт; решение владельца — в настройках окна.
+    """
+
+    def test_default_budget_matches_the_program_setting(self) -> None:
+        """Дефолты модуля и настроек программы — одни и те же.
+
+        ⚠️ Как с числом ролей (в модуле было «две», в настройках — «три»):
+        источник правды должен быть один, иначе модуль и программа разойдутся
+        и владелец будет читать одно, а программа делать другое.
+        """
+        import minigen_state as state
+        self.assertEqual(council.DEFAULT_COUNCIL_ROUNDS,
+                         int(state.DEFAULT_SETTINGS.get("councilRounds") or 0))
+        self.assertEqual(council.DEFAULT_WORK_FLOOR,
+                         int(state.DEFAULT_SETTINGS.get("councilWorkFloor") or 0))
+
+    def test_owner_numbers_are_read(self) -> None:
+        plan = council.budget({"councilRounds": 6, "councilWorkFloor": 18}, 24)
+        self.assertEqual(plan["council"], 6)
+        self.assertEqual(plan["work"], 18)
+
+    def test_defaults_when_the_owner_did_not_touch_them(self) -> None:
+        plan = council.budget({}, 24)
+        self.assertEqual(plan["council"], council.DEFAULT_COUNCIL_ROUNDS)
+        self.assertEqual(plan["work"], council.DEFAULT_WORK_FLOOR)
+
+    def test_garbage_falls_back_to_the_defaults(self) -> None:
+        """Мусор в настройке — не повод сломать ход: дефолт."""
+        plan = council.budget({"councilRounds": "сколько?",
+                               "councilWorkFloor": -5}, 24)
+        self.assertEqual(plan["council"], council.DEFAULT_COUNCIL_ROUNDS)
+        self.assertEqual(plan["work"], council.DEFAULT_WORK_FLOOR)
+
+    def test_the_council_yields_to_the_work_floor(self) -> None:
+        """«Совету 20, работе 12» в 24 раунда не влезает — уступает совет.
+
+        ⚠️ Запас работы — это гарантия («работа никогда не остаётся без
+        шагов»), а не пожелание: сначала режется аппетит совета.
+        """
+        plan = council.budget({"councilRounds": 20, "councilWorkFloor": 12}, 24)
+        self.assertEqual(plan["council"], 12)
+        self.assertEqual(plan["work"], 12)
+
+    def test_the_budget_never_exceeds_the_task_cap(self) -> None:
+        """Даже «совету 99 и работе 99» — раундов на задачу не больше 24."""
+        plan = council.budget({"councilRounds": 99, "councilWorkFloor": 99}, 24)
+        self.assertLessEqual(plan["council"] + plan["work"], plan["cap"])
+        self.assertGreaterEqual(plan["council"], council.MIN_COUNCIL_ROUNDS)
+        self.assertGreaterEqual(plan["work"], council.MIN_WORK_FLOOR)
+
+    def test_the_council_spends_no_more_than_the_owner_allowed(self) -> None:
+        """Владелец урезал совет — совет занимает меньше, работа — не меньше."""
+        greedy = FakeAgent(council_replies(), cost=99)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = greedy._council([{"role": "user", "content": TASK}], {},
+                                  budget, {"councilRounds": 4,
+                                           "councilWorkFloor": 12}, TASK)
+        spent = int(outcome.get("rounds") or 0)
+        self.assertLessEqual(spent, 4, "совет не должен превысить свою долю")
+        self.assertGreaterEqual(budget["left"], 12,
+                                "работе должен остаться запас шагов")
+
+    def test_the_owner_can_give_the_council_more(self) -> None:
+        """Владелец расширил совет — совет занимает больше, но не за счёт
+        предела задачи: раундов на задачу всё равно не больше `MAX_ROUNDS`."""
+        greedy = FakeAgent(council_replies(), cost=99)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = greedy._council([{"role": "user", "content": TASK}], {},
+                                  budget, {"councilRounds": 20,
+                                           "councilWorkFloor": 4}, TASK)
+        spent = int(outcome.get("rounds") or 0)
+        self.assertGreater(spent, agent_mod.COUNCIL_ROUNDS,
+                           "совет должен занять больше прежнего дефолта")
+        self.assertLessEqual(spent + budget["left"], agent_mod.MAX_ROUNDS)
+
+    def test_a_small_budget_still_leaves_room_for_a_voice(self) -> None:
+        """⚠️ Дыра, найденная живой пробой 26.11: при `councilRounds=8` весь
+        бюджет совета уходил в резерв (судья + исполнители), и совет
+        «обсуждал» в пустоту — ни одного голоса. Обсуждение и есть смысл
+        совета ⇒ резерв уступает место хотя бы одному голосу."""
+        fake = FakeAgent(council_replies(), cost=99)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = fake._council([{"role": "user", "content": TASK}], {},
+                                budget, {"councilRounds": 8,
+                                         "councilWorkFloor": 12}, TASK)
+        advisor_turns = [turn for turn in fake.turns
+                          if "ты — специалист совета" in turn["system"].lower()]
+        self.assertTrue(advisor_turns, "совет должен хоть кого-то позвать")
+        self.assertLessEqual(int(outcome.get("rounds") or 0), 8,
+                             "совет не должен превысить свою долю")
+        self.assertGreaterEqual(budget["left"], 12,
+                                "работе должен остаться запас шагов")
+
+    def test_the_specialist_knows_how_many_steps_it_has(self) -> None:
+        """⚠️ Живая проба 26.11: голос с двумя раундами пытался прочитать
+        четыре места и **не успел ответить** — его мнение в обсуждении было
+        пустым («не уложился в 2 шагов»). Поэтому в промпте сказано прямо:
+        столько-то шагов, прочитай одно место."""
+        fake = FakeAgent(council_replies(), cost=99)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        fake._council([{"role": "user", "content": TASK}], {}, budget, {},
+                      TASK)
+        advisor_turns = [turn for turn in fake.turns
+                         if "ты — специалист совета" in turn["system"].lower()]
+        self.assertTrue(advisor_turns, "совет должен кого-то позвать")
+        for turn in advisor_turns:
+            self.assertIn("шагов", turn["system"])
+            self.assertIn("одно", turn["system"])
+
+    def test_the_council_still_calls_a_specialist_if_the_secretary_fails(self) -> None:
+        """⚠️ Живая проба 26.11: секретарь назвал только исполнителя — совет
+        остался без единого голоса («никого не позвали»), а решение вынесено.
+        Совет без обсуждения — не совет ⇒ зовём первых советников реестра."""
+        replies = council_replies()
+        replies["секретарь"] = json.dumps({"roles": ["coder"]},
+                                          ensure_ascii=False)
+        greedy = FakeAgent(replies, cost=99)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = greedy._council([{"role": "user", "content": TASK}], {},
+                                  budget, {}, TASK)
+        advisor_turns = [turn for turn in greedy.turns
+                         if "ты — специалист совета" in turn["system"].lower()]
+        self.assertTrue(advisor_turns, "совет должен кого-то позвать")
+        self.assertNotIn("никого не позвали",
+                         outcome.get("council_text") or "")
+
+    def test_a_tiny_budget_does_not_break_the_round_limit(self) -> None:
+        """⚠️ Дыра, найденная сверкой 26.11: урезанный совет выходил за свою
+        долю — резерв под судью и исполнителей (7 раундов) не помещался в
+        бюджет совета в 2 раунда, и раундов на задачу становилось больше
+        `MAX_ROUNDS` (приёмка промта #132)."""
+        greedy = FakeAgent(council_replies(), cost=99)
+        budget = {"left": agent_mod.MAX_ROUNDS}
+        outcome = greedy._council([{"role": "user", "content": TASK}], {},
+                                  budget, {"councilRounds": 2,
+                                           "councilWorkFloor": 24}, TASK)
+        spent = int(outcome.get("rounds") or 0)
+        self.assertLessEqual(spent + budget["left"], agent_mod.MAX_ROUNDS)
+        self.assertLessEqual(spent, 2, "совет не должен превысить свою долю")
+        self.assertGreaterEqual(budget["left"], council.MIN_WORK_FLOOR)
 
 
 # ────────────────────────────────────────────────────── новый специалист

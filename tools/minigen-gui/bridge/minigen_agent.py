@@ -58,16 +58,26 @@ TOOL_RESULT_LIMIT = 24_000
 #: шагов. Это и есть приёмка промта #132: «число раундов на задачу не выходит
 #: за `MAX_ROUNDS`».
 #:
+#: ⚠️ Эти два числа — **настройки владельца** (`councilRounds`,
+#: `councilWorkFloor`); `COUNCIL_ROUNDS` и `WORK_FLOOR` ниже — их дефолт.
+#: Фактические числа считает `minigen_council.budget()`.
+#:
 #: ⚠️ Числа — из живых проб 26.11 (см. `docs/SESSION_HANDOFF.md`): работа по
 #: задаче «объясни, как устроен совет» без совета занимает **12** раундов, а
 #: полный совет (3 голоса + 3 исполнителя + судья + секретарь) — не меньше 14.
 #: На 24 раундах обе части не помещаются ⇒ совет получает 12, работа — не
 #: меньше 12. Голосов в бюджет совета помещается два (по два раунда: прочитать
 #: и ответить) — поэтому секретарь зовёт не больше, чем бюджет выдерживает.
-COUNCIL_ROUNDS = 12
+#:
+#: ⚠️ Это **дефолт**, а не догма: с 26.11 числа — настройки владельца
+#: (`councilRounds`, `councilWorkFloor` в настройках окна), см.
+#: `minigen_council.budget()`. Здесь остаются как дефолт модуля совета —
+#: источник правды один, иначе модуль и программа разойдутся (как разошлись
+#: дефолты числа ролей 26.11: в модуле было «две», в настройках — «три»).
+COUNCIL_ROUNDS = council.DEFAULT_COUNCIL_ROUNDS
 #: Гарантированный запас работы: сколько шагов хода остаётся на работу, сколько
 #: бы совет ни занял. Живой случай 25.11 оставил 4 — этого не хватало.
-WORK_FLOOR = 12
+WORK_FLOOR = council.DEFAULT_WORK_FLOOR
 
 
 class ModelUnavailable(RuntimeError):
@@ -327,7 +337,8 @@ class Agent:
 
         ⚠️ Бюджет: совет и работа делят **один** бюджет задачи (`MAX_ROUNDS`).
         Совет занимает часть и оставляет работе гарантированный запас
-        (`WORK_FLOOR`) — см. `COUNCIL_ROUNDS`.
+        (`councilWorkFloor`) — сколько именно, решает владелец в настройках,
+        дефолт — из живых проб 26.11 (см. `COUNCIL_ROUNDS`).
 
         ⚠️ `note` — подсказка на **один ход** (сводка отчётов сторожей, заказ
         24.11). Она попадает в системную подсказку хода, а **не** в историю
@@ -399,24 +410,43 @@ class Agent:
         Если совет не сложился (модель недоступна, реестр не прочитан, решения
         нет) — работа продолжается **без** совета, и в чате это сказано прямо.
 
-        **Бюджет.** Совет занимает часть бюджета задачи (`COUNCIL_ROUNDS`), работа
-        получает остаток, но не меньше `WORK_FLOOR` — итого раундов на задачу не
-        больше `MAX_ROUNDS` (живой случай 25.11 — см. `COUNCIL_ROUNDS`).
+        **Бюджет.** Совет занимает часть бюджета задачи (`councilRounds`),
+        работа получает остаток, но не меньше гарантированного запаса
+        (`councilWorkFloor`) — итого раундов на задачу не больше `MAX_ROUNDS`
+        (живой случай 25.11 — см. `COUNCIL_ROUNDS`). Числа — настройки
+        владельца; дефолты — из живых проб 26.11.
         """
         cohort = council.roles()
         if not cohort:
             return {"status": "done", "history": messages, "council_text": ""}
         limit = council.max_roles(settings)
         task_left = int(budget.get("left", MAX_ROUNDS))
-        # Сколько совет может занять: не больше COUNCIL_ROUNDS и не больше
-        # того, что останется работе (WORK_FLOOR — гарантированный запас).
-        cap = max(2, min(COUNCIL_ROUNDS, task_left - WORK_FLOOR))
+        # Бюджет совета и работы — **настройки владельца** (`councilRounds`,
+        # `councilWorkFloor`), дефолт — из живых проб 26.11. Совет занимает не
+        # больше своей доли и не больше того, что останется работе: запас
+        # работы гарантирован, а не выбирается.
+        plan = council.budget(settings, task_left)
+        work_floor = plan["work"]
+        cap = max(2, min(plan["council"], task_left - work_floor))
         used = {"left": cap}
 
         # ⚠️ Сколько голосов бюджет совета выдерживает: секретарь не должен
         # звать больше, чем совет потом оплатит (иначе часть голосов не
         # говорит — и это видно владельцу в переписке).
-        voices_pool = max(0, cap - council.JUDGE_ROUNDS - council.EXECUTOR_POOL - 1)
+        #
+        # ⚠️ Резерв под судью и исполнителей — **в пределах** бюджета совета:
+        # владелец может урезать совет до двух раундов, а резерв (судья +
+        # исполнители = 7) в него не влезал — и совет выходил за свою долю,
+        # то есть раундов на задачу становилось больше `MAX_ROUNDS` (дыра
+        # найдена сверкой 26.11, когда числа бюджета стали настройками).
+        #
+        # ⚠️ И резерв не должен съедать **обсуждение**: при councilRounds=8
+        # весь бюджет уходил в резерв, и совет «обсуждал» в пустоту — ни
+        # одного голоса (живая проба 26.11). Поэтому резерв уступает место
+        # хотя бы одному голосу, если бюджет это позволяет.
+        reserve = min(council.JUDGE_ROUNDS + council.EXECUTOR_POOL,
+                      max(0, cap - 1 - council.MIN_VOICE_ROUNDS))
+        voices_pool = max(0, cap - reserve - 1)
         limit = max(1, min(limit, voices_pool // council.MIN_VOICE_ROUNDS))
 
         def spent() -> int:
@@ -426,7 +456,7 @@ class Agent:
         def give_back() -> None:
             """Отдать бюджету задачи то, что занял совет (и раундов не
             осталось лишних — работа получает остаток, но не меньше запаса)."""
-            budget["left"] = max(WORK_FLOOR, task_left - spent())
+            budget["left"] = min(task_left, max(work_floor, task_left - spent()))
 
         # 1) секретарь отбирает, кто нужен на задачу
         triage = self._role_turn(
@@ -445,6 +475,18 @@ class Agent:
                 selected.append(item)
             if len(selected) >= limit:
                 break
+        # ⚠️ Секретарь мог назвать только исполнителя или несуществующий slug —
+        # тогда совет остался бы **без единого голоса** (живая проба 26.11:
+        # «по этой задаче никого не позвали — обсуждения не было», а решение
+        # вынесено). Совет без обсуждения — это не совет: берём первых
+        # советников реестра, сколько бюджет потянет.
+        if not selected:
+            for item in cohort:
+                if str(item.get("kind")) == "executor":
+                    continue
+                selected.append(item)
+                if len(selected) >= limit:
+                    break
 
         # 2) обсуждение: каждый специалист — по своей роли и своими инструментами
         #
@@ -452,7 +494,6 @@ class Agent:
         # бессмысленно, и голоса не должны съесть весь бюджет совета. Резерв
         # откладывается **до** голосов, а доля голоса делится поровну между
         # оставшимися специалистами: один голос не съедает бюджет остальных.
-        reserve = council.JUDGE_ROUNDS + council.EXECUTOR_POOL
         voices = {"left": voices_pool}
         opinions: list[dict[str, Any]] = []
         for index, item in enumerate(selected):
@@ -465,7 +506,7 @@ class Agent:
                             voices["left"] // (len(selected) - index)))
             share = min(share, voices["left"])
             turn = self._role_turn(
-                council.role_prompt(item, task),
+                council.role_prompt(item, task, share),
                 [{"role": "user", "content": task}],
                 item.get("tools") or [], cfg, share, voices)
             if turn.get("status") == "unavailable":
@@ -495,20 +536,20 @@ class Agent:
         makers = {"left": min(council.EXECUTOR_POOL, used["left"])}
         wanted = list(decision.get("executors") or [])
         for index, slug in enumerate(wanted):
-            if makers["left"] < council.MIN_VOICE_ROUNDS:
+            if makers["left"] < council.MIN_EXECUTOR_ROUNDS:
                 break              # бюджет исполнителей исчерпан
             item = council.role(slug)
             if item is None:
                 continue
             # Доля исполнителя — та же поровну (приёмка: работа делится между
             # исполнителями, а не делается одним — каждому нужны свои шаги).
-            share = max(council.MIN_VOICE_ROUNDS,
+            share = max(council.MIN_EXECUTOR_ROUNDS,
                         min(council.EXECUTOR_ROUNDS,
                             makers["left"] // (len(wanted) - index)))
             share = min(share, makers["left"])
             before = makers["left"]
             turn = self._role_turn(
-                council.executor_prompt(item, decision),
+                council.executor_prompt(item, decision, share),
                 [{"role": "user",
                   "content": council.executor_input(task, decision, outputs)}],
                 item.get("tools") or [], cfg, share, makers)
