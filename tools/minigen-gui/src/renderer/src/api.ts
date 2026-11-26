@@ -73,6 +73,13 @@ export const api = {
   ),
   setAutoheal: (slug: string, autoheal: boolean) =>
     call<{ ok: boolean; error?: string }>('areas.set_autoheal', { slug, autoheal }),
+  // Переключатель «водитель проекта»: кто водит сессиями области
+  // («Управляющий» / «автомат» / «никто» / «по правилу») — промт #174.
+  setDriver: (slug: string, driver: string) =>
+    call<{ ok: boolean; error?: string; driver?: string; title?: string }>(
+      'areas.set_driver',
+      { slug, driver }
+    ),
   start: (slug: string) => call<{ ok: boolean; error?: string }>('areas.start', { slug }),
   stop: (slug: string) => call<{ ok: boolean; error?: string }>('areas.stop', { slug }),
   restart: (slug: string) => call<{ ok: boolean; error?: string }>('areas.restart', { slug }),

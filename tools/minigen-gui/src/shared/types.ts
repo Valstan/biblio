@@ -259,6 +259,23 @@ export interface Area {
   account: AccountState
   sessions: SessionVerdict[]
   points?: AccountState & { points_today?: number; next_points?: number; state?: string }
+  /**
+   * Переключатель «водитель проекта» (промт КАРМАНА #174): кто водит
+   * сессиями — «Управляющий», «автомат», «никто» или «по правилу».
+   * Пустое значение — «по правилу» (если в области работает Управляющий,
+   * водит он, иначе — автомат).
+   */
+  driver?: string
+  /** Кто водит сессиями **сейчас** (по переключателю или по правилу). */
+  driverNow?: DriverState
+}
+
+/** Кто водит сессиями проекта — с причиной (для окна и отчёта). */
+export interface DriverState {
+  driver: string
+  title: string
+  why: string
+  source: string
 }
 
 export interface NetworkPath {

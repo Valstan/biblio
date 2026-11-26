@@ -70,6 +70,11 @@ SESSION_STATE = LOCAL / "sessionwatch-state.json"
 REPORTS = LOCAL / "reports.jsonl"
 REPORTS_MAX_BYTES = 512 * 1024      # больше — подрезаем хвост
 REPORTS_KEEP_LINES = 800
+#: Состояние автомата аккаунтов (лечащего). Сторож сессий читает его,
+#: чтобы узнать, что аккаунт уже обновлён (промт КАРМАНА #174: аккаунты и
+#: сессии — разные автоматы; «Продолжай» после смены аккаунта отдаёт
+#: сторож сессий, а не лечащий).
+AUTHEAL_STATE = LOCAL / "autheal-state.json"
 
 # ────────────────────────────────────────────────────────── журнал и состояние
 
@@ -221,9 +226,140 @@ def areas() -> list:
             "folder": p.get("folder", ""),
             "karman": p.get("karman", slug),
             "autoheal": bool(p.get("autoheal")),
+            # водитель сессий проекта (промт КАРМАНА #174): "" ⇒ по правилу
+            "driver": str(p.get("driver") or "").strip().lower(),
             "dir": AREAS_ROOT / ("p-" + slug),
         })
     return out
+
+
+# ───────────────────────────────────── водитель сессий (промт КАРМАНА #174)
+#
+# Правило «один водитель на проект» (G679 + зачитка владельца 26.11, 19:00):
+# в каждый момент у проекта ОДИН водитель сессий — либо «Управляющий»
+# (карусель или сам владелец), либо автомат управления сессиями, либо никто.
+# Автомат аккаунтов (лечащий) водителем НЕ бывает: он меняет аккаунты, а в
+# сессии не пишет ни одного сообщения (промт #174, п. 1).
+#
+# Переключатель — поле `driver` проекта в конфиге областей:
+#   "" / «auto»      — по правилу: если в области работает Управляющий,
+#                      водит он (автомат только наблюдает), иначе автомат;
+#   «manager»        — Управляющий (автомат не действует);
+#   «automaton»      — автомат управления сессиями;
+#   «none»           — никто (наблюдение без действий).
+
+DRIVER_AUTO = "auto"             # по умолчанию: решает наличие живого Управляющего
+DRIVER_MANAGER = "manager"       # Управляющий
+DRIVER_AUTOMATON = "automaton"   # автомат управления сессиями
+DRIVER_NONE = "none"             # никто
+DRIVERS = (DRIVER_AUTO, DRIVER_MANAGER, DRIVER_AUTOMATON, DRIVER_NONE)
+DRIVER_TITLES = {
+    DRIVER_AUTO: "по правилу",
+    DRIVER_MANAGER: "Управляющий",
+    DRIVER_AUTOMATON: "автомат",
+    DRIVER_NONE: "никто",
+}
+#: Маркер сессии «Управляющего» в заголовке (заказ владельца 26.11):
+#: такую сессию автомат не оживляет, не сбрасывает и не ротирует — как
+#: служебные пробы.
+MANAGER_MARKERS = ("ЗАДАНИЕ ОТ УПРАВЛЯЮЩЕГО",)
+
+
+def is_manager_title(title: str) -> bool:
+    """Заголовок сессии Управляющего? («ЗАДАНИЕ ОТ УПРАВЛЯЮЩЕГО — …»)."""
+    blob = (title or "").strip().upper()
+    return any(marker in blob for marker in MANAGER_MARKERS)
+
+
+def driver_title(driver: str) -> str:
+    """Человеческое имя водителя («Управляющий» / «автомат» / «никто»)."""
+    return DRIVER_TITLES.get(driver or "", DRIVER_TITLES[DRIVER_AUTO])
+
+
+def area_sessions(area_dir: Path) -> list:
+    """Неархивные сессии области — для правила водителя и запрета второй."""
+    con = connect(area_db(area_dir))
+    if not con:
+        return []
+    out = []
+    try:
+        for r in rows(con, "select session_id, status, session_kind, title, "
+                          "workspace_dir, updated_at_ms from local_runtime_sessions "
+                          "where coalesce(archived, 0) = 0"):
+            out.append({"session_id": r[0] or "", "status": r[1] or "",
+                        "kind": r[2] or "", "title": r[3] or "",
+                        "workspace_dir": r[4] or "", "updated_at_ms": r[5] or 0})
+    finally:
+        con.close()
+    return out
+
+
+def live_sessions(area: dict) -> list:
+    """Живые сессии области: рантайм считает их занятыми.
+
+    «Живая» = идёт ход (`accepted` без завершения) **или** сессия в состоянии
+    «started». Просто неархивная сессия (ход закончился) живой НЕ считается:
+    иначе простой на минутах замораживал бы проект навсегда (D-249 ⑤:
+    реально законченную работу продолжать не надо принудительно, а архивировать
+    её — не дело автомата).
+
+    Это и есть «порог живой сессии» из промта #174 («уточни, что считать
+    живой»): **рантайм занят**, а не «сессия не архивирована».
+    """
+    area_dir = Path((area or {}).get("dir") or "")
+    if not area_dir:
+        return []
+    busy = set()
+    con = connect(area_db(area_dir))
+    if con:
+        try:
+            busy = {str(r[0]) for r in rows(
+                con, "select distinct session_id from local_runtime_turn_ingress "
+                     "where status = 'accepted' and completed_at_ms is null")}
+        finally:
+            con.close()
+    out = []
+    for sess in area_sessions(area_dir):
+        if sess["kind"] and sess["kind"] != "conversation":
+            continue
+        if sess["session_id"] in busy or sess["status"] == "started":
+            out.append(sess)
+    return out
+
+
+def live_manager_session(area: dict) -> str:
+    """Живая сессия «Управляющего» в области (id или пусто)."""
+    for sess in live_sessions(area):
+        if is_manager_title(sess["title"]):
+            return sess["session_id"]
+    return ""
+
+
+def driver_of(area: dict) -> dict:
+    """Кто водит сессиями в области сейчас.
+
+    Возвращает `{"driver": …, "title": …, "why": …, "source": …}`:
+    - `driver` — «manager» / «automaton» / «none»;
+    - `why` — почему так (словами, для отчёта и окна);
+    - `source` — «переключатель» (значение проекта) или «правило» (по умолчанию).
+    """
+    want = str((area or {}).get("driver") or "").strip().lower()
+    if want == DRIVER_MANAGER:
+        return {"driver": DRIVER_MANAGER, "title": driver_title(DRIVER_MANAGER),
+                "why": "переключатель проекта: Управляющий", "source": "переключатель"}
+    if want == DRIVER_AUTOMATON:
+        return {"driver": DRIVER_AUTOMATON, "title": driver_title(DRIVER_AUTOMATON),
+                "why": "переключатель проекта: автомат", "source": "переключатель"}
+    if want == DRIVER_NONE:
+        return {"driver": DRIVER_NONE, "title": driver_title(DRIVER_NONE),
+                "why": "переключатель проекта: никто", "source": "переключатель"}
+    mgr = live_manager_session(area)
+    if mgr:
+        return {"driver": DRIVER_MANAGER, "title": driver_title(DRIVER_MANAGER),
+                "why": "в области работает Управляющий (%s)" % mgr[:12],
+                "source": "правило"}
+    return {"driver": DRIVER_AUTOMATON, "title": driver_title(DRIVER_AUTOMATON),
+            "why": "Управляющего в области нет", "source": "правило"}
 
 
 _RUNNING_CACHE = {"ts": 0.0, "set": set(), "mod": None}
