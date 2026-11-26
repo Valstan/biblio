@@ -84,7 +84,10 @@ Updated: 2026-11-26 (тридцать третья смена: промт #131 �
   `tabs/SettingsTab.tsx` (тот же вопрос общим компонентом), `install.ps1`,
   `docs/knowledge-pack.md`, `tests/copy-view.test.ts`,
   `tests/works-seen.test.ts` (**новый**), `docs/SESSION_HANDOFF.md` (этот блок).
-  **PR полосы: #198.**
+  **PR полосы: #198** (код, приёмка) и **#199** (письмо Мозгу
+  `mailbox/to-brain/2026-11-26-first-run-question-and-honest-answer.md` — три
+  переносимых правила: место вопроса — часть требования, успех действия ≠
+  успех его последствий, «новое» — это то, чего ещё не видели).
 - **`src/shared/types.ts` не трогал**: его правят чужие незалитые ветки
   (`origin/feat/minigen-model-settings`, `origin/feat/council-of-specialists`,
   `origin/feature/minigen-shows-version`, `origin/feat/prompt-storage`). Новых
