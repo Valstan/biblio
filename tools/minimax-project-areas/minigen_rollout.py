@@ -230,6 +230,166 @@ def _clean_stale_bundles(dst: Path) -> int:
     return removed
 
 
+def _npm(args: list[str]) -> list[str]:
+    """Команда npm: на Windows npm — это .cmd, его надо звать через cmd.
+
+    ⚠️ Та же оговорка, что в мосте программы (`bridge/minigen_update.py`):
+    `npm` на Windows — это `npm.cmd`, а `CreateProcess` такие файлы не запускает
+    ⇒ нужен `cmd.exe /c`.
+    """
+    import shutil
+
+    npm = shutil.which("npm") or "npm"
+    if npm.lower().endswith((".cmd", ".bat")):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/c", npm] + args
+    return [npm] + args
+
+
+def _git_out(args: list[str]) -> str:
+    """Вывод git-команды (пусто — команда не сработала)."""
+    try:
+        res = subprocess.run(["git", "-C", str(REPO)] + args,
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if res.returncode != 0:
+        return ""
+    return (res.stdout or "").strip()
+
+
+def _git_ok(args: list[str]) -> bool:
+    """True — команда git отработала успешно (код 0)."""
+    try:
+        res = subprocess.run(["git", "-C", str(REPO)] + args,
+                             capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.returncode == 0
+
+
+def target_hash(ref: str = "origin/master") -> str:
+    """**Полный** хеш коммита, который раскатывается.
+
+    ⚠️ Полный, а не короткий: метка сборки в `build-info.json` — короткий хеш,
+    а `git rev-parse --short` со временем **удлиняется** (новые объекты могут
+    сделать короткий префикс неоднозначным). Сравнение по полному хешу
+    (метка — его префикс) от этого не ломается.
+    """
+    return _git_out(["rev-parse", ref])
+
+
+def head_hash() -> str:
+    """Полный хеш коммита рабочего дерева (то, из чего собирается окно)."""
+    return _git_out(["rev-parse", "HEAD"])
+
+
+def resolve_hash(rev: str) -> str:
+    """Полный хеш по любому обозначению (метка сборки — короткий хеш).
+
+    Пусто — коммит неизвестен репозиторию (например, окно собрано в другой
+    копии репозитория): тогда свежесть бандла доказать нечем.
+    """
+    rev = (rev or "").strip()
+    if not rev:
+        return ""
+    return _git_out(["rev-parse", "--verify", "%s^{commit}" % rev])
+
+
+def is_ancestor(ancestor: str, descendant: str) -> bool:
+    """Входит ли коммит `ancestor` в историю `descendant` (или он и есть)."""
+    if not ancestor or not descendant:
+        return False
+    if ancestor == descendant:
+        return True
+    return _git_ok(["merge-base", "--is-ancestor", ancestor, descendant])
+
+
+def tracked_dirty() -> bool:
+    """Есть ли незакоммиченные правки в **отслеживаемых** файлах.
+
+    ⚠️ Только отслеживаемые: новые (незакоммиченные) файлы сборку не трогают
+    (сборка пишет в `out/`, который в игноре) — тот же порядок, что и в
+    обновлении из окна (`bridge/minigen_update.py`).
+    """
+    return bool(_git_out(["status", "--porcelain", "--untracked-files=no"]))
+
+
+def build_window() -> tuple[bool, str]:
+    """Собрать окно (`npm run build`) — вернуть (удалось, хвост вывода)."""
+    res = subprocess.run(_npm(["run", "build"]), cwd=str(PROGRAM_SRC),
+                         capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=1800,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if res.returncode == 0:
+        return True, ""
+    tail = ((res.stderr or "") + "\n" + (res.stdout or "")).strip().splitlines()[-8:]
+    return False, "\n".join(tail)
+
+
+def ensure_fresh_bundle(ref: str = "origin/master", rebuild: bool = True) -> tuple[bool, str]:
+    """Окно перед раскаткой должно содержать **тот же код**, что и демоны.
+
+    ⚠️ Зачем (живой случай 27.11): раскатка ставит бандл окна из `out/` рабочего
+    дерева, а демонов — из `ref` (master). Стоило в master залить правки и **не
+    пересобрать** окно — раскатка проходила «успешно», а окно оставалось на
+    старой сборке (метка `0d6094f` при master `f8d07b3`). Владелец видел
+    «свежую» программу, а в окне не было новой кнопки. Перезапуск окна **не
+    помогал**: перезапускался тот же старый бандл.
+
+    Теперь правило **в самой раскатке**: бандл окна должен быть собран из кода,
+    в котором есть раскатываемый коммит. Не содержит ⇒ пересобрать; пересобрать
+    не из чего ⇒ честно сказать и **не раскатывать** (молчаливый старый бандл —
+    ровно тот дефект, который чиним).
+
+    Проверка — по **предку**, а не по точному равенству: бандл, собранный из
+    ветки, что содержит master, свежее master'а — и он годится. Старее master'а
+    (нет master'а в его истории) — не годится: именно это и было «окно старое».
+
+    Возвращает (готово, почему нет).
+    """
+    target = target_hash(ref)
+    if not target:
+        return False, "не знаю, какой коммит раскатываю (%s)" % ref
+
+    label = built_commit()
+    label_full = resolve_hash(label)
+    if label_full and is_ancestor(target, label_full):
+        return True, ""
+
+    head = head_hash()
+    if head and not is_ancestor(target, head):
+        return False, ("рабочее дерево на %s, а раскатывается %s — в дереве нет "
+                       "раскатываемого кода, окно из него не собрать. Поставь "
+                       "дерево на нужный коммит (git fetch && git checkout %s) "
+                       "и повтори" % (head[:7], target[:7], ref))
+
+    if not rebuild:
+        return False, ("окно собрано из %s, а раскатывается %s — пересборка "
+                       "выключена" % (label or "без метки", target[:7]))
+
+    if tracked_dirty():
+        return False, ("в исходниках есть незакоммиченные правки — сборка впишет "
+                       "их в бандл, а метка скажет «это коммит %s». Чужую работу "
+                       "не затираем: разберись с правками и повтори" % target[:7])
+
+    if not (PROGRAM_SRC / "node_modules").is_dir():
+        return False, ("в исходниках нет node_modules — поставь зависимости "
+                       "(npm install в tools/minigen-gui) и повтори")
+
+    print("   окно собрано из %s, а раскатывается %s — пересобираю (npm run build)"
+          % (label or "без метки", target[:7]))
+    good, why = build_window()
+    if not good:
+        return False, ("сборка окна не прошла — окно осталось бы старым:\n%s"
+                       % why[-800:])
+    label = built_commit()
+    label_full = resolve_hash(label)
+    if not (label_full and is_ancestor(target, label_full)):
+        return False, ("после сборки окно из %s, а раскатывается %s — "
+                       "окно осталось бы старым" % (label or "без метки", target[:7]))
+    return True, ""
+
+
 def built_commit(program_src: Path | None = None) -> str:
     """Коммит, из которого **собран бандл окна** (файл метки рядом с бандлом).
 
@@ -755,6 +915,29 @@ def main() -> int:
         if index + 1 < len(sys.argv):
             ref = sys.argv[index + 1]
     print("=== раскатка «МиниГена» из репозитория (biblio %s) на боевое место ===" % ref)
+
+    # ⚠️ 27.11 (живой случай): раскатка ставит бандл окна из `out/` рабочего
+    # дерева, а демонов — из `ref` (master). Стоило в master залить правки и **не
+    # пересобрать** окно — раскатка проходила «успешно», а окно оставалось на
+    # старой сборке (метка `0d6094f` при master `f8d07b3`). Владелец видел
+    # «свежую» программу, а в окне не было новой кнопки. Перезапуск окна **не
+    # помогал**: перезапускался тот же старый бандл. Теперь правило **в самой
+    # раскатке**: бандл окна должен быть собран из кода, в котором есть
+    # раскатываемый коммит; не содержит — пересобрать, а пересобрать не из чего —
+    # остановиться, **не раскатывая** (молчаливый старый бандл — ровно тот
+    # дефект, который чиним).
+    if "--no-program" not in sys.argv:
+        print("--- окно: проверка свежести сборки ---")
+        ready, why = ensure_fresh_bundle(ref)
+        if not ready:
+            print("   ⚠️ %s" % why)
+            print("   ⚠️ раскатка ОСТАНОВЛЕНА: окно осталось бы на старой сборке,")
+            print("      а «версия на месте» говорила бы про новый master. Машину")
+            print("      не трогаем. Сначала пересобери окно (npm run build в")
+            print("      tools/minigen-gui) — или катай только демонов (--no-program).")
+            return 1
+        print("   сборка окна свежая (окно собрано из кода с раскатываемым коммитом)")
+
     print("--- файлы ---")
     for name in FILES:
         data = master_file(name, ref)
