@@ -33,6 +33,7 @@ r"""Приёмка: «Всегда автомат» — колонка «Реж�
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import re
 import sys
@@ -66,6 +67,11 @@ def main() -> int:
         if not cond:
             failures.append(message)
             print("   FAIL: " + message)
+
+    # ⚠️ Приёмка проверяет **код репозитория**: боевой код на машине доезжает
+    # только раскаткой, а проверка должна быть зелёной уже сейчас (и в CI,
+    # где боевой папки нет вовсе).
+    os.environ["MINIGEN_DAEMON_DIR"] = str(HERE)
 
     tab_src = read(TABS / "AreasTab.tsx")
     sort_src = read(TABS / "areas-sort.ts")
