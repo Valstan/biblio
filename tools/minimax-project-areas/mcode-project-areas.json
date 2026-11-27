@@ -1,27 +1,172 @@
 {
   "note": "По одному изолированному экземпляру MiniMax Code на проект: свой каталог данных (свои сессии), своя рабочая папка, свой AUMID и своё имя окна в панели задач. Запуск: mcode-project-start.ps1 -Project <slug>; ярлыки: make-mcode-project-shortcuts.ps1. Второй и третий экземпляры ТОГО ЖЕ проекта — отдельный slug (matricarmz2, matricarmz3) + отдельный git worktree (m2, m3): канон проекта запрещает двух пишущих агентов в одном дереве, а линии по промтам из КАРМАНА идут параллельно.",
   "authTemplate": "C:\\Users\\valstan\\.minimax-areas\\p-brain",
-  "karmanNote": "karman — имя раздела проекта в КАРМАНе (brain_matrica/docs/PROJECT_NAMES.md): его и просит Карман, когда берёт токен MiniMax под область (заголовок X-MiniMax-Project) — чтобы статистика расхода шла по проектам, а не по «brain». ⚠️ Имя — **каноническое имя раздела библиотеки промтов**, а не имя папки репозитория: у Мозга раздел `brain_matrica` (папка `brain_matrica`), и область с полем «brain» искала раздел, которого нет, ⇒ промты не приходили вовсе (G732, 26.11).",
+  "karmanNote": "karman — имя раздела проекта в КАРМАНе (brain_matrica/docs/PROJECT_NAMES.md): его и просит Карман, когда берёт токен MiniMax под область (заголовок X-MiniMax-Project) — чтобы статистика расхода шла по проектам, а не по «brain». ⚠️ Имя — каноническое имя раздела библиотеки промтов, а не имя папки репозитория: у Мозга раздел `brain_matrica` (папка `brain_matrica`), и область с полем «brain» искала раздел, которого нет, ⇒ промты не приходили вовсе (G732, 26.11).",
   "autohealNote": "autoheal — режим обслуживания области: true = АВТОМАТ (при отказе по очкам лечащий берёт у Кармана следующий аккаунт, активирует бонус, перезапускает область и отправляет «Продолжай»), false = ВРУЧНУЮ (вход меняет владелец кнопкой «Новый вход (токен)»). Переключатель «Автомат / Вручную» в панели «МиниГен» пишет это поле; лечащий перечитывает конфиг на каждом проходе (раз в 3 мин), так что переключение действует без перезапуска. Признак отказа — вендорский код 50110 «insufficient balance (1008)» в рантайме, а не текст в переписке. Состояние: python C:\\Users\\valstan\\bin\\minimax-autheal.py --status",
   "projects": [
-    {"slug": "brain", "title": "МОЗГ", "folder": "D:\\valstan\\REPO\\brain_matrica", "karman": "brain_matrica", "autoheal": true},
-    {"slug": "brain2", "title": "Управляющий", "folder": "D:\\valstan\\REPO\\brain_matrica\\.claude\\worktrees\\manager", "karman": "brain_matrica", "autoheal": true},
-    {"slug": "matricarmz", "title": "Матрица РМЗ", "folder": "D:\\valstan\\REPO\\MatricaRMZ", "karman": "MatricaRMZ", "autoheal": true},
-    {"slug": "matricarmz2", "title": "Матрица РМЗ 2", "folder": "D:\\valstan\\REPO\\MatricaRMZ\\.claude\\worktrees\\m2", "karman": "MatricaRMZ", "autoheal": true},
-    {"slug": "matricarmz3", "title": "Матрица РМЗ 3", "folder": "D:\\valstan\\REPO\\MatricaRMZ\\.claude\\worktrees\\m3", "karman": "MatricaRMZ", "autoheal": true},
-    {"slug": "matrica4", "title": "Матрица 4", "folder": "D:\\valstan\\REPO\\Matrica4", "karman": "Matrica4", "autoheal": true},
-    {"slug": "gonba", "title": "Гоньба", "folder": "D:\\valstan\\REPO\\Gonba", "karman": "GONBA", "autoheal": true},
-    {"slug": "sarafan", "title": "Сарафан", "folder": "D:\\valstan\\REPO\\sarafan", "karman": "SARAFAN", "autoheal": true},
-    {"slug": "karman", "title": "КАРМАН", "folder": "D:\\valstan\\REPO\\karman", "karman": "KARMAN", "autoheal": true},
-    {"slug": "sabantuy", "title": "Сабантуй Малмыж", "folder": "D:\\valstan\\REPO\\SabantuyMalmyzh", "karman": "SabantuyMalmyzh", "autoheal": true},
-    {"slug": "trener", "title": "Интер (тренер)", "folder": "D:\\valstan\\REPO\\trener", "karman": "trener", "autoheal": true},
-    {"slug": "kazanskaya", "title": "Казанская", "folder": "D:\\valstan\\REPO\\KazanskayaMalmyzh", "karman": "KazanskayaMalmyzh", "autoheal": true},
-    {"slug": "rmz", "title": "РМЗ (сайт завода)", "folder": "D:\\valstan\\REPO\\RmzMalmyzh", "karman": "RmzMalmyzh", "autoheal": true},
-    {"slug": "vmalmyzhe", "title": "ВМалмыже (портал)", "folder": "D:\\valstan\\REPO\\vMalmyzhe", "karman": "vMalmyzhe", "autoheal": true},
-    {"slug": "kultura", "title": "Культура (портал)", "folder": "D:\\valstan\\REPO\\KulturaMalmyzh", "karman": "KulturaMalmyzh", "autoheal": true},
-    {"slug": "portfolio", "title": "Портфолио", "folder": "D:\\valstan\\REPO\\ValentinPortfolio", "karman": "ValentinPortfolio", "autoheal": true},
-    {"slug": "pozvoni", "title": "ПОЗВОНИ", "folder": "D:\\valstan\\REPO\\Pozvoni", "karman": "Pozvoni", "autoheal": true},
-    {"slug": "biblio", "title": "biblio (дом утилит)", "folder": "D:\\valstan\\REPO\\biblio", "karman": "biblio", "autoheal": false},
-    {"slug": "minigen", "title": "МиниГен (разработка)", "folder": "D:\\valstan\\REPO\\biblio-minigen", "karman": "biblio", "autoheal": true}
+    {
+      "slug": "brain",
+      "title": "МОЗГ",
+      "folder": "D:\\valstan\\REPO\\brain_matrica",
+      "karman": "brain_matrica",
+      "autoheal": true
+    },
+    {
+      "slug": "brain2",
+      "title": "Управляющий",
+      "folder": "D:\\valstan\\REPO\\brain_matrica\\.claude\\worktrees\\manager",
+      "karman": "brain_matrica",
+      "autoheal": true
+    },
+    {
+      "slug": "matricarmz",
+      "title": "Матрица РМЗ",
+      "folder": "D:\\valstan\\REPO\\MatricaRMZ",
+      "karman": "MatricaRMZ",
+      "autoheal": true
+    },
+    {
+      "slug": "matricarmz2",
+      "title": "Матрица РМЗ 2",
+      "folder": "D:\\valstan\\REPO\\MatricaRMZ\\.claude\\worktrees\\m2",
+      "karman": "MatricaRMZ",
+      "autoheal": true
+    },
+    {
+      "slug": "matricarmz3",
+      "title": "Матрица РМЗ 3",
+      "folder": "D:\\valstan\\REPO\\MatricaRMZ\\.claude\\worktrees\\m3\\faza",
+      "karman": "MatricaRMZ",
+      "autoheal": true,
+      "driver": "none"
+    },
+    {
+      "slug": "matrica4",
+      "title": "Матрица 4",
+      "folder": "D:\\valstan\\REPO\\Matrica4",
+      "karman": "Matrica4",
+      "autoheal": false
+    },
+    {
+      "slug": "gonba",
+      "title": "Гоньба",
+      "folder": "D:\\valstan\\REPO\\Gonba",
+      "karman": "GONBA",
+      "autoheal": false
+    },
+    {
+      "slug": "sarafan",
+      "title": "Сарафан",
+      "folder": "D:\\valstan\\REPO\\sarafan",
+      "karman": "SARAFAN",
+      "autoheal": true
+    },
+    {
+      "slug": "karman",
+      "title": "КАРМАН",
+      "folder": "D:\\valstan\\REPO\\karman",
+      "karman": "KARMAN",
+      "autoheal": true
+    },
+    {
+      "slug": "sabantuy",
+      "title": "Сабантуй Малмыж",
+      "folder": "D:\\valstan\\REPO\\SabantuyMalmyzh",
+      "karman": "SabantuyMalmyzh",
+      "autoheal": false
+    },
+    {
+      "slug": "trener",
+      "title": "Интер (тренер)",
+      "folder": "D:\\valstan\\REPO\\trener",
+      "karman": "trener",
+      "autoheal": false
+    },
+    {
+      "slug": "kazanskaya",
+      "title": "Казанская",
+      "folder": "D:\\valstan\\REPO\\KazanskayaMalmyzh",
+      "karman": "KazanskayaMalmyzh",
+      "autoheal": false
+    },
+    {
+      "slug": "rmz",
+      "title": "РМЗ (сайт завода)",
+      "folder": "D:\\valstan\\REPO\\RmzMalmyzh",
+      "karman": "RmzMalmyzh",
+      "autoheal": false
+    },
+    {
+      "slug": "vmalmyzhe",
+      "title": "ВМалмыже (портал)",
+      "folder": "D:\\valstan\\REPO\\vMalmyzhe",
+      "karman": "vMalmyzhe",
+      "autoheal": false
+    },
+    {
+      "slug": "kultura",
+      "title": "Культура (портал)",
+      "folder": "D:\\valstan\\REPO\\KulturaMalmyzh",
+      "karman": "KulturaMalmyzh",
+      "autoheal": false
+    },
+    {
+      "slug": "portfolio",
+      "title": "Портфолио",
+      "folder": "D:\\valstan\\REPO\\ValentinPortfolio",
+      "karman": "ValentinPortfolio",
+      "autoheal": false
+    },
+    {
+      "slug": "pozvoni",
+      "title": "ПОЗВОНИ",
+      "folder": "D:\\valstan\\REPO\\Pozvoni",
+      "karman": "Pozvoni",
+      "autoheal": false
+    },
+    {
+      "slug": "biblio",
+      "title": "biblio (дом утилит)",
+      "folder": "D:\\valstan\\REPO\\biblio",
+      "karman": "biblio",
+      "autoheal": false
+    },
+    {
+      "slug": "minigen",
+      "title": "МиниГен (разработка)",
+      "folder": "D:\\valstan\\REPO\\biblio-minigen",
+      "karman": "biblio",
+      "autoheal": true,
+      "driver": "none"
+    },
+    {
+      "slug": "ideas",
+      "title": "Идеи",
+      "folder": "D:\\valstan\\REPO\\ideas",
+      "karman": "ideas",
+      "autoheal": false
+    },
+    {
+      "slug": "p-kompik",
+      "title": "Компик",
+      "folder": "D:\\valstan\\REPO\\kompik",
+      "karman": "kompik",
+      "autoheal": true
+    },
+    {
+      "slug": "orca",
+      "title": "Орка",
+      "folder": "D:\\valstan\\REPO\\orca",
+      "karman": "orca",
+      "autoheal": true
+    },
+    {
+      "slug": "memory",
+      "title": "Память",
+      "folder": "D:\\valstan\\REPO\\memory",
+      "karman": "memory",
+      "autoheal": true,
+      "driver": "none"
+    }
   ]
 }

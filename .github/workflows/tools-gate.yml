@@ -40,6 +40,8 @@ jobs:
         run: python3 tools/minimax-project-areas/test_no_console_windows.py
       - name: Приёмка списка раскатки (все файлы, что грузят демоны)
         run: python3 tools/minimax-project-areas/test_rollout_covers_runtime_files.py
+      - name: Приёмка слияния конфига областей (структура — из репозитория, живое — с машины)
+        run: python3 tools/minimax-project-areas/test_rollout_areas_config_merge.py
       - name: Приёмка сброса сессии на месте
         run: python3 tools/minimax-project-areas/test_session_reset_in_place.py
       - name: Приёмка лечения сессий по решению «Управляющего» (промт #172)
