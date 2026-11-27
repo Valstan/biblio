@@ -1,8 +1,13 @@
 import type { Area } from '@shared/types'
+import { DRIVER_VALUES, driverValue } from './driver-view'
 
 /**
  * Сортировка списка областей по клику на шапку столбца (заказ владельца
- * 24.11): «Область · Работает · Вход · Очки · Режим · Сессии · Действия».
+ * 24.11): «Область · Работает · Вход · Очки · Режим · Сессии».
+ *
+ * ⚠️ ПРОМТ КАРМАНА #177 (27.11): колонка «Водитель» переехала **вплотную за
+ * «Режимом»** (раньше её добавляли отдельным заголовком в конец таблицы), и
+ * она тоже сортируется.
  *
  * Правила:
  *
@@ -18,7 +23,7 @@ import type { Area } from '@shared/types'
  * глазами (как карта генов и шапка окна).
  */
 
-export type AreaSortKey = 'area' | 'running' | 'account' | 'points' | 'mode' | 'sessions'
+export type AreaSortKey = 'area' | 'running' | 'account' | 'points' | 'mode' | 'driver' | 'sessions'
 export type AreaSortDir = 'asc' | 'desc'
 
 export interface AreaSort {
@@ -39,6 +44,7 @@ export const AREA_COLUMNS: AreaColumn[] = [
   { key: 'account', label: 'Вход', first: 'asc' },
   { key: 'points', label: 'Очки', first: 'desc' },
   { key: 'mode', label: 'Режим', first: 'desc' },
+  { key: 'driver', label: 'Водитель', first: 'asc' },
   { key: 'sessions', label: 'Сессии', first: 'desc' }
 ]
 
@@ -70,6 +76,18 @@ function pointsOf(area: Area): number | null {
   return typeof value === 'number' ? value : null
 }
 
+/**
+ * Ранг водителя для сортировки — в порядке самого переключателя: «Внешнее
+ * управление», «Управление МиниГеном», «Оператор». Кто водит на самом деле
+ * (по правилу ядра) — смотрим и на это: сортировка должна отвечать на
+ * вопрос «кто сейчас водит», а не «что записано в конфиге».
+ */
+function driverRank(area: Area): number {
+  const value = driverValue(area)
+  const index = (DRIVER_VALUES as readonly string[]).indexOf(value)
+  return index < 0 ? DRIVER_VALUES.length : index
+}
+
 function compare(a: Area, b: Area, key: AreaSortKey): number {
   switch (key) {
     case 'area':
@@ -86,6 +104,8 @@ function compare(a: Area, b: Area, key: AreaSortKey): number {
       )
     case 'mode':
       return Number(a.autoheal) - Number(b.autoheal)
+    case 'driver':
+      return driverRank(a) - driverRank(b)
     case 'sessions':
       return a.sessions.length - b.sessions.length
     default:

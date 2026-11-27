@@ -2,8 +2,9 @@ import { useMemo, useState } from 'react'
 import type { Area, Snapshot } from '@shared/types'
 import { api } from '../api'
 import { verdictClass } from '../format'
-import { AREA_COLUMNS, DEFAULT_AREA_SORT, nextSort, sortAreas } from './areas-sort'
-import { DRIVER_HINTS, DRIVER_LABELS, DRIVER_VALUES, driverHint } from './driver-view'
+import { AREA_COLUMNS, DEFAULT_AREA_SORT, nextSort, sortAreas, type AreaSortKey } from './areas-sort'
+import { MODE_BUTTONS } from './areas-mode'
+import { DRIVER_HINTS, DRIVER_LABELS, DRIVER_VALUES, driverHint, driverValue } from './driver-view'
 
 interface Props {
   areas: Area[]
@@ -13,11 +14,12 @@ interface Props {
 }
 
 /**
- * Переключатель «водитель проекта» (промт КАРМАНА #174): в каждый момент у
- * проекта один водитель сессий — либо «Управляющий», либо автомат управления
- * сессиями, либо никто. Значение «по правилу» — то самое правило по
- * умолчанию: если в области работает Управляющий, водит он (автомат только
- * наблюдает), иначе — автомат.
+ * Переключатель «водитель проекта» (промт КАРМАНА #174, слова владельца —
+ * #177): в каждый момент у проекта один водитель сессий. Вариантов **ровно
+ * три**: «Внешнее управление», «Управление МиниГеном», «Оператор».
+ * «По правилу» в переключателе нет (владелец просил три) — это правило ядра
+ * для области, где водитель ещё не выбран явно; окно показывает, кто водит
+ * фактически, и почему.
  */
 const DRIVERS = DRIVER_VALUES.map((value) => ({
   value,
@@ -43,6 +45,88 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
     setMessage(`область ${res.slug} создана`)
     setCreating(false)
     setForm({ slug: '', title: '', folder: '', karman: '' })
+  }
+
+  /**
+   * Ячейка строки по колонке. Порядок ячеек задаётся `AREA_COLUMNS` — тем же
+   * списком, что и шапки, — поэтому колонка «Водитель» не может «уехать» в
+   * конец: она в том же списке, что и остальные (промт #177, п. 2, 10).
+   */
+  const cell = (key: AreaSortKey, area: Area) => {
+    switch (key) {
+      case 'area':
+        return (
+          <>
+            <div className="title">{area.title}</div>
+            <div className="muted small">
+              {area.slug}
+              {area.folder ? ` · ${area.folder}` : ''}
+            </div>
+          </>
+        )
+      case 'running':
+        return (
+          <>
+            <span className={`dot ${area.running ? 'ok' : 'off'}`} />
+            {area.running ? 'да' : 'нет'}
+          </>
+        )
+      case 'account':
+        return (
+          <>
+            <div>{area.account?.state ?? '—'}</div>
+            {area.account?.email && <div className="muted small">{area.account.email}</div>}
+          </>
+        )
+      case 'points':
+        return <>{area.points?.points_today ?? '—'}</>
+      case 'mode':
+        // ⚠️ Промт КАРМАНА #177 (п. 1): «Режим» — две небольшие кнопки, обе
+        // подписи всегда на виду, включённая выделена. ОДНА кнопка с
+        // меняющейся надписью тут больше не годится.
+        return (
+          <div className="mode-switch">
+            {MODE_BUTTONS.map((button) => (
+              <button
+                key={button.label}
+                className={`mode-btn ${area.autoheal === button.autoheal ? 'on' : 'off'}`}
+                disabled={busy}
+                title={button.hint}
+                aria-pressed={area.autoheal === button.autoheal}
+                onClick={() =>
+                  void run(() => api.setAutoheal(area.slug, button.autoheal))
+                }
+              >
+                {button.label}
+              </button>
+            ))}
+          </div>
+        )
+      case 'driver':
+        return <DriverCell area={area} busy={busy} run={run} />
+      case 'sessions':
+        return area.sessions.length === 0 ? (
+          <span className="muted">—</span>
+        ) : (
+          <div className="chips">
+            {area.sessions.slice(0, 3).map((session) => (
+              <span
+                key={session.session_id}
+                className={`chip ${verdictClass(session.verdict)}`}
+                title={session.reason}
+              >
+                {session.verdict}
+                {session.fill ? ` ${session.fill}%` : ''}
+              </span>
+            ))}
+            {area.sessions.length > 3 && (
+              <span className="chip muted">+{area.sessions.length - 3}</span>
+            )}
+          </div>
+        )
+      default:
+        return null
+    }
   }
 
   return (
@@ -89,7 +173,7 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
               />
             </label>
             <label>
-              Раздел КАРМАНа
+              Раздел КАРМАНА
               <input
                 value={form.karman}
                 onChange={(e) => setForm({ ...form, karman: e.target.value })}
@@ -129,80 +213,17 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
                 </button>
               </th>
             ))}
-            <th>Водитель</th>
             <th>Действия</th>
           </tr>
         </thead>
         <tbody>
           {sorted.map((area) => (
             <tr key={area.slug}>
-              <td>
-                <div className="title">{area.title}</div>
-                <div className="muted small">
-                  {area.slug}
-                  {area.folder ? ` · ${area.folder}` : ''}
-                </div>
-              </td>
-              <td>
-                <span className={`dot ${area.running ? 'ok' : 'off'}`} />
-                {area.running ? 'да' : 'нет'}
-              </td>
-              <td>
-                <div>{area.account?.state ?? '—'}</div>
-                {area.account?.email && <div className="muted small">{area.account.email}</div>}
-              </td>
-              <td>{area.points?.points_today ?? '—'}</td>
-              <td>
-                <button
-                  className={`toggle ${area.autoheal ? 'on' : 'off'}`}
-                  disabled={busy}
-                  onClick={() =>
-                    void run(() => api.setAutoheal(area.slug, !area.autoheal))
-                  }
-                >
-                  {area.autoheal ? 'Автомат' : 'Вручную'}
-                </button>
-              </td>
-              <td>
-                {area.sessions.length === 0 ? (
-                  <span className="muted">—</span>
-                ) : (
-                  <div className="chips">
-                    {area.sessions.slice(0, 3).map((session) => (
-                      <span
-                        key={session.session_id}
-                        className={`chip ${verdictClass(session.verdict)}`}
-                        title={session.reason}
-                      >
-                        {session.verdict}
-                        {session.fill ? ` ${session.fill}%` : ''}
-                      </span>
-                    ))}
-                    {area.sessions.length > 3 && (
-                      <span className="chip muted">+{area.sessions.length - 3}</span>
-                    )}
-                  </div>
-                )}
-              </td>
-              <td>
-                <select
-                  value={area.driver || 'auto'}
-                  disabled={busy}
-                  title={driverHint(area)}
-                  onChange={(e) =>
-                    void run(() => api.setDriver(area.slug, e.target.value))
-                  }
-                >
-                  {DRIVERS.map((item) => (
-                    <option key={item.value} value={item.value}>
-                      {item.label}
-                    </option>
-                  ))}
-                </select>
-                <div className="muted small">
-                  {area.driverNow?.title ? `сейчас: ${area.driverNow.title}` : 'сейчас: —'}
-                </div>
-              </td>
+              {AREA_COLUMNS.map((column) => (
+                <td key={column.key} className={`col-${column.key}`}>
+                  {cell(column.key, area)}
+                </td>
+              ))}
               <td className="actions">
                 <button className="ghost" disabled={busy} onClick={() => void run(() => api.start(area.slug))}>
                   Старт
@@ -246,5 +267,48 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
         </p>
       )}
     </section>
+  )
+}
+
+/**
+ * Ячейка «Водитель» — узкая колонка сразу за «Режимом» (промт КАРМАНА #177,
+ * п. 2): переключатель с тремя вариантами и короткая строка «сейчас: …»,
+ * которая колонку не раздувает (полный текст — во всплывающей подсказке).
+ */
+function DriverCell({
+  area,
+  busy,
+  run
+}: {
+  area: Area
+  busy: boolean
+  run: (action: () => Promise<unknown>) => Promise<void>
+}) {
+  const value = driverValue(area)
+  const now = area.driverNow
+  const byRule = now?.source === 'правило'
+  const nowText = now?.title
+    ? `сейчас: ${now.title}${byRule ? ' (по правилу)' : ''}`
+    : 'сейчас: —'
+  const nowTitle = now?.why ? `${nowText} — ${now.why}` : nowText
+  return (
+    <>
+      <select
+        className="driver-select"
+        value={value}
+        disabled={busy}
+        title={driverHint(area)}
+        onChange={(e) => void run(() => api.setDriver(area.slug, e.target.value))}
+      >
+        {DRIVERS.map((item) => (
+          <option key={item.value} value={item.value} title={item.hint}>
+            {item.label}
+          </option>
+        ))}
+      </select>
+      <div className="muted small driver-now" title={nowTitle}>
+        {nowText}
+      </div>
+    </>
   )
 }
