@@ -118,6 +118,12 @@ PROBE_TEXTS = ("ping", "пинг", "probe")
 # (`driver_of`, `live_manager_session`, `live_sessions`).
 RECOVERY_WAIT = 900      # после восстановления сети ждём 15 минут перед «Продолжай»
 REVIVE_COOLDOWN = 900    # не чаще одного «Продолжай» на сессию за 15 минут
+#: ⚠️ ПРОМТ КАРМАНА #177 (п. 7): зависшая сессия (ход идёт, а сообщений
+#: нет) — это «задание не выполнено, но нитка встала». Встроенная нейросеть
+#: решает, что с ней делать, а «продолжать» — это **попытка продолжения**.
+#: Попытки не должны повторяться бесконечно ⇒ предел:
+STUCK_ATTEMPT_LIMIT = 3      # столько попыток продолжения на одну зависшую сессию
+STUCK_REACTION_WAIT = 600    # сколько ждём реакцию агента на попытку (10 минут)
 CONTEXT_LIMIT = 95       # верхняя граница: процент заполнения контекста, после которого ротация
 CONTEXT_ROTATE = 60      # backstop: НИЖЕ минимальной наблюдённой точки сжатия.
                           # ⚠️ Точка сжатия не выражается стабильным процентом (замер 22.11
@@ -995,6 +1001,10 @@ def treatment_facts(area: dict, sess: dict, verdict: dict, passport: dict,
     отчёт о выполнении, событие сжатия контекста, заполнение контекста,
     когда был последний ход, репозиторий/ветка/worktree нитки, что осталось,
     критерии приёмки, открытые PR и параллельные сессии того же репозитория.
+
+    ⚠️ ПРОМТ КАРМАНА #177 (п. 6): встроенная нейросеть **смотрит на вывод
+    сессии** — последнее слово и выводы («выполнила такую-то работу»). Поэтому
+    вывод сессии (`last_text`) — часть фактов, а не украшение.
     """
     return {
         "area": str(area.get("slug") or ""),
@@ -1002,6 +1012,8 @@ def treatment_facts(area: dict, sess: dict, verdict: dict, passport: dict,
         "reason": verdict.get("reason"),
         "has_report": bool(verdict.get("has_report")),
         "report_kind": verdict.get("report_kind") or "",
+        # вывод сессии — чтобы решение принималось по словам агента
+        "last_text": (verdict.get("last_text") or "")[:1500],
         "compaction": verdict.get("compaction") or {},
         "context": verdict.get("context") or {"fill": verdict.get("fill"),
                                               "peak_fill": verdict.get("peak_fill")},
@@ -1040,6 +1052,11 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
                     "source": decision.get("source") or "",
                     "reason": decision.get("reason") or "",
                     "instruction": instruction}
+    # ⚠️ Промт КАРМАНА #177 (п. 6): сессия, чья работа **уже завершена**
+    # (вердикт «готова» — завершение определено по выводу сессии), не требует
+    # команды закрытия: она и так закрыта. Лишняя команда — лишний ход и лишние
+    # очки. Проверка «сессия закрылась корректно» при этом остаётся.
+    already_done = str((verdict or {}).get("verdict") or "") == "готова"
     if action == thread.CONTINUE:
         # Ничего разрушающего: ни «заверши работу», ни архивирования.
         report["ok"] = True
@@ -1061,11 +1078,14 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         # Паспорт снимаем ДО закрытия — нитка не теряется ни при каком исходе.
         thread.save_passport(passport)
         report["steps"].append({"passport": "сохранён"})
-        res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
-        report["steps"].append({"close_command": res})
-        if not res.get("ok"):
-            report["why"] = "команду закрытия не приняли: %s" % res.get("why")
-            return report
+        if already_done:
+            report["steps"].append({"close_command": "не нужна: работа уже завершена"})
+        else:
+            res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
+            report["steps"].append({"close_command": res})
+            if not res.get("ok"):
+                report["why"] = "команду закрытия не приняли: %s" % res.get("why")
+                return report
         closed = wait_closed(area, sess["session_id"])
         report["steps"].append({"closed": closed})
         if not closed:
@@ -1080,11 +1100,14 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         # Перенос нитки: паспорт → завершение → архив → новая сессия.
         thread.save_passport(passport)
         report["steps"].append({"passport": "сохранён"})
-        res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
-        report["steps"].append({"close_command": res})
-        if not res.get("ok"):
-            report["why"] = "команду закрытия не приняли: %s" % res.get("why")
-            return report
+        if already_done:
+            report["steps"].append({"close_command": "не нужна: работа уже завершена"})
+        else:
+            res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
+            report["steps"].append({"close_command": res})
+            if not res.get("ok"):
+                report["why"] = "команду закрытия не приняли: %s" % res.get("why")
+                return report
         closed = wait_closed(area, sess["session_id"])
         report["steps"].append({"closed": closed})
         if not closed:
@@ -1126,6 +1149,24 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         # новая» соблюдён. Право на исключение есть только у решения
         # «Управляющего» (правило-фолбэк перенос нитки не выбирает).
         by_decision = str(decision.get("source") or "") == "Управляющий"
+        # ⚠️ ПРОМТ КАРМАНА #177 (п. 6): нитка должна **продвигаться**. Если с
+        # прошлого переноса нового «сделано» не появилось (та же сводка) —
+        # новая сессия не поднимается: иначе нитка крутится вхолостую (сессия
+        # за сессией, а работы столько же). Запись — в состоянии сторожа, по
+        # нитке (thread_id).
+        rot = state.setdefault("rotations", {})
+        tid = str(passport.get("thread_id") or "")
+        prev = rot.get(tid) or {}
+        done_now = summary.strip()
+        if prev and done_now and done_now == str(prev.get("done") or "").strip():
+            rot[tid] = {"done": done_now, "at": core.now_ms()}
+            report["ok"] = True
+            report["why"] = ("нитка не продвинулась с прошлого переноса — "
+                             "новая сессия не поднимается")
+            core.log("СЕССИИ: %s — нитка не продвинулась с прошлого переноса: "
+                     "новая сессия не поднимается" % sess["session_id"][:12])
+            return report
+        rot[tid] = {"done": done_now, "at": core.now_ms()}
         opened = new_session(area, text, folder=str(passport.get("worktree") or ""),
                              by_decision=by_decision)
         report["steps"].append({"new_session": opened})
@@ -1208,6 +1249,41 @@ def survey(area: dict, state: dict) -> list:
     return out
 
 
+def stuck_reaction(v: dict, state: dict) -> str:
+    """Реакция агента на попытку продолжить зависшую сессию (#177, п. 7).
+
+    Возвращает "" — реакции пока нет (ждём). Иначе — что получилось:
+    очки кончились / работа идёт дальше / работа закончена / реакции нет.
+
+    Реакция читается из **состояния сессии**, а не из наших предположений:
+    заговорил агент (вывод изменился) — работа идёт; пришёл отказ по очкам —
+    кончились; вердикт «готова» — работа закончена.
+    """
+    stuck = state.get("stuck") or {}
+    rec = stuck.get(v["session_id"]) or {}
+    pending = rec.get("pending")
+    if not pending:
+        return ""
+    if v["verdict"] == "ход завис":
+        # сессия молчит — реакции ещё нет: ждём, сколько положено
+        waited = core.now_ms() - int(pending.get("at") or 0)
+        if waited < STUCK_REACTION_WAIT * 1000:
+            return ""
+        rec["pending"] = None
+        stuck[v["session_id"]] = rec
+        return ("реакции нет: сессия молчит и дальше (%d с) — ждём следующей попытки"
+                % (waited // 1000))
+    rec["pending"] = None
+    stuck[v["session_id"]] = rec
+    if v["verdict"] == "кончились очки":
+        return "очки кончились (попытка продолжения вскрыла отказ по очкам)"
+    if v["verdict"] == "готова":
+        return "работа закончена: сессия закрылась сама после попытки продолжения"
+    if (v.get("last_text") or "") != (pending.get("text") or ""):
+        return "работа идёт дальше: агент ответил после попытки продолжения"
+    return "работа идёт дальше (вердикт: %s)" % v["verdict"]
+
+
 def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
     """Действия по вердиктам: оживление и ротация."""
     actions = []
@@ -1233,6 +1309,41 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
             actions.append({"session": v["session_id"],
                             "action": "сессия Управляющего — не трогаем"})
             continue
+        # ⚠️ ПРОМТ КАРМАНА #177 (п. 7): реакция на попытку продолжения
+        # зависшей сессии. Смотрим ДО отсева «готова/работает» — реакция может
+        # быть и «работа идёт дальше».
+        reaction = stuck_reaction(v, state)
+        if reaction:
+            actions.append({"session": v["session_id"],
+                            "action": "зависшая сессия — %s" % reaction,
+                            "driver": drv["driver"], "why": drv["why"]})
+            core.log("СЕССИИ: %s — зависшая сессия: %s" % (slug, reaction))
+            core.report("info", "session", "%s: зависшая сессия — %s" % (slug, reaction),
+                        area=slug)
+        if v["verdict"] == "готова" and not v.get("archived"):
+            # ⚠️ ПРОМТ КАРМАНА #177 (п. 6): завершение работы определяется **по
+            # выводу сессии** (последнее слово, выводы «выполнила такую-то
+            # работу»). Решение принимает встроенная нейросеть: работа
+            # закончена — закрыть, архивировать и поднять новую сессию с
+            # продолжением нитки разработки; не закончена — продолжить.
+            #
+            # Под водителем «Внешнее управление» или «Оператор» автомат в
+            # сессии **не вмешивается**: жить сессией водит внешний агент
+            # (слова о невыполненном действии пишутся там, где действие
+            # действительно было бы, — см. ветки ниже).
+            if drv["driver"] != core.DRIVER_AUTOMATON:
+                continue
+            if dry_run:
+                actions.append({"session": v["session_id"],
+                                "action": "работа завершена — решение «Управляющего» (сухой прогон)"})
+                continue
+            sess = {"session_id": v["session_id"], "title": v["title"],
+                    "workspace_dir": v.get("workspace_dir") or area.get("folder", "")}
+            rep = treat_session(area, sess, v, state)
+            actions.append({"session": v["session_id"],
+                            "action": "работа завершена: %s" % (rep.get("action") or "—"),
+                            "report": rep})
+            continue
         if v["verdict"] in ("готова", "работает", "ждёт владельца"):
             continue
         # Дальше — только решения, которые меняют жизнь сессии. Здесь решает
@@ -1247,6 +1358,59 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                                                v.get("reason") or ""), area=slug)
             core.log("СЕССИИ: %s — водитель — %s, действие не выполнялось (%s): %s"
                      % (slug, drv["title"], v["verdict"], v.get("reason") or ""))
+            continue
+        if v["verdict"] == "ход завис":
+            # ⚠️ ПРОМТ КАРМАНА #177 (п. 7): задание не выполнено, а сессия
+            # встала (ход идёт, но сообщений нет). Решение принимает
+            # **встроенная нейросеть** — она смотрит на вывод сессии; её
+            # «продолжать» — это **попытка продолжения**.
+            #
+            # Попытки ограничены (STUCK_ATTEMPT_LIMIT): иначе «зависшая» нитка
+            # получала бы «Продолжай» до бесконечности. Когда попытки
+            # исчерпаны — пишем это в журнал и в отчёт и больше не трогаем
+            # сессию (решение о её жизни принимает владелец).
+            stuck = state.setdefault("stuck", {})
+            rec = stuck.get(v["session_id"]) or {}
+            attempt = int(rec.get("attempt") or 0)
+            why = v.get("reason") or "ход идёт, сообщений нет"
+            if attempt >= STUCK_ATTEMPT_LIMIT:
+                actions.append({"session": v["session_id"],
+                                "action": ("зависшая сессия — попытки исчерпаны (%d), "
+                                           "больше не продолжаем" % attempt),
+                                "driver": drv["driver"], "why": drv["why"]})
+                core.log("СЕССИИ: %s — зависшая сессия: попытки исчерпаны (%d): %s"
+                         % (slug, attempt, why))
+                core.report("warn", "session",
+                            "%s: зависшая сессия — попытки исчерпаны (%d): %s"
+                            % (slug, attempt, why), area=slug)
+                continue
+            if dry_run:
+                actions.append({"session": v["session_id"],
+                                "action": "зависшая сессия — решение «Управляющего» (сухой прогон)"})
+                continue
+            sess = {"session_id": v["session_id"], "title": v["title"],
+                    "workspace_dir": v.get("workspace_dir") or area.get("folder", "")}
+            rep = treat_session(area, sess, v, state)
+            decision = (rep.get("decision") or {}).get("action")
+            if decision == thread.CONTINUE:
+                # Попытка продолжения сделана — ждём реакцию агента.
+                attempt += 1
+                stuck[v["session_id"]] = {
+                    "attempt": attempt,
+                    "pending": {"at": core.now_ms(), "text": v.get("last_text") or "",
+                                "why": why},
+                    "at": core.now_ms(),
+                }
+                core.log("СЕССИИ: %s — зависшая сессия: попытка продолжения %d из %d (%s)"
+                         % (slug, attempt, STUCK_ATTEMPT_LIMIT, why))
+                core.report("info", "session",
+                            "%s: зависшая сессия — попытка продолжения %d из %d (%s)"
+                            % (slug, attempt, STUCK_ATTEMPT_LIMIT, why), area=slug)
+            else:
+                stuck[v["session_id"]] = {"attempt": attempt}
+            actions.append({"session": v["session_id"],
+                            "action": "зависшая сессия: %s" % (rep.get("action") or "—"),
+                            "report": rep})
             continue
         if v["verdict"] == "кончились очки":
             # ⚠️ ПРОМТ #174: аккаунты и сессии — РАЗНЫЕ автоматы. Лечащий
@@ -1366,10 +1530,9 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
             # живая сессия (своя или чужая). Здесь мы ничего не поднимаем —
             # только оживляем существующую, — но решение «новая сессия» ниже
             # запрет соблюдает (`new_session`).
-            # «Ход завис» сюда НЕ входит: сорвать зависший ход и положить
-            # «Продолжай» в начало умеет лечащий (перезапуск области) — если
-            # послать «Продолжай» сюда, оно встанет в очередь за висящим ходом
-            # и не разбудит нитку (та самая беда, что чинили 18.11).
+            # «Ход завис» сюда НЕ входит: он разобран выше отдельной веткой
+            # (промт КАРМАНА #177, п. 7) — там решение принимает встроенная
+            # нейросеть и делается **попытка продолжения** с пределом попыток.
             if cool:
                 continue
             if dry_run:

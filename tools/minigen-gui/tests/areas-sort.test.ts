@@ -12,6 +12,9 @@ import {
  * Сортировка списка областей по клику на шапку столбца (заказ владельца
  * 24.11): «Область · Работает · Вход · Очки · Режим · Сессии · Действия».
  *
+ * ⚠️ Промт КАРМАНА #177 (27.11): колонка «Водитель» стоит **вплотную за
+ * «Режимом»** и тоже сортируется.
+ *
  * По умолчанию — по статусу «Работает», работающие сверху.
  */
 
@@ -140,7 +143,56 @@ describe('сортировка областей', () => {
       'Вход',
       'Очки',
       'Режим',
+      'Водитель',
       'Сессии'
+    ])
+  })
+
+  it('«Водитель» стоит вплотную за «Режимом»', () => {
+    const labels = AREA_COLUMNS.map((item) => item.label)
+    expect(labels.indexOf('Водитель')).toBe(labels.indexOf('Режим') + 1)
+    expect(labels.indexOf('Водитель')).toBeLessThan(labels.indexOf('Сессии'))
+  })
+
+  it('по водителю — в порядке самого переключателя', () => {
+    const mixed = [
+      area({ slug: 'оператор', driver: 'none' }),
+      area({ slug: 'внешний', driver: 'manager' }),
+      area({ slug: 'миниген', driver: 'automaton' })
+    ]
+    const sort = nextSort(DEFAULT_AREA_SORT, 'driver')
+    expect(sort).toEqual({ key: 'driver', dir: 'asc' })
+    expect(sortAreas(mixed, sort).map((item) => item.slug)).toEqual([
+      'внешний',
+      'миниген',
+      'оператор'
+    ])
+    const back = nextSort(sort, 'driver')
+    expect(sortAreas(mixed, back).map((item) => item.slug)).toEqual([
+      'оператор',
+      'миниген',
+      'внешний'
+    ])
+  })
+
+  it('по водителю смотрим на того, кто водит фактически (правило ядра)', () => {
+    const mixed = [
+      area({
+        slug: 'по-правилу-внешний',
+        driver: '',
+        driverNow: {
+          driver: 'manager',
+          title: 'Внешнее управление',
+          why: 'по правилу: в области работает сессия Управляющего',
+          source: 'правило'
+        }
+      }),
+      area({ slug: 'явно-оператор', driver: 'none' })
+    ]
+    const sort = nextSort(DEFAULT_AREA_SORT, 'driver')
+    expect(sortAreas(mixed, sort).map((item) => item.slug)).toEqual([
+      'по-правилу-внешний',
+      'явно-оператор'
     ])
   })
 })
