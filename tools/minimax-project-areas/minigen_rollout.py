@@ -72,15 +72,21 @@ FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
          # грузит его как **мягкую зависимость** (рядом с собой) ⇒ без него в
          # списке раскатка затирала бы свежую правку лечащего старым модулем,
          # а порог «остаток очков» на машине жил бы не из master'а.
-         "minimax-points.py",
-         # 27.11 (шестнадцатая смена): конфиг областей. Без него в списке
-         # раскатка держала бы на машине **тот** конфиг, какой там есть, и
-         # репозиторий (эталон) расходился бы с машиной молча: четыре области,
-         # заведённые на машине, в репозитории не появлялись, а правка поля
-         # «Раздел КАРМАНА» (G732) не доезжала. Файл читает и лечащий, и
-         # сторож сессий (`core.CONFIG`), и **нет у него запасного пути**:
-         # нет файла ⇒ ноль областей ⇒ демоны молча делают ничего.
-         "mcode-project-areas.json")
+         "minimax-points.py")
+# ⚠️ **Конфиг областей (`mcode-project-areas.json`) в списке раскатки НЕТ — и
+# это решение, а не забывчивость** (канон владельца 27.11):
+#
+# - области — **локальная вещь компьютера**: рабочие папки агентов и их
+#   состав живут на машине владельца, а на другом компьютере должны быть
+#   **свои** локальные области. Синхронизировать их на GitHub нельзя;
+# - поэтому конфиг **не лежит в репозитории** и **не приезжает раскаткой**:
+#   раскатка, доставляющая список областей, залила бы чужие локальные
+#   области на чужую машину (или стёрла бы свои);
+# - конфиг пишет **сама программа** (`minigen_state.write_projects`, атомарно) —
+#   он и есть источник правды на машине;
+# - приёмка `test_rollout_covers_runtime_files.py` знает про такой класс:
+#   файл без запасного пути, но **локальный**, обязан быть и в списке
+#   раскатки **отсутствовать**, и в git **отсутствовать**.
 # ⚠️ 23.11: `minimax-autheal.py` в списке НЕ БЫЛ — раскатка выкладывала
 # сторожей, но не лечащего. Отсюда и расхождение «репозиторий ↔ машина»:
 # правки лечащего жили только на машине, а эталон (master) отставал, и
@@ -112,112 +118,6 @@ FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
 # перезапускает её — перезапуск панели заменён перезапуском ДЕМОНОВ:
 # их поднимает программа «МиниГен» (мост в режиме `--daemon`).
 
-
-
-#: Конфиг областей: его пишет **сама программа** (`minigen_state.write_projects`
-#: → `json.dumps(..., ensure_ascii=False, indent=2)`), поэтому файл в репозитории
-#: обязан быть **побайтно тем же**, что на машине: иначе каждая раскатка
-#: переписывала бы файл на машине в чужом формате, а программа — обратно.
-AREAS_CONFIG = "mcode-project-areas.json"
-
-#: Поля, которые переключает **владелец на машине** (панель «МиниГен»:
-#: «Автомат / Вручную» и водитель проекта). Репозиторий — эталон **структуры**
-#: (какие области есть, их названия, папки, разделы), машина — эталон
-#: **живого состояния**. Раскатка не должна молча откатывать решение владельца
-#: (припаркованный проект, который включился бы в автолечение, — это и
-#: лишние очки, и лишние перезапуски).
-RUNTIME_FIELDS = ("autoheal", "driver")
-
-
-def merge_areas_config(repo_bytes: bytes, live_bytes: bytes) -> tuple[bytes, dict]:
-    """Слить конфиг областей: структура — из репозитория, живое — с машины.
-
-    ⚠️ Зачем слияние, а не копия: файл на машине меняется **во время работы**
-    (владелец переключает «Автомат/Вручную», программа заводит области). Если
-    раскатка копирует репозиторий поверх машины молча, она откатывает эти
-    решения — и это ровно тот дефект, который мы чиним. Слияние говорит о
-    себе в отчёте: что добавлено, что сохранено, чего в репозитории не было.
-
-    Возвращает (байты конфига, отчёт).
-    """
-    try:
-        repo = json.loads(repo_bytes.decode("utf-8"))
-    except (ValueError, UnicodeDecodeError) as exc:
-        return repo_bytes, {"error": "конфиг из репозитория не читается: %s" % exc}
-    if not isinstance(repo, dict):
-        return repo_bytes, {"error": "конфиг из репозитория — не объект"}
-
-    try:
-        live = json.loads(live_bytes.decode("utf-8")) if live_bytes.strip() else {}
-    except (ValueError, UnicodeDecodeError):
-        live = {}
-    if not isinstance(live, dict):
-        live = {}
-
-    live_projects = {}
-    for item in live.get("projects") or []:
-        if isinstance(item, dict) and item.get("slug"):
-            live_projects[str(item["slug"])] = item
-
-    areas = []
-    changed = []
-    for item in repo.get("projects") or []:
-        if not isinstance(item, dict):
-            continue
-        area = dict(item)
-        slug = str(area.get("slug") or "")
-        old = live_projects.get(slug)
-        if old:
-            for field in RUNTIME_FIELDS:
-                if field in old:
-                    area[field] = old[field]
-            # ⚠️ Структура — по репозиторию, но **говорим**, что поменяли:
-            # молча откатить папку области (или раздел) — значит снести чужую
-            # работу вслепую.
-            for field, value in area.items():
-                if field in RUNTIME_FIELDS:
-                    continue
-                if field in old and old.get(field) != value:
-                    changed.append("%s.%s: %r → %r" % (slug, field, old.get(field), value))
-        areas.append(area)
-
-    known = {str(a.get("slug") or "") for a in areas}
-    live_only = []
-    for slug, old in live_projects.items():
-        if slug not in known:
-            areas.append(dict(old))
-            live_only.append(slug)
-
-    repo["projects"] = areas
-    out = json.dumps(repo, ensure_ascii=False, indent=2)
-    # ⚠️ Переводы строк — **как на машине**. Файл пишет программа
-    # (`minigen_state.write_projects` → `write_text` → на Windows это CRLF), а
-    # git с `core.autocrlf=true` отдаёт из репозитория LF. Если записать на
-    # машину LF, программа при следующей записи вернёт CRLF ⇒ файл «прыгает»
-    # при каждой раскатке (лишний шум и риск, что читатель поймает половину).
-    newline = "\r\n" if b"\r\n" in live_bytes else "\n"
-    if not live_bytes.strip():
-        newline = os.linesep
-    return out.replace("\n", newline).encode("utf-8"), {
-        "areas": len(areas), "live_only": sorted(live_only),
-        "changed": changed}
-
-
-def _write_atomic(path: Path, data: bytes) -> None:
-    """Записать файл целиком (tmp + переименование).
-
-    ⚠️ Файл читают живые демоны **во время работы**: читатель может поймать
-    половину файла. Программа пишет конфиг так же (атомарно) — потому мы так же.
-    """
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_bytes(data)
-    for _ in range(30):
-        try:
-            os.replace(str(tmp), str(path))
-            return
-        except PermissionError:
-            time.sleep(0.1)
-    path.write_bytes(data)
 
 
 def master_file(name: str, ref: str = "origin/master") -> bytes:
@@ -1055,25 +955,6 @@ def main() -> int:
     print("--- файлы ---")
     for name in FILES:
         data = master_file(name, ref)
-        if name == AREAS_CONFIG:
-            # ⚠️ Конфиг областей на машине меняется **во время работы** (владелец
-            # переключает «Автомат/Вручную», программа заводит области). Копия
-            # поверх молча откатывала бы эти решения ⇒ сливаем: структура из
-            # репозитория, живое состояние с машины.
-            live = b""
-            try:
-                live = (BIN / name).read_bytes()
-            except OSError:
-                pass
-            data, report = merge_areas_config(data, live)
-            _write_atomic(BIN / name, data)
-            print("   записан %-26s %d байт (областей: %s%s)"
-                  % (name, len(data), report.get("areas", "?"),
-                     ("; только на машине: " + ", ".join(report["live_only"]))
-                     if report.get("live_only") else ""))
-            for line in report.get("changed") or []:
-                print("      ⚠️ из репозитория: %s" % line)
-            continue
         (BIN / name).write_bytes(data)
         print("   записан %-26s %d байт" % (name, len(data)))
 

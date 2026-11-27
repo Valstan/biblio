@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import subprocess
 import sys
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -47,6 +48,18 @@ OPTIONAL_FILES = {
     "minigen-net.json": ("minigen_core.py", "Нет файла ⇒ дефолты"),
     "happ-servers.json": ("minimax-netwatch.py", "читается, если есть"),
 }
+
+#: Файлы, которые демон читает, но которые — **локальное состояние машины**:
+#: они **не приезжают раскаткой** и **не лежат в git** (канон владельца
+#: 27.11: области — чисто локальная вещь компьютера; на другом компьютере
+#: должны быть свои локальные области, и список чужих областей туда ехать
+#: не должен).
+#:
+#: Такие файлы проверяем **наоборот**: их не должно быть ни в списке раскатки,
+#: ни в отслеживаемых файлах репозитория. Если такой файл попадёт в git —
+#: чужие локальные области (и пути машины) уедут в публичный репозиторий; если
+#: попадёт в раскатку — машина получит чужие области.
+LOCAL_ONLY_FILES = ("mcode-project-areas.json",)
 
 #: Расширения файлов, которые демоны подгружают из `bin`.
 RUNTIME_EXT = ("py", "ps1", "json")
@@ -96,6 +109,25 @@ def runtime_files() -> set[str]:
             for name in found}
 
 
+def tracked_files() -> set[str]:
+    """Файлы, отслеживаемые git (по индексу) — имена без пути.
+
+    ⚠️ Именно индекс, а не каталог: неотслеживаемый файл в рабочем дереве
+    (например, оставшийся от прежней правки) в публичный репозиторий не уедет,
+    а вот отслеживаемый — уедет.
+    """
+    res = subprocess.run(["git", "-C", str(HERE), "ls-files", "--cached"],
+                         capture_output=True, text=True, timeout=60)
+    if res.returncode != 0:
+        return set()
+    out: set[str] = set()
+    for line in (res.stdout or "").splitlines():
+        name = line.strip().replace("\\", "/")
+        if name:
+            out.add(name.rsplit("/", 1)[-1])
+    return out
+
+
 def main() -> int:
     failures: list[str] = []
 
@@ -110,7 +142,7 @@ def main() -> int:
     print("   список раскатки: %s" % ", ".join(sorted(files)))
     print("   грузится в рантайме: %s" % ", ".join(sorted(runtime)))
 
-    missing = sorted(runtime - files - set(OPTIONAL_FILES))
+    missing = sorted(runtime - files - set(OPTIONAL_FILES) - set(LOCAL_ONLY_FILES))
     check(not missing,
           "в списке раскатки нет файлов, которые демоны грузят в рантайме: %s "
           "(правка в репозитории не доедет до машины)" % missing)
@@ -118,6 +150,20 @@ def main() -> int:
     for name in sorted(files):
         check((HERE / name).is_file(),
               "файл из списка раскатки не существует в репозитории: %s" % name)
+
+    # ⚠️ Локальное состояние машины — проверяем **наоборот** (канон 27.11).
+    print("   локальное состояние машины (не доезжает и не лежит в git): %s"
+          % ", ".join(sorted(LOCAL_ONLY_FILES)))
+    tracked = tracked_files()
+    for name in sorted(LOCAL_ONLY_FILES):
+        check(name not in files,
+              "локальный файл %s попал в список раскатки — машина получит "
+              "чужие области" % name)
+        check(name not in tracked,
+              "локальный файл %s отслеживается git — чужие локальные области "
+              "(и пути машины) уедут в публичный репозиторий" % name)
+        check(name in runtime,
+              "локальный файл %s демоны не читают — список устарел" % name)
 
     print("   необязательные (есть запасной путь в коде): %s"
           % ", ".join(sorted(OPTIONAL_FILES)))
