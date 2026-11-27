@@ -66,6 +66,7 @@ Updated: 2026-11-27 (пятнадцатая смена — **закрыт вто
 
 | где что | состояние |
 |---|---|
+| master | **`d537bd6`** — PR #240 влит squash'ем; гейты `gate` (46 с) + `panel` (3m6s) — SUCCESS |
 | машинный конфиг | **23 области**, побайтно = копия на диске в репозитории |
 | копия в репозитории | `tools/minimax-project-areas/mcode-project-areas.json` — на диске **побайтно** та же; в индексе git — LF (`core.autocrlf=true`), на машине — CRLF, как пишет программа (`write_text` на Windows) |
 | список раскатки | `mcode-project-areas.json` **включён** (17 файлов) |
