@@ -23,7 +23,8 @@
       "title": "Матрица РМЗ",
       "folder": "D:\\valstan\\REPO\\MatricaRMZ",
       "karman": "MatricaRMZ",
-      "autoheal": true
+      "autoheal": true,
+      "driver": "none"
     },
     {
       "slug": "matricarmz2",
@@ -59,7 +60,8 @@
       "title": "Сарафан",
       "folder": "D:\\valstan\\REPO\\sarafan",
       "karman": "SARAFAN",
-      "autoheal": true
+      "autoheal": true,
+      "driver": "none"
     },
     {
       "slug": "karman",
