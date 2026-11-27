@@ -67,7 +67,12 @@ FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
          # 26.11 (промт #172): паспорт нитки и решение о лечении сессии —
          # модуль сторожа сессий. Без него в списке демон на машине не
          # поднимется (сторож грузит его при старте).
-         "minigen_thread.py")
+         "minigen_thread.py",
+         # 27.11 (watchdog очков): модуль остатка очков и порогов. Лечащий
+         # грузит его как **мягкую зависимость** (рядом с собой) ⇒ без него в
+         # списке раскатка затирала бы свежую правку лечащего старым модулем,
+         # а порог «остаток очков» на машине жил бы не из master'а.
+         "minimax-points.py")
 # ⚠️ 23.11: `minimax-autheal.py` в списке НЕ БЫЛ — раскатка выкладывала
 # сторожей, но не лечащего. Отсюда и расхождение «репозиторий ↔ машина»:
 # правки лечащего жили только на машине, а эталон (master) отставал, и
@@ -775,7 +780,7 @@ def main() -> int:
     print("--- проверка ---")
     ok = True
     for name in ("minigen_core.py", "minigen_thread.py", "minimax-netwatch.py",
-                 "minimax-sessionwatch.py", "minimax-autheal.py"):
+                 "minimax-sessionwatch.py", "minimax-autheal.py", "minimax-points.py"):
         r = subprocess.run([sys.executable, "-m", "py_compile", str(BIN / name)],
                            capture_output=True, text=True)
         good = r.returncode == 0
