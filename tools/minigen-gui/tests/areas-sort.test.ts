@@ -5,15 +5,17 @@ import {
   DEFAULT_AREA_SORT,
   nextSort,
   sortAreas,
+  sortColumnsHint,
   sortLabel
 } from '../src/renderer/src/tabs/areas-sort'
 
 /**
  * Сортировка списка областей по клику на шапку столбца (заказ владельца
- * 24.11): «Область · Работает · Вход · Очки · Режим · Сессии · Действия».
+ * 24.11): «Область · Работает · Вход · Очки · Сессии · Состояние · Действия».
  *
- * ⚠️ Промт КАРМАНА #177 (27.11): колонка «Водитель» стоит **вплотную за
- * «Режимом»** и тоже сортируется.
+ * ⚠️ Промт КАРМАНА #182 (27.11): колонка «Режим» **убрана** (ручного режима
+ * больше нет), «Водитель» стал «Сессиями», бывшие «Сессии» — «Состоянием».
+ * Сортировки по «Режиму» больше нет; по новым колонкам — есть.
  *
  * По умолчанию — по статусу «Работает», работающие сверху.
  */
@@ -24,7 +26,7 @@ function area(over: Partial<Area> = {}): Area {
     title: 'Область',
     folder: '',
     karman: '',
-    autoheal: false,
+    autoheal: true,
     dir: 'p-a',
     running: false,
     exists: true,
@@ -107,16 +109,7 @@ describe('сортировка областей', () => {
     ])
   })
 
-  it('по режиму — «Автомат» сверху', () => {
-    const mixed = [
-      area({ slug: 'ручной', autoheal: false }),
-      area({ slug: 'автомат', autoheal: true })
-    ]
-    const sort = nextSort(DEFAULT_AREA_SORT, 'mode')
-    expect(sortAreas(mixed, sort).map((item) => item.slug)).toEqual(['автомат', 'ручной'])
-  })
-
-  it('по сессиям — по их количеству', () => {
+  it('по «Состоянию» — по числу сессий', () => {
     const mixed = [
       area({ slug: 'одна', sessions: [{ session_id: '1' } as never] }),
       area({ slug: 'три', sessions: [1, 2, 3].map((n) => ({ session_id: String(n) } as never)) })
@@ -134,6 +127,9 @@ describe('сортировка областей', () => {
   it('подпись шапки показывает столбец и направление', () => {
     expect(sortLabel(DEFAULT_AREA_SORT)).toBe('Работает ▼')
     expect(sortLabel({ key: 'area', dir: 'asc' })).toBe('Область ▲')
+    // переименованные колонки (#182)
+    expect(sortLabel({ key: 'driver', dir: 'asc' })).toBe('Сессии ▲')
+    expect(sortLabel({ key: 'sessions', dir: 'desc' })).toBe('Состояние ▼')
   })
 
   it('столбцы — все, кроме «Действия»', () => {
@@ -142,19 +138,33 @@ describe('сортировка областей', () => {
       'Работает',
       'Вход',
       'Очки',
-      'Режим',
-      'Водитель',
-      'Сессии'
+      'Сессии',
+      'Состояние'
     ])
   })
 
-  it('«Водитель» стоит вплотную за «Режимом»', () => {
+  it('сортировки по «Режиму» больше нет', () => {
     const labels = AREA_COLUMNS.map((item) => item.label)
-    expect(labels.indexOf('Водитель')).toBe(labels.indexOf('Режим') + 1)
-    expect(labels.indexOf('Водитель')).toBeLessThan(labels.indexOf('Сессии'))
+    expect(labels).not.toContain('Режим')
+    // `String(...)` — проверка остаётся рабочей и после того, как ключ «mode»
+    // исчез из типа `AreaSortKey`.
+    expect(AREA_COLUMNS.some((item) => String(item.key) === 'mode')).toBe(false)
   })
 
-  it('по водителю — в порядке самого переключателя', () => {
+  it('«Сессии» (бывшая «Водитель») стоит перед «Состоянием»', () => {
+    const labels = AREA_COLUMNS.map((item) => item.label)
+    expect(labels.indexOf('Сессии')).toBe(labels.indexOf('Очки') + 1)
+    expect(labels.indexOf('Сессии')).toBeLessThan(labels.indexOf('Состояние'))
+  })
+
+  it('подсказка со списком колонок совпадает с экраном', () => {
+    expect(sortColumnsHint()).toBe(
+      AREA_COLUMNS.map((item) => item.label).join(' · ')
+    )
+    expect(sortColumnsHint()).toBe('Область · Работает · Вход · Очки · Сессии · Состояние')
+  })
+
+  it('по водителю (колонка «Сессии») — в порядке самого переключателя', () => {
     // ⚠️ Заказ владельца 27.11: положений переключателя **два** — «Миниген» и
     // «Оператор», а «Внешнее управление» и «Оператор» — одно и то же положение
     // (управление внешнее; оператор или другой агент — без разницы). Значит
