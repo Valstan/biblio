@@ -8,8 +8,9 @@
 1. **Предел простоя вынесен явно** — «“Продолжать” без единого действия —
    сессия может стоять долго. Нужен предел (например, N часов без отчёта ⇒
    перенос нитки) — это решение владельца, вынеси его явно и не выбирай сам».
-   Значит: константа есть, значение **не выбрано** (0 = выключено), а когда
-   владелец её включит — молчащая нитка переносится, а не стоит вечно.
+   Значит: константа есть, а значение выбирает **владелец** — **27.11.2026 он
+   выбрал 2 часа** (до этого был 0 = выключено). Молчащая нитка переносится, а
+   не стоит вечно.
 2. **Секретов в паспорте нет** (D-038): паспорт наполняется текстом агента
    (сводка, handoff, отчёт) — а агент иногда печатает токен или ключ.
 
@@ -42,11 +43,11 @@ def main() -> int:
 
     thread = load_module("thread_172_gaps", HERE / "minigen_thread.py")
 
-    print("1) предел простоя вынесен явно, а значение не выбрано")
+    print("1) предел простоя вынесен явно, значение выбрал владелец (2 ч)")
     check(hasattr(thread, "STUCK_LIMIT_HOURS"),
           "в модуле нет константы предела простоя")
-    check(thread.STUCK_LIMIT_HOURS == 0,
-          "предел простоя включён без решения владельца: %s"
+    check(thread.STUCK_LIMIT_HOURS == 2,
+          "предел простоя — решение владельца (27.11.2026): 2 часа, а не %s"
           % thread.STUCK_LIMIT_HOURS)
     src = (HERE / "minigen_thread.py").read_text(encoding="utf-8")
     check("STUCK_LIMIT_HOURS" in src and "решение владельца" in src.lower(),
@@ -64,16 +65,26 @@ def main() -> int:
     check(got["action"] == thread.FINISH,
           "при отчёте правило не завершает: %s" % got["action"])
 
-    print("4) когда владелец включает предел — молчащая нитка переносится")
+    print("4) при выбранном владельцем пределе — молчащая нитка переносится")
     old = thread.STUCK_LIMIT_HOURS
-    thread.STUCK_LIMIT_HOURS = 6
     try:
+        # сначала — на выбранном владельцем значении (2 ч), без подмены
+        got = thread.fallback_decision({"has_report": False,
+                                        "last_turn": {"idle_min": 60 * 2}})
+        check(got["action"] == thread.NEW_SESSION,
+              "при пределе 2 ч нитка, молчащая 2 ч, не перенесена: %s" % got["action"])
+        check("паспорт" in str(got.get("instruction") or "").lower(),
+              "инструкция переноса не упоминает паспорт: %s" % got.get("instruction"))
+        got = thread.fallback_decision({"has_report": False,
+                                        "last_turn": {"idle_min": 60}})
+        check(got["action"] == thread.CONTINUE,
+              "нить перенесена раньше предела: %s" % got["action"])
+        # и на другом значении — правило работает при любом включённом пределе
+        thread.STUCK_LIMIT_HOURS = 6
         got = thread.fallback_decision({"has_report": False,
                                         "last_turn": {"idle_min": 60 * 7}})
         check(got["action"] == thread.NEW_SESSION,
               "молчащая нитка не перенесена при включённом пределе: %s" % got["action"])
-        check("паспорт" in str(got.get("instruction") or "").lower(),
-              "инструкция переноса не упоминает паспорт: %s" % got.get("instruction"))
         got = thread.fallback_decision({"has_report": False,
                                         "last_turn": {"idle_min": 10}})
         check(got["action"] == thread.CONTINUE,
