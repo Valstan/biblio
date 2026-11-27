@@ -140,6 +140,36 @@ class DriverSwitchTest(unittest.TestCase):
         self.assertEqual(out.get("title"), "—")
         self.assertTrue(out.get("why"))
 
+    def test_switch_has_exactly_two_positions(self) -> None:
+        """Переключатель — два положения (заказ владельца 27.11).
+
+        ⚠️ «Внешнее управление» (`manager`) и «Оператор» (`none») — одно
+        положение (управление внешнее; оператор или другой агент — без разницы),
+        поэтому в переключателе его нет: там **«Миниген»** и **«Оператор»**.
+        В ядре значение `manager` осталось — это ответ **правила** (в области
+        работает Управляющий ⇒ водит он), и правило обязано его уметь назвать.
+        """
+        import minigen_tools as tools
+
+        tool = tools.by_name()["areas.set_driver"]
+        props = tool["parameters"]["properties"]
+        enum = list(props["driver"]["enum"])
+        self.assertEqual(sorted(enum), ["auto", "automaton", "none"],
+                         "в переключателе должны быть только два положения "
+                         "(и «по правилу» для ядра)")
+        self.assertNotIn("manager", enum)
+
+    def test_legacy_manager_value_is_still_accepted(self) -> None:
+        """Старое значение из прежнего переключателя — не ломаем.
+
+        В конфиге области может остаться `manager` (переключатель раньше его
+        предлагал) ⇒ команда обязана его принять, а не ругаться.
+        """
+        bridge_cls, fake = self._bridge()
+        result = bridge_cls.cmd_set_driver(fake, {"slug": "brain", "driver": "manager"})
+        self.assertTrue(result.get("ok"), result)
+        self.assertEqual(self._projects()[0].get("driver"), "manager")
+
 
 if __name__ == "__main__":
     unittest.main()
