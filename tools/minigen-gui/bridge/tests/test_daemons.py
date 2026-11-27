@@ -300,6 +300,33 @@ class ConfigWriteRaceTest(unittest.TestCase):
         final = json.loads(self.core.CONFIG.read_text(encoding="utf-8"))
         self.assertEqual(len(final["projects"]), 29)
 
+    def test_write_keeps_a_local_backup(self) -> None:
+        """Перед записью — копия рядом (в git его нет, копия — единственная).
+
+        ⚠️ Конфиг областей — локальная вещь компьютера (канон владельца
+        27.11): в репозитории его нет ⇒ страховка живёт только тут.
+        """
+        state.write_projects({"projects": [{"slug": "первая", "autoheal": True}]})
+        backup = Path(str(self.core.CONFIG) + ".bak")
+        self.assertTrue(backup.is_file(), "локальной копии нет: %s" % backup)
+        first = json.loads(backup.read_text(encoding="utf-8"))
+        self.assertEqual(first["projects"][0]["slug"], "первая")
+
+        state.write_projects({"projects": [{"slug": "вторая", "autoheal": False}]})
+        again = json.loads(backup.read_text(encoding="utf-8"))
+        self.assertEqual(again["projects"][0]["slug"], "первая",
+                         "копия должна хранить ПРЕДЫДУЩЕЮ версию")
+
+    def test_broken_file_does_not_overwrite_the_backup(self) -> None:
+        """Битый файл не должен затереть хорошую копию."""
+        state.write_projects({"projects": [{"slug": "хорошая", "autoheal": True}]})
+        backup = Path(str(self.core.CONFIG) + ".bak")
+        self.core.CONFIG.write_text("{не json", encoding="utf-8")
+        state.write_projects({"projects": [{"slug": "новая", "autoheal": True}]})
+        saved = json.loads(backup.read_text(encoding="utf-8"))
+        self.assertEqual(saved["projects"][0]["slug"], "хорошая",
+                         "битый файл затерел хорошую копию")
+
     def test_write_reports_result(self) -> None:
         ok, err = state.write_projects({"projects": [{"slug": "x", "autoheal": True}]})
         self.assertTrue(ok, err)

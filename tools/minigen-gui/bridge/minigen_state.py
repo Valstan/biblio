@@ -270,18 +270,37 @@ def write_projects(cfg: dict[str, Any]) -> tuple[bool, str]:
     переименование повторяем: окно у читателя — миллисекунды. Если и это
     не помогло — пишем на место: действие владельца важнее атомарности, а
     читатель при сбое разбора перечитывает файл.
+
+    ⚠️ **Перед записью — локальная копия** (`…json.bak`). Конфиг областей —
+    **чисто локальная вещь компьютера** (канон владельца 27.11): рабочие
+    области агентов и их состав живут на машине, и в GitHub этому файлу не
+    место ⇒ копии в репозитории больше нет, и **единственная** страховка —
+    рядом на диске. Без неё побитый файл = потерянные области и потерянный
+    `authTemplate` (путь к области с авторизацией).
+
+    Правила копии (проверены приёмкой):
+
+    - текущий файл **читается** ⇒ в копию уходит **предыдущая годная версия**;
+    - текущий файл **бит** ⇒ хорошая копия **не трогается** (битое в копию не
+      годится);
+    - копии **не было** ⇒ после записи она появляется (иначе после первой
+      записи страховки нет вовсе).
     """
     core = load_daemons()["core"]
     try:
         cfg = dict(cfg)
         cfg.pop("_error", None)
         core.CONFIG.parent.mkdir(parents=True, exist_ok=True)
+        backup = Path(str(core.CONFIG) + ".bak")
+        prev_valid = _copy_if_valid(core.CONFIG, backup)
         tmp = core.CONFIG.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         last = ""
         for _ in range(30):
             try:
                 os.replace(str(tmp), str(core.CONFIG))
+                if not prev_valid and not backup.is_file():
+                    _copy_if_valid(core.CONFIG, backup)
                 return True, ""
             except PermissionError as exc:
                 last = str(exc)
@@ -295,9 +314,29 @@ def write_projects(cfg: dict[str, Any]) -> tuple[bool, str]:
             pass
         core.CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
                                encoding="utf-8")
+        if not prev_valid and not backup.is_file():
+            _copy_if_valid(core.CONFIG, backup)
         return True, "записано на место (атомарная замена не удалась: %s)" % last
     except OSError as exc:
         return False, str(exc)
+
+
+def _copy_if_valid(src: Path, dst: Path) -> bool:
+    """Скопировать файл в `dst`, **если он читается** (валидный JSON).
+
+    True — скопировали (и `dst` теперь годная копия). False — файла нет, он
+    бит или копия не записалась ⇒ вызывающий решает сам.
+    """
+    try:
+        text = src.read_text(encoding="utf-8")
+        json.loads(text)
+    except (OSError, ValueError):
+        return False
+    try:
+        dst.write_text(text, encoding="utf-8")
+    except OSError:
+        return False
+    return True
 
 
 def local_account(mods: dict[str, Any], area_dir: Path) -> dict[str, Any]:
