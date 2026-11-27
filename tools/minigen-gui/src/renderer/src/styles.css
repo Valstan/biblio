@@ -416,18 +416,36 @@ td.actions {
 
 /* ── «Водитель»: узкая колонка сразу за «Режимом» (#177, п. 2) ──────────
    Колонка не раздувается: переключатель ограничен по ширине, а строка
-   «сейчас: …» обрезается (полный текст — во всплывающей подсказке). */
+   «сейчас: …» обрезается (полный текст — во всплывающей подсказке).
+   ⚠️ Заказ владельца 27.11: переключатель — **две небольшие кнопки**, как у
+   «Режима» (выпадающее меню больше не используется). */
 table.grid td.col-driver {
   width: 1%;
   max-width: 180px;
   white-space: nowrap;
 }
 
-.driver-select {
-  width: 170px;
-  max-width: 170px;
-  font-size: 12px;
-  padding: 2px 4px;
+.driver-switch {
+  display: flex;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.driver-btn {
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.driver-btn.on {
+  border-color: #2c5c34;
+  color: #7ee787;
+  background: rgba(126, 231, 135, 0.12);
+  font-weight: 600;
+}
+
+.driver-btn.off {
+  color: var(--muted);
 }
 
 .driver-now {

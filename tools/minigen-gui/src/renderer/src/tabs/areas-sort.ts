@@ -1,5 +1,5 @@
 import type { Area } from '@shared/types'
-import { DRIVER_VALUES, driverValue } from './driver-view'
+import { DRIVER_VALUES, driverPosition } from './driver-view'
 
 /**
  * Сортировка списка областей по клику на шапку столбца (заказ владельца
@@ -77,14 +77,17 @@ function pointsOf(area: Area): number | null {
 }
 
 /**
- * Ранг водителя для сортировки — в порядке самого переключателя: «Внешнее
- * управление», «Управление МиниГеном», «Оператор». Кто водит на самом деле
- * (по правилу ядра) — смотрим и на это: сортировка должна отвечать на
- * вопрос «кто сейчас водит», а не «что записано в конфиге».
+ * Ранг водителя для сортировки — в порядке самого переключателя: «Миниген»,
+ * «Оператор». Кто водит на самом деле (по правилу ядра) — смотрим и на это:
+ * сортировка должна отвечать на вопрос «кто сейчас водит», а не «что записано
+ * в конфиге».
+ *
+ * ⚠️ «Внешнее управление» и «Оператор» — одно положение (управление внешнее),
+ * ⇒ ранга у них общий.
  */
 function driverRank(area: Area): number {
-  const value = driverValue(area)
-  const index = (DRIVER_VALUES as readonly string[]).indexOf(value)
+  const position = driverPosition(area)
+  const index = (DRIVER_VALUES as readonly string[]).indexOf(position)
   return index < 0 ? DRIVER_VALUES.length : index
 }
 
