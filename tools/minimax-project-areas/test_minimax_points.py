@@ -149,8 +149,11 @@ def main() -> int:
           "без остатка работает запасная эвристика по расходу (получено %s)" % v3)
     v4, _ = mp.verdict_for(None, mp.POINTS_THRESHOLD, 1000, 800000, True)
     check(v4 == "простаивает", "простаивающая область не трогается (получено %s)" % v4)
-    check(mp.POINTS_THRESHOLD >= 200,
-          "порог по очкам должен перекрывать p99 одного запроса (246 очков), а не 10")
+    check(mp.POINTS_THRESHOLD == 150,
+          "порог по очкам — решение владельца (27.11.2026): 150 очков, а не %s"
+          % mp.POINTS_THRESHOLD)
+    check(mp.POINTS_THRESHOLD > 10,
+          "порог по очкам не может быть тугим: при 10 аккаунт умирал бы посреди хода")
     src_points = (HERE / "minimax-points.py").read_text(encoding="utf-8")
     check("credit/details" in src_points,
           "остаток должен читаться с сайта MiniMax (credit/details)")
