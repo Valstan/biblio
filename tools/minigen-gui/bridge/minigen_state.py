@@ -341,6 +341,34 @@ def local_account(mods: dict[str, Any], area_dir: Path) -> dict[str, Any]:
     return out
 
 
+def driver_of_area(mods: dict[str, Any], area: dict[str, Any]) -> dict[str, Any]:
+    """Кто водит сессиями в области сейчас (промт КАРМАНА #174).
+
+    Правило «один водитель на проект»: либо «Управляющий», либо автомат
+    управления сессиями, либо никто. Переключатель проекта (`driver`) важнее
+    правила; правило по умолчанию — «если в области работает Управляющий, водит
+    он, иначе автомат».
+
+    ⚠️ Ядро на машине может быть старше программы (без `driver_of`) — тогда
+    честно говорим «не знаю», а не выдумываем водителя.
+    """
+    core = mods["core"]
+    fn = getattr(core, "driver_of", None)
+    if fn is None:
+        return {"driver": "", "title": "—",
+                "why": "ядро без правила водителя (обновите демоны)",
+                "source": ""}
+    try:
+        out = fn(area) or {}
+    except Exception:  # noqa: BLE001 — водитель не должен ломать окно
+        return {"driver": "", "title": "—", "why": "водителя не определили",
+                "source": ""}
+    return {"driver": str(out.get("driver") or ""),
+            "title": str(out.get("title") or ""),
+            "why": str(out.get("why") or ""),
+            "source": str(out.get("source") or "")}
+
+
 def areas_state(mods: dict[str, Any], include_sessions: bool = True,
                 only_running: bool = False) -> list[dict[str, Any]]:
     """Список областей с их живым состоянием."""
@@ -362,6 +390,9 @@ def areas_state(mods: dict[str, Any], include_sessions: bool = True,
             "running": is_running,
             "exists": area["dir"].is_dir(),
             "account": local_account(mods, area["dir"]),
+            # водитель сессий проекта (промт КАРМАНА #174)
+            "driver": str(area.get("driver") or ""),
+            "driverNow": driver_of_area(mods, area),
         }
         if include_sessions and is_running and area["dir"].is_dir():
             item["sessions"] = session_verdicts(mods, area)

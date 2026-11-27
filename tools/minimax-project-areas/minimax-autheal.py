@@ -1,10 +1,19 @@
 """МиниГен: авто-лечение областей MiniMax Code (решение владельца 16.11.2026).
 
+⚠️ ПРОМТ КАРМАНА #174 (26.11): этот демон — **автомат аккаунтов**. Он меняет
+аккаунт (перелогин, свежие очки) и **в сессии не пишет ни одного сообщения**:
+не оживляет, не сбрасывает, не ротирует, не архивирует и не открывает новые
+сессии. Жизнью сессии занимается отдельный автомат — сторож сессий
+(`minimax-sessionwatch.py`): он один продлевает, завершает, архивирует и
+поднимает новые сессии с продолжением нитки.
+
 Что делает. Раз в интервал смотрит за областями из `mcode-project-areas.json`
 с флагом `autoheal` (и без флага `paused`). Если область **застряла на отказе
 по очкам** — то есть аккаунт кончился, — берёт у Кармана следующий аккаунт,
-сажает его в область, активирует бонусные очки, перезапускает область и
-отправляет в её сессию «Продолжай», чтобы работа над проектом возобновилась.
+сажает его в область и активирует бонусные очки. Дальше работу в сессии
+продолжает **сторож сессий**: он видит, что аккаунт обновлён (состояние лечащего
+— `core.AUTHEAL_STATE`), и отдаёт сессии «Продолжай» — ровно один раз на смену
+аккаунта.
 
 Детектор (2026-11-17, переписан после трёх остановок подряд). Ключевая правка:
 статус хода `failed` **сам по себе ни о чём не говорит** — рантайм помечает
@@ -20,17 +29,22 @@
 - **T2 (эвристика + живая проверка).** Ход упал, не дав ни одного ответа
   агента (провайдер отказал сразу), область после него застряла. Такие
   случаи лечатся **только после живой проверки**: в область отправляется
-  короткий ход; если провайдер отвечает отказом по очкам — лечим, если ход
-  проходит — не лечим (пул Кармана не жжём).
+  короткий служебный ход-проба («ping», своя сессия); если провайдер отвечает
+  отказом по очкам — лечим, если ход проходит — не лечим (пул Кармана не жжём).
 
-Границы (решение владельца от 16.11, отмена D-222 / G636):
+Границы (решение владельца от 16.11, отмена D-222 / G636; уточнение промта #174):
 - лечим **только отказ по очкам**, а не «приложение считает себя вышедшим»;
+- **в сессии не пишем**: ни «Продолжай», ни команд закрытия, ни новых сессий;
+  единственное исключение — собственная служебная **проба аккаунта** («ping»),
+  это диагностика аккаунта, а не работа (сторож сессий такие пробы не трогает);
 - **кулдаун**: не чаще одного лечения на область за интервал — иначе общий
   пул Кармана выжигается;
 - если у Кармана **нет свободного аккаунта** — пишем в журнал и ждём;
 - **основной десктоп (без `--user-data-dir`) не трогаем никогда**;
 - область, помеченная `paused`, не трогаем (владелец снял её с присмотра);
-- «Продолжай» уходит **в фоне**: ход длинный, ждать его в цикле нельзя.
+- перезапуск десктопа делается **только** когда вход потерян (десктоп без
+  входа ⇒ новый токен ему некуда положить). Это действие с АККАУНТОМ; живой
+  ход ради этого не срываем.
 
 Механика входа — **единственная реализация** `minimax-switch.py` (здесь она
 подключается как модуль, а не дублируется). Адрес проекта для Кармана берётся
@@ -66,9 +80,6 @@ BIN = Path(r"C:\Users\valstan\bin")
 CONFIG = BIN / "mcode-project-areas.json"
 AREAS_ROOT = Path(os.environ.get("MINIMAX_AREAS_ROOT", r"C:\Users\valstan\.minimax-areas"))
 SWITCH = BIN / "minimax-switch.py"
-# Детектор оборванных субагентов: лечащий ссылается на него в самом «Продолжай».
-# Путь — в bin, а не в репозитории: файл нужен в любой области, а не только в Мозге.
-ORPHANS = BIN / "minimax-orphans.py"
 MCODE = Path(os.environ.get("APPDATA", "")) / "npm" / "mcode.cmd"
 JOURNAL = Path(os.environ.get("LOCALAPPDATA", "")) / "mcode-web" / "journal.log"
 # Кулдаун лечения хранится в файле, а не в памяти: перезапуск супервизора не должен
@@ -101,10 +112,6 @@ POOL_EMPTY_BACKOFF = 600 # Карман ответил «свободных ак
 BURST_WINDOW = 180         # окно подсчёта «активационной лавины», сек
 BURST_LIMIT = 5            # столько аккаунтов на проект за окно ⇒ аларм и стоп
 LIVE_SWITCH = True       # смена аккаунта без перезапуска десктопа (заказ владельца)
-PROBE_TTL = 1800          # сколько ждём разбора пробного хода, сек (30 мин)
-PROBE_NO_TURN_TIMEOUT = 120 # если нового хода нет дольше этого — откат: перезапуск
-PROBE_FAIL_FAST = 180      # падение пробного хода быстрее этого ⇒ десктоп
-                          # отверг токен (откат); дольше ⇒ очки кончились
 ACTIVATE_TIMEOUT = 150     # сколько ждём, пока десктоп поднимется и войдёт
 ACTIVATION_POLL = 5        # шаг опроса состояния десктопа, сек
 ERROR_WINDOW = 86400    # окно отказа по очкам (сутки): сломанный аккаунт сам не
@@ -117,7 +124,7 @@ MIN_TOKEN_LIFE_MIN = 30 # минимальный остаток жизни acces
 MAX_PULL_TRIES = 3      # сколько аккаунтов пробуем взять, пока не найдём живой токен
 LOST_LOGIN_STATES = ("logout_pending", "none", "lease-expired", "logged_out", "signed_out")
 
-_state = {"last_heal": {}, "install": {}, "probe": {}, "pulls": {}, "backoff": {}, "activated": {}, "burst": {}, "alarm": {}, "probe_turn": {}, "pause_notice": {}, "failure": {}}
+_state = {"last_heal": {}, "install": {}, "probe": {}, "pulls": {}, "backoff": {}, "activated": {}, "burst": {}, "alarm": {}, "pause_notice": {}, "failure": {}}
 _last_verdict = {}      # прошлый вердикт по области — чтобы не писать в журнал
                         # одно и то же «лечить нечего» каждые 15 секунд
 _next_check = {}        # slug → время следующей проверки области
@@ -141,8 +148,6 @@ def load_cooldowns() -> None:
             _state["burst"] = {str(k): [float(t) for t in v] for k, v in (data.get("burst") or {}).items()
                                 if isinstance(v, list)}
             _state["alarm"] = data.get("alarm") if isinstance(data.get("alarm"), dict) else {}
-            _state["probe_turn"] = {str(k): v for k, v in (data.get("probe_turn") or {}).items()
-                                   if isinstance(v, dict)}
             _state["pause_notice"] = {str(k): v for k, v in (data.get("pause_notice") or {}).items()}
             _state["failure"] = {str(k): v for k, v in (data.get("failure") or {}).items()
                                  if isinstance(v, dict)}
@@ -155,7 +160,6 @@ def load_cooldowns() -> None:
         _state["activated"] = {}
         _state["burst"] = {}
         _state["alarm"] = {}
-        _state["probe_turn"] = {}
 
 
 def save_cooldowns() -> None:
@@ -185,25 +189,6 @@ def _core():
         except Exception:  # noqa: BLE001
             _core_mod = False
     return _core_mod or None
-
-
-def _model_flags(area_dir: Path) -> list:
-    """Флаги модели области — через ядро, но **мягко**.
-
-    ⚠️ Живой случай 24.11: ядро подгружается лениво (`_core()`), а в двух
-    местах имя `core` не было определено вовсе ⇒ `NameError: name 'core' is
-    not defined` ⇒ «Продолжай» **не уходил** в область: аккаунт у КАРМАНА
-    брался, а лечение сорвалось на последнем шаге. Ядро here — мягкая
-    зависимость (лечащий намеренно живёт без ядра): нет ядра — нет флагов,
-    а ход всё равно уходит.
-    """
-    core = _core()
-    if core is None:
-        return []
-    try:
-        return list(core.model_flags(area_dir) or [])
-    except Exception:  # noqa: BLE001
-        return []
 
 
 def log(msg: str) -> None:
@@ -1103,117 +1088,13 @@ def restart_area(slug: str) -> None:
     log("СЕССИИ: десктоп %s не поднялся после старта" % slug)
 
 
-def broken_subagents(area_dir: Path) -> list:
-    """Оборванные субагенты области: работа, которая пропала из-за обрыва.
-
-    Состояние ребёнка определяется его **последним ходом**: `completed` ⇒ работа
-    закончена (не трогаем), `failed`/`aborted` ⇒ работа оборвана (будим).
-
-    Факт (17.11): CLI не умеет открывать сессии субагентов («Sub-agent Sessions
-    are internal and cannot be opened») — будить ребёнка можно только
-    инструментом рантайма `task_append` по `task_id`; он поднимает ребёнка
-    с его же контекстом.
-    """
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file():
-        return []
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return []
-    out = []
-    try:
-        for rec in _rows(con, "select record_json from local_runtime_background_tasks "
-                               "where kind = 'subagent' "
-                               "and status in ('failed','canceled','aborted')"):
-            try:
-                task = json.loads(rec[0] or "{}")
-            except ValueError:
-                continue
-            child = (task.get("metadata") or {}).get("childSessionId")
-            if not child:
-                continue
-            row = _rows(con, "select turn_id, status from local_runtime_turn_ingress "
-                             "where session_id = ? order by accepted_at_ms desc limit 1",
-                        (child,))
-            if not row:
-                continue
-            if row[0][1] == "completed":
-                continue                      # ребёнок закончил — не трогаем
-            out.append({"task_id": task.get("taskId"),
-                        "description": task.get("description") or "",
-                        "child_session": child,
-                        "last_turn": row[0][0],
-                        "last_turn_status": row[0][1]})
-    finally:
-        con.close()
-    return out
-
-
-def continue_prompt(area_dir: Path) -> str:
-    """«Продолжай» + список оборванных субагентов, которых надо поднять.
-
-    Лечащий вкладывает список в **само сообщение**: агент после перезахода
-    сразу видит, кого разбудить через `task_append`, а тех, чью работу он
-    уже сделал сам, — пропускает (у него свой контекст).
-    """
-    slug = area_dir.name.replace("p-", "")
-    kids = broken_subagents(area_dir)
-    if not kids:
-        return "Продолжай"
-    lines = ["Продолжай", "",
-             "ПОРЯДОК (важно, заказ владельца 18.11):",
-             "1) СНАЧАЛА разбуди оборванных субагентов — через task_append "
-             "(инструмент рантайма) по task_id из списка ниже; дождись их.",
-             "2) ПОТОМ продолжай основной чат.",
-             "",
-             "Оборванные субагенты (последний ход failed/aborted — работа не закончена):"]
-    for kid in kids:
-        lines.append("- task_id=%s  «%s»" % (kid["task_id"], kid["description"][:80]))
-    lines += ["",
-              "Тех, чью работу ты уже сделал сам, не буди. "
-              "Полный список — python %s %s" % (ORPHANS, slug)]
-    return "\n".join(lines)
-
-
-def _continue_once(area_dir: Path, folder: str, logfile):
-    """Одна попытка отправить «Продолжай» (фоном).
-
-    Возвращает ("ok", описание) — ход пошёл; или ("busy", хвост лога) — сессия
-    занята («Session already has an active Turn»); или ("dead", хвост лога) —
-    умер по другой причине.
-
-    logfile — **открытый файловый объект** (stdout/stderr для CLI), а не путь:
-    Popen не умеет принимать Path как поток. Читать его надо по пути.
-    """
-    env = dict(os.environ)
-    env["MINIMAX_DATA_DIR"] = str(area_dir)
-    env["MAVIS_DATA_DIR"] = str(area_dir)
-    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    cmd = ([str(MCODE), "exec", "--continue", "--cwd", folder]
-           + _model_flags(area_dir) + [continue_prompt(area_dir)])
-    try:
-        proc = subprocess.Popen(cmd, env=env, stdout=logfile, stderr=logfile,
-                                stdin=subprocess.DEVNULL, creationflags=flags)
-    except Exception as exc:  # noqa: BLE001
-        return "dead", "не запустилось: %s" % exc
-    time.sleep(3)
-    if proc.poll() is None:
-        return "ok", "отправлено (ход идёт в фоне, pid %s, лог %s)" % (
-            proc.pid, getattr(logfile, "name", logfile))
-    # Процесс умер сразу — читаем, что он написал.
-    # ⚠️ logfile здесь бывает НЕ Path, а открытым файловым объектом (TextIOWrapper):
-    # у него нет read_text, и вызов .read_text() ронял лечение целиком
-    # (18.11 03:04 — «лечение сорвалось: '_io.TextIOWrapper' object has no
-    # attribute 'read_text'»). Поэтому читаем ПО ПУТИ, а не по объекту.
-    try:
-        log_path = logfile if isinstance(logfile, Path) else Path(str(getattr(logfile, "name", "")))
-        tail = "\n".join(log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-3:])
-    except (OSError, ValueError):
-        tail = ""
-    if "active turn" in tail.lower():
-        return "busy", tail
-    return "dead", tail or ("процесс умер сразу, rc=%s" % proc.returncode)
+# ⚠️ ПРОМТ КАРМАНА #174 (26.11): здесь раньше жили `broken_subagents`,
+# `continue_prompt` и `_continue_once` — лечащий САМ отправлял «Продолжай» в
+# сессию (и звал `task_append` за оборванных субагентов). Теперь автомат
+# аккаунтов в сессии не пишет: жизнью сессии занимается сторож сессий
+# (`minimax-sessionwatch.py`), а он один знает про паспорт нитки и решения
+# «Управляющего». Оборванных субагентов поднимает «Управляющий» (task_append) —
+# это его работа, а не лечащего.
 
 
 # ── Зависший ход: «Продолжай» ушёл бы в очередь рантайма ─────────────────────
@@ -1222,481 +1103,45 @@ def _continue_once(area_dir: Path, folder: str, logfile):
 # „Продолжай“ поверх очереди запросов — два проекта так и не продолжили сессию
 # из-за того, что там в очереди сообщений висел запрос».
 #
-# Что происходит на самом деле: CLI **не отказывается** на занятом ходе (как
-# раньше, «Session already has an active Turn») — он **ставит сообщение в
-# очередь рантайма** (`local_runtime_queue_items`, доставка помечена
-# `queue-delivery:claim_…`). Очередь разбирается, когда текущий ход закончится,
-# поэтому «Продолжай» ждёт зависшего хода и работа не возобновляется.
-#
-# Сорвать ход из CLI нечем: `mcode exec` умеет только поставить сообщение в
-# очередь. Единственный доступный способ — **перезапуск области** (ход умирает,
-# сообщение после перезапуска встаёт первым). Но срывать надо ТОЛЬКО зависший
-# ход: живая работа агента (долгий ход, сборка) — не повод.
-#
-# Признак зависания: ход идёт (`status='accepted'`, `completed_at_ms IS NULL`),
-# а в сессии давно нет ни одного сообщения (`local_runtime_message_rows`).
-# Живой ход сообщения пишет постоянно — это и есть сигнал прогресса.
-# ⚠️ `local_runtime_session_agent_state.updated_at_ms` для проверки НЕ годится:
-# он не меняется от начала хода до конца (проверено замером 18.11).
-
-# ⚠️ Порог тишины (23.11, правка после ложного перезапуска десктопа Управляющего).
-# 120 с было СЛИШКОМ мало: агент может молчать и при живой работе — длинная
-# команда (сборка, тесты, ожидание), чтение большого файла, ожидание ответа
-# инструмента. В 09:34 лечащий решил, что ход «завис», и перезапустил область,
-# хотя беседа работала. Теперь тишина в 10 минут — кандидат на «завис», и даже
-# тогда область не перезапускается (см. preempt_stuck): срыв хода перезапуском
-# убивает ВСЕ сессии области, включая живую беседу владельца.
-STUCK_IDLE_SEC = 600      # ход идёт, но сообщений нет дольше этого ⇒ кандидат на «завис»
-WAIT_IDLE_SEC = 30        # сколько ждём освобождения сессии перед отправкой
-PREEMPT_PAUSE_SEC = 6     # пауза после перезапуска области перед отправкой
+# Урок усвоен, но решение изменилось (промт КАРМАНА #174, 26.11): лечащий —
+# автомат АККАУНТОВ, и в сессии он не пишет ни одного сообщения. Поэтому
+# «Продолжай», ожидание свободной сессии, срыв зависшего хода перезапуском
+# области и разбор пробного хода уехали в сторож сессий
+# (`minimax-sessionwatch.py`). Здесь остались только аккаунты: вход, очки,
+# бонус, диагностика отказа.
 
 
-def session_is_idle(area_dir: Path) -> bool:
-    """Сессия свободна: нет идущего хода, и рантайм считает её не «started».
-
-    ⚠️ Проверять только «есть активный ход» мало: после падения хода рантайм
-    ещё какое-то время держит сессию в «started» (разбор хода), и сообщение,
-    отправленное в это окно, **встаёт в очередь** — а очередь разбирается только
-    на следующей границе хода (наблюдение 18.11: отправили в 16:50, ход начался
-    в 17:02 — 12 минут простоя).
-    """
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file():
-        return True
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return True
-    try:
-        busy = _rows(con, "select count(*) from local_runtime_turn_ingress "
-                          "where status = 'accepted' and completed_at_ms is null")
-        if busy and int(busy[0][0] or 0) > 0:
-            return False
-        rows = _rows(con, "select status from local_runtime_sessions "
-                          "order by updated_at_ms desc limit 1")
-        return not (rows and str(rows[0][0] or "") == "started")
-    finally:
-        con.close()
+# ⚠️ ПРОМТ КАРМАНА #174: `session_waits_owner`, `turn_is_delivery`, `stuck_turn`,
+# `active_turn_failed` и `preempt_stuck` удалены вместе с «Продолжай»: срывать
+# зависший ход перезапуском области — это решение о жизни сессии, а лечащий
+# теперь занимается только аккаунтами.
 
 
-def wait_for_idle(area: dict, seconds: int) -> bool:
-    """Подождать, пока сессия освободится. True — освободилась (или ждать нечего).
-
-    Ждать дольше нескольких секунд нельзя: лечащий обходит области по очереди,
-    и залипание на одной области подвешивает остальные.
-    """
-    deadline = time.time() + max(0, seconds)
-    while True:
-        if session_is_idle(area["dir"]):
-            return True
-        if time.time() >= deadline:
-            return False
-        time.sleep(3)
+# ⚠️ ПРОМТ КАРМАНА #174: `say_continue` удалена. Лечащий больше **не пишет в
+# сессии**: ни «Продолжай», ни команд закрытия, ни новых сессий. Продолжить
+# нитку после смены аккаунта — работа **сторожа сессий** (он видит, что
+# аккаунт обновлён, и отдаёт сессии «Продолжай» ровно один раз на смену).
 
 
-def active_turn(area_dir: Path):
-    """Ход, который сейчас идёт в области: (turn_id, session_id, accepted_at_ms)."""
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file():
-        return None
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return None
-    try:
-        rows = _rows(con, "select turn_id, session_id, accepted_at_ms from local_runtime_turn_ingress "
-                          "where status = 'accepted' and completed_at_ms is null "
-                          "order by accepted_at_ms desc limit 1")
-        return (rows[0][0], rows[0][1], int(rows[0][2] or 0)) if rows else None
-    finally:
-        con.close()
+# ⚠️ ПРОМТ КАРМАНА #174: `latest_turn`, `turn_after` и `probe_pending` удалены
+# вместе с «Продолжай» — разбор пробного хода был частью отправки сообщения
+# в сессию. Теперь лечащий не отправляет сообщений, поэтому и разбирать их
+# нечего: «проба» осталась только как **собственная служебная сессия**
+# диагностики аккаунта (`probe_exhausted`, «ping»).
 
 
-def session_progress_ms(area_dir: Path, session_id: str) -> int:
-    """Когда в сессии последний раз было сообщение — это сигнал прогресса хода."""
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file() or not session_id:
-        return 0
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return 0
-    try:
-        rows = _rows(con, "select max(created_at_ms) from local_runtime_message_rows "
-                          "where session_id = ?", (session_id,))
-        return int(rows[0][0] or 0) if rows else 0
-    finally:
-        con.close()
-
-
-def session_waits_owner(area_dir: Path, session_id: str) -> bool:
-    """Агент ждёт ответа владельца (вопрос) — такой ход срывать нельзя."""
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file() or not session_id:
-        return False
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return False
-    try:
-        rows = _rows(con, "select count(*) from questionnaire_requests "
-                          "where session_id = ? and answered_at is null and dismissed_at is null",
-                     (session_id,))
-        return bool(rows and int(rows[0][0] or 0) > 0)
-    finally:
-        con.close()
-
-
-def turn_is_delivery(area_dir: Path, turn_id: str) -> bool:
-    """Ход **доставки** сообщения в очередь занятой сессии — это не «зависание».
-
-    Почему это важно (23.11, разбор ложного перезапуска десктопа Управляющего):
-    когда «Продолжай» отправляют в ЗАНЯТУЮ сессию, рантайм создаёт отдельный
-    ход доставки (`turn_task_delivery`). Он висит ровно столько, сколько занята
-    сессия, и **по определению молчит** — сообщений он не пишет. Лечащий брал
-    его за «зависший ход» (тишина > 120 с), считал, что «Продолжай» не
-    доставился, и перезапускал область — убивая живую беседу.
-
-    Теперь ход доставки зависанием **не считается никогда**.
-    """
-    if not turn_id:
-        return False
-    low = str(turn_id).lower()
-    if "delivery" in low or "deliver" in low:
-        return True
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file():
-        return False
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return False
-    try:
-        rows = _rows(con, "select source, claim_source from local_runtime_turn_ingress "
-                          "where turn_id = ?", (turn_id,))
-        if not rows:
-            return False
-        src = " ".join(str(x or "").lower() for x in rows[0])
-        return "delivery" in src
-    finally:
-        con.close()
-
-
-def stuck_turn(area: dict):
-    """Сессия висит на ходе, который не идёт: (turn_id, простой_секунд) либо None.
-
-    None — либо хода нет, либо ход живой (сообщения идут), либо агент ждёт
-    ответа владельца, либо это ход **доставки** в очередь (он молчит по
-    определению — зависанием не считается).
-    """
-    at = active_turn(area["dir"])
-    if not at:
-        return None
-    turn_id, sid, accepted = at
-    if session_waits_owner(area["dir"], sid):
-        return None
-    if turn_is_delivery(area["dir"], turn_id):
-        return None
-    prog = session_progress_ms(area["dir"], sid)
-    idle_ms = int(time.time() * 1000) - int(prog or accepted)
-    if idle_ms < STUCK_IDLE_SEC * 1000:
-        return None
-    return (turn_id, int(idle_ms // 1000))
-
-
-def active_turn_failed(area_dir: Path) -> bool:
-    """Активный ход УПАЛ (failed/aborted), а не просто молчит."""
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file():
-        return False
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return False
-    try:
-        rows = _rows(con, "select status from local_runtime_turn_ingress "
-                          "where status in ('failed','aborted') and completed_at_ms is null "
-                          "order by accepted_at_ms desc limit 1")
-        return bool(rows)
-    finally:
-        con.close()
-
-
-def preempt_stuck(area: dict, why: str) -> bool:
-    """Сорвать зависший ход, чтобы «Продолжай» встал в начало, а не в очередь.
-
-    Перезапуск области — единственный доступный способ сорвать ход (CLI не умеет
-    прерывать). Окно при этом закрывается и открывается заново — поэтому делаем
-    это только когда ход действительно висит, и только в работающей области
-    (правило владельца 18.11: окно в неработающей области не открываем).
-
-    ⚠️ 23.11, правка после ложного перезапуска: **перезапуск области — крайняя
-    мера**, он убивает ВСЕ сессии области, включая живую беседу владельца.
-    Поэтому применяем его только когда ход **УПАЛ** (failed/aborted), а не когда
-    он просто молчит: молчание — норма для длинной работы (сборка, тесты,
-    ожидание инструмента). Молчащий ход мы оставляем в покое.
-    """
-    slug = area["slug"]
-    if not active_turn_failed(area["dir"]):
-        log("%s: %s — ход не упал, просто молчит; десктоп НЕ трогаю (перезапуск "
-            "убил бы живые сессии области)" % (area["title"], why))
-        return False
-    if not desktop_running(slug):
-        log("%s: %s, но десктоп не запущен — окно не открываем" % (area["title"], why))
-        return False
-    log("%s: %s — срываю его перезапуском области, чтобы «Продолжай» встал в начало" % (
-        area["title"], why))
-    restart_area(slug)
-    time.sleep(PREEMPT_PAUSE_SEC)
-    ok, _at, why2 = wait_activation(area)
-    if not ok:
-        log("%s: после перезапуска вход не подтверждён — %s" % (area["title"], why2))
-    return ok
-
-
-def say_continue(area: dict) -> str:
-    """Отправить «Продолжай» в последнюю сессию области — **в начало, а не в очередь**.
-
-    Нюанс (17.11, замечание владельца): если в сессии **идёт ход**, CLI
-    отказывается — «Session already has an active Turn. Use queue send to
-    deliver the message after it». Ждать конца чужого хода нельзя (область
-    должна продолжить работу сразу), поэтому мы **срываем зависший ход
-    перезапуском области** и отправляем «Продолжай» заново: сообщение встаёт
-    первым.
-
-    Фоновый запуск, не ждём: ход длинный, ждать его в цикле лечения нельзя —
-    остальные области зависнут.
-    """
-    area_dir = area["dir"]
-    folder = area.get("folder") or ""
-    if not folder or not Path(folder).is_dir():
-        return "папка проекта недоступна — «Продолжай» не отправляли"
-    # «Продолжай» НЕЛЬЗЯ отправлять в занятую сессию: CLI не отказывается, а
-    # ставит сообщение в очередь рантайма, и очередь разбирается только на
-    # следующей границе хода (наблюдение 18.11: отправили в 16:50 — ход
-    # стартовал лишь в 17:02, 12 минут простоя).
-    #
-    # Три состояния, и каждое — своё действие:
-    # 1) ход ВИВЫЙ (сообщения идут) — не мешаем работающему агенту: сообщение
-    #    встанет в очередь и отработает после хода, это правильно;
-    # 2) ход ЗАВИС (сообщений нет долго) — срываем его перезапуском области,
-    #    чтобы «Продолжай» встал в начало, а не ждал конца висящего хода;
-    # 3) хода нет, но рантайм ещё считает сессию занятой (разбор хода) — ждём
-    #    освобождения; не освободилась — перезапуск чистит заевшее состояние.
-    at = active_turn(area["dir"])
-    stuck = stuck_turn(area) if at else None
-    if stuck:
-        preempt_stuck(area, "ход %s висит (сообщений нет %d с)" % (stuck[0][:12], stuck[1]))
-    elif at:
-        log("%s: сессия занята живым ходом — «Продолжай» встанет в очередь "
-            "и отработает после него" % area["title"])
-    elif not wait_for_idle(area, WAIT_IDLE_SEC):
-        preempt_stuck(area, "сессия не освободилась (ходов нет, а рантайм считает её занятой)")
-    logfile = area_dir / "logs" / "continue.log"
-    try:
-        logfile.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(logfile, "a", encoding="utf-8")
-    except OSError:
-        fh = subprocess.DEVNULL
-    try:
-        for attempt in (1, 2):
-            status, info = _continue_once(area_dir, folder, fh)
-            if status == "ok":
-                return info
-            if status == "busy":
-                if not desktop_running(area["slug"]):
-                    log("%s: сессия занята ходом, но десктоп не запущен — «Продолжай» не отправляем "
-                        "(окно не открываем: владелец в этой области не работает)" % area["title"])
-                    return "не отправлено: десктоп не запущен"
-                log("%s: сессия занята ходом — срываю его перезапуском области, "
-                    "чтобы «Продолжай» встал в начало (попытка %s)" % (
-                        area["title"], attempt))
-                restart_area(area["slug"])
-                # ⚠️ 23.11: после перезапуска команда «Продолжай» уходила через
-                # 6 секунд — а десктоп после старта грузится и входит десятки
-                # секунд. Команда приходила в ещё не готовый рантайм, терялась,
-                # и лечащий уходил в ещё один перезапуск (каскад «ОТКАТ» в 00:30,
-                # 00:35, 01:12, 01:26 — команды накладывались друг на друга).
-                # Теперь: ЖДЁМ готовности (приложение поднялось + вошло + вендор
-                # подтвердил токен) и только потом шлём следующую команду.
-                ok, _at, why = wait_activation(area)
-                if not ok:
-                    log("%s: после перезапуска приложение не подтвердило вход (%s) — "
-                        "«Продолжай» пока не отправляю" % (area["title"], why))
-                    return "не отправлено: десктоп не готов (%s)" % why
-                log("%s: десктоп поднялся и вошёл — повторяю «Продолжай»" % area["title"])
-                time.sleep(PREEMPT_PAUSE_SEC)
-                continue
-            return "не отправлено: %s" % info
-        # Сессия занята и после перезапуска — последний путь: новая сессия.
-        env = dict(os.environ)
-        env["MINIMAX_DATA_DIR"] = str(area_dir)
-        env["MAVIS_DATA_DIR"] = str(area_dir)
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        cmd = ([str(MCODE), "exec", "--cwd", folder]
-               + _model_flags(area_dir) + [continue_prompt(area_dir)])
-        proc = subprocess.Popen(cmd,
-                                env=env, stdout=fh, stderr=fh, stdin=subprocess.DEVNULL,
-                                creationflags=flags)
-        time.sleep(3)
-        if proc.poll() is None:
-            return "сессия была занята — отправил «Продолжай» в НОВУЮ сессию (pid %s)" % proc.pid
-        return "сессия занята и новая сессия не поднялась — ждём следующего прохода"
-    finally:
-        if fh is not subprocess.DEVNULL:
-            try:
-                fh.close()
-            except OSError:
-                pass
-
-
-def latest_turn(area_dir: Path):
-    """Последний ход в рантайме области: (turn_id, status, accepted_at_ms)."""
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file():
-        return None
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return None
-    try:
-        rows = _rows(con, "select turn_id, status, accepted_at_ms from local_runtime_turn_ingress "
-                           "order by accepted_at_ms desc limit 1")
-        return (rows[0][0], rows[0][1], int(rows[0][2] or 0)) if rows else None
-    finally:
-        con.close()
-
-
-def turn_after(area_dir: Path, before_ms: int):
-    """Ход, начавшийся ПОСЛЕ отметки before_ms (или None)."""
-    db = area_dir / "v2" / "sqlite" / "runtime-state.sqlite"
-    if not db.is_file():
-        return None
-    try:
-        con = sqlite3.connect("file:%s?mode=ro" % db, uri=True, timeout=10)
-    except sqlite3.Error:
-        return None
-    try:
-        rows = _rows(con, "select turn_id, status, accepted_at_ms from local_runtime_turn_ingress "
-                           "where accepted_at_ms > ? order by accepted_at_ms desc limit 1",
-                     (int(before_ms),))
-        return (rows[0][0], rows[0][1], int(rows[0][2] or 0)) if rows else None
-    finally:
-        con.close()
-
-
-def probe_pending(area: dict) -> bool:
-    """Разбираемся с пробным ходом после смены аккаунта без перезапуска.
-
-    True — область занята пробой (диагностику пропускаем), False — можно лечить.
-    """
-    slug = area["slug"]
-    pend = (_state.get("probe_turn") or {}).get(slug)
-    if not pend:
-        return False
-    if time.time() - float(pend.get("at") or 0) > PROBE_TTL:
-        _state["probe_turn"].pop(slug, None)
-        save_cooldowns()
-        log("%s: пробный ход устарел (%d мин) — возвращаюсь к обычной проверке" % (
-            area["title"], PROBE_TTL // 60))
-        return False
-    turn = turn_after(area["dir"], int(pend.get("before_ms") or 0))
-    if turn is None:
-        # Хода нет: то ли он ещё не начался (сессия была занята), то ли рантайм
-        # его не принял. Долго ждать нельзя — область стоит.
-        age = time.time() - float(pend.get("at") or 0)
-        # Ждём полный таймаут, только если ход живой. Если ход висит (нет
-        # сообщений) — «Продолжай» лежит в очереди за ним, и ждать бессмысленно:
-        # срываем ход сейчас.
-        stuck_now = stuck_turn(area)
-        if age < PROBE_NO_TURN_TIMEOUT and not stuck_now:
-            return True      # ещё рано — подождём следующего прохода
-        live = active_turn(area["dir"])
-        if live and not stuck_now:
-            # Живой ход: «Продолжай» стоит в очереди за ним и отработает после
-            # него. «Нового хода нет» — не значит «сессия мертва»: перезапуск
-            # десктопа тут срывал бы живую работу (23.11, 01:09 — так был
-            # перезапущен рабочий десктоп «Матрицы РМЗ»).
-            log("%s: «Продолжай» стоит в очереди за живым ходом %s — жду, "
-                "десктоп не трогаю"
-                % (area["title"], (live[1] if len(live) > 1 else "?")[:12]))
-            return True
-        if stuck_now:
-            log("%s: «Продолжай» лежит в очереди за зависшим ходом %s (сообщений нет %d с) — "
-                "жду дальше только бессмысленно" % (area["title"], stuck_now[0][:12], stuck_now[1]))
-            # ⚠️ 23.11: ЗДЕСЬ БЫЛ НЕТ `return` ⇒ выполнение падало в «ОТКАТ:
-            # перезапускаю область», и десктоп перезапускался на живом ходе.
-            # В 09:34 так был перезапущен десктоп Управляющего «ни с чего ни с
-            # сего», пока владелец смотрел на свою рабочую беседу.
-            #
-            # Теперь: молчащий (или висящий в очереди) ход — НЕ повод трогать
-            # десктоп. Откат с перезапуском остаётся только для настоящего
-            # случая «доставка не удалась» — когда активного хода нет вовсе.
-            _state["probe_turn"].pop(slug, None)
-            save_cooldowns()
-            return True
-        _state["probe_turn"].pop(slug, None)
-        save_cooldowns()
-        log("%s: «Продолжай» без перезапуска не доставился (нового хода нет %d с) — "
-            "ОТКАТ: перезапускаю область и повторяю" % (area["title"], int(age)))
-        if not desktop_running(slug):
-            # Десктоп закрыт (владелец в этой области не работает) — окно не
-            # открываем. Вход уже обновлён, «Продолжай» дойдёт, когда владелец
-            # сам запустит область (18.11: так открылось лишнее окно ВМалмыже).
-            log("%s: десктоп не запущен — откат без перезапуска, окно не открываем" % area["title"])
-            return False
-        restart_area(slug)
-        ok, _at, why = wait_activation(area)
-        if not ok:
-            log("%s: после перезапуска вход не подтверждён — %s" % (area["title"], why))
-            return False
-        _state["activated"][slug] = int(time.time() * 1000)
-        save_cooldowns()
-        res = say_continue(area)
-        log("%s: «Продолжай» после перезапуска — %s" % (area["title"], res))
-        return False
-    status = turn[1]
-    if status == "completed":
-        _state["probe_turn"].pop(slug, None)
-        save_cooldowns()
-        log("%s: десктоп принял новый вход БЕЗ перезапуска (ход %s завершён) — сессия не прерывалась" % (
-            area["title"], turn[0][:8]))
-        return False
-    if status in ("failed", "aborted"):
-        _state["probe_turn"].pop(slug, None)
-        save_cooldowns()
-        # Сколько ход шёл до падения? Короткое падение ⇒ десктоп отверг старый
-        # токен (нужен откат). Долгое ⇒ новый аккаунт израсходовался (обычное
-        # лечение, перезапуск не нужен и только тратит время).
-        ran_ms = int(turn[2] or 0) - int(float(pend.get("at") or 0) * 1000)
-        if ran_ms > PROBE_FAIL_FAST * 1000:
-            log("%s: пробный ход %s шёл %d мин и упал — это не «десктоп отверг токен», "
-                "а очки кончились: лечу обычным порядком (следующий аккаунт), "
-                "перезапуск не нужен" % (area["title"], turn[0][:8], int(ran_ms // 60000)))
-            return False
-        log("%s: десктоп новый вход без перезапуска не взял (ход %s: %s, упал сразу) — "
-            "ОТКАТ: перезапускаю область и повторяю «Продолжай»" % (
-                area["title"], turn[0][:8], status))
-        if not desktop_running(slug):
-            log("%s: десктоп не запущен — откат без перезапуска, окно не открываем" % area["title"])
-            return False
-        restart_area(slug)
-        ok, _at, why = wait_activation(area)
-        if not ok:
-            log("%s: после перезапуска вход не подтверждён — %s" % (area["title"], why))
-            return False
-        # Отказы пробного хода — не про очки: двигаем якорь, чтобы лечащий
-        # не счёл их отказом по балансу и не покусил ещё один аккаунт.
-        _state["activated"][slug] = int(time.time() * 1000)
-        save_cooldowns()
-        res = say_continue(area)
-        log("%s: «Продолжай» после перезапуска — %s" % (area["title"], res))
-        return False
-    return True              # ход ещё идёт — ждём
+# ⚠️ ПРОМТ КАРМАНА #174: `probe_pending` удалён (см. выше). Разбор пробного
+# хода был частью отправки «Продолжай» в сессию; без сообщений разбирать нечего.
 
 
 def renew(switch, area: dict, burst: list = None) -> tuple:
-    """Поставить области новый аккаунт и продолжить её работу.
+    """Поставить области новый аккаунт.
+
+    ⚠️ ПРОМТ КАРМАНА #174: это **автомат аккаунтов**. Функция меняет вход
+    области (новый access-токен в сторе + бонусные очки) и **ничего не пишет в
+    сессии**: ни «Продолжай», ни команд закрытия, ни новых сессий. Работу в
+    сессии продолжает сторож сессий (`minimax-sessionwatch.py`) — он видит по
+    состоянию лечащего, что аккаунт обновлён, и отдаёт сессии «Продолжай».
 
     **Общий путь** для автоматического лечения и для кнопки «Новый вход
     (токен)» в панели.
@@ -1710,14 +1155,8 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
     ⚠️ ИСКЛЮЧЕНИЕ (23.11): если десктоп **без входа** (стор пуст, экран «Create
     an account or log in to continue») — новый токен ему некуда положить. Тогда
     перезапуск НУЖЕН, и за ним обязательно идёт проверка входа
-    (`wait_activation`): «Продолжай» уходит только в подтверждённо готовый
-    десктоп. Это и есть лечение «из логина вышли, а обратно не зашли».
-
-    Дальше сообщение «Продолжай» уходит сначала в субагенты (если они есть и если
-    они были прерваны), а потом в основной чат.
-
-    Порядок «субагенты → основной чат» задан в самом тексте сообщения
-    (`continue_prompt`).
+    (`wait_activation`): десктоп должен войти новым аккаунтом. Это и есть лечение
+    «из логина вышли, а обратно не зашли».
 
     Возвращает (ok, описание).
     """
@@ -1807,17 +1246,21 @@ def renew(switch, area: dict, burst: list = None) -> tuple:
                 "область, она войдёт новым входом" % area["title"])
     _state["activated"][slug] = int(time.time() * 1000)
     save_cooldowns()
-    if area["dir"].name not in (switch.running_areas() or set()):
-        log("%s: десктоп не запущен — вход обновлён, «Продолжай» не отправляли "
-            "(живой сессии нет; когда запустите область, она войдёт новым входом)" % area["title"])
-        return True, "вход обновлён, десктоп не запущен — «Продолжай» не отправляли"
-    before = latest_turn(area["dir"])
-    before_ms = before[2] if before else 0
-    res = say_continue(area)
-    log("%s: «Продолжай» без перезагрузки — %s" % (area["title"], res))
-    _state["probe_turn"][slug] = {"before_ms": before_ms, "at": time.time()}
-    save_cooldowns()
-    return True, res
+    # ⚠️ ПРОМТ КАРМАНА #174: дальше — **ни одного сообщения в сессию**. Лечащий
+    # сменил аккаунт (новый токен в сторе + бонусные очки) — этого достаточно:
+    # рантайм подхватывает новый токен на следующем запросе. Продолжить работу
+    # в сессии — дело **сторожа сессий**: он видит, что аккаунт обновлён, и
+    # отдаёт сессии «Продолжай» ровно один раз на смену аккаунта.
+    core = _core()
+    if core is not None:
+        try:
+            core.report("info", "heal", "%s: аккаунт обновлён, сессии не тронуты — "
+                        "нитку продолжит сторож сессий" % area["title"])
+        except Exception:  # noqa: BLE001
+            pass
+    log("%s: аккаунт обновлён — в сессии ничего не писали (продолжит сторож сессий)"
+        % area["title"])
+    return True, "аккаунт обновлён, сессии не тронуты — продолжит сторож сессий"
 
 
 def network_unhealthy() -> str:
@@ -2056,8 +1499,6 @@ def main() -> int:
                     log("%s: %s" % (area["title"], why))
                     _next_check[area["slug"]] = time.time() + HEAL_QUIET
                     continue
-                if probe_pending(area):
-                    continue          # ждём разбора пробного хода
                 # diagnose() внутри heal() — второй раз не читаем: проверка
                 # локальная, но при короткой паузе лишние чтения не нужны.
                 healed = heal(area, switch, force=args.force)

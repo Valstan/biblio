@@ -81,6 +81,15 @@ PROMPT_DISPATCH_EVERY = 60
 #: бы одной и той же строкой. Первое появление причины пишется сразу.
 PROMPT_NOTE_EVERY = 6 * 3600
 
+# ──────────────────────────────────── водитель сессий проекта (промт #174)
+#: Значения переключателя «водитель проекта» — как в ядре (`minigen_core`).
+#: Пустое значение («auto») — «по правилу»: если в области работает
+#: Управляющий, водит он, иначе — автомат управления сессиями.
+DRIVER_VALUES = ("", "auto", "manager", "automaton", "none")
+DRIVER_TITLES = {"": "по правилу", "auto": "по правилу",
+                 "manager": "Управляющий", "automaton": "автомат",
+                 "none": "никто"}
+
 
 def _title_from(text: str) -> str:
     """Заголовок заявки из зачитки: первая строка, обрезанная до 90 знаков.
@@ -338,6 +347,7 @@ class Bridge:
             "areas.state": self.cmd_areas_state,
             "areas.points": self.cmd_areas_points,
             "areas.set_autoheal": self.cmd_set_autoheal,
+            "areas.set_driver": self.cmd_set_driver,
             "areas.start": self.cmd_start,
             "areas.stop": self.cmd_stop,
             "areas.restart": self.cmd_restart,
@@ -571,6 +581,9 @@ class Bridge:
             "running": area["dir"].name in (self.core.running_areas() or set()),
             "account": state.local_account(self.mods, area["dir"]),
             "sessions": state.session_verdicts(self.mods, area),
+            # водитель сессий проекта (промт КАРМАНА #174)
+            "driver": str(area.get("driver") or ""),
+            "driverNow": state.driver_of_area(self.mods, area),
         }
         if self.mods.get("autheal"):
             try:
@@ -635,6 +648,39 @@ class Bridge:
         self.core.log("Панель «МиниГен»: %s — режим обслуживания %s" % (
             slug, "АВТОМАТ" if want else "ВРУЧНУЮ"))
         return {"ok": True, "autoheal": want}
+
+    def cmd_set_driver(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Переключатель «водитель проекта»: кто водит сессиями области.
+
+        Промт КАРМАНА #174: в каждый момент у проекта один водитель сессий —
+        либо «Управляющий», либо автомат управления сессиями, либо никто.
+        Значение «Управляющий» ⇒ автомат в этой области **наблюдает, но не
+        действует**: не продлевает, не завершает, не архивирует, не поднимает
+        новых сессий.
+        """
+        slug = str(args.get("slug") or "")
+        want = str(args.get("driver") or "").strip().lower()
+        if want not in DRIVER_VALUES:
+            return {"error": "неизвестный водитель: %s" % want}
+        cfg = state.read_projects()
+        projects = cfg.get("projects") or []
+        target = next((p for p in projects if p.get("slug") == slug), None)
+        if target is None:
+            return {"error": "нет такой области: %s" % slug}
+        current = str(target.get("driver") or "").strip().lower()
+        if current == want:
+            return {"ok": True, "driver": want, "note": "уже так"}
+        if want:
+            target["driver"] = want
+        else:
+            target.pop("driver", None)
+        ok, err = state.write_projects(cfg)
+        if not ok:
+            return {"error": "конфиг не записан: %s" % err}
+        self.core.log("Панель «МиниГен»: %s — водитель сессий: %s" % (
+            slug, DRIVER_TITLES.get(want, "по правилу")))
+        return {"ok": True, "driver": want,
+                "title": DRIVER_TITLES.get(want, "по правилу")}
 
     def _ps_script(self, name: str) -> Path:
         return self.core.BIN / name

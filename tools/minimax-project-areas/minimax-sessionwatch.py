@@ -109,10 +109,13 @@ VENDOR_MARKERS = ("the model service is unstable", "model service is unstable",
 # владельца, их не показываем и не «оживляем» — иначе будем будить пробы.
 PROBE_TITLES = ("ping", "пинг", "probe")
 PROBE_TEXTS = ("ping", "пинг", "probe")
-# Области, где работает «Управляющий» — сессия, которая управляет сессиями.
-# Правило: **один Управляющий на область** (урок ночи, G679): вторая живая
-# сессия там = два писателя в одном worktree.
-MANAGER_AREAS = ("brain2",)
+# ⚠️ ПРОМТ КАРМАНА #174 (26.11): «MANAGER_AREAS = ("brain2",)» больше не
+# существует. Раньше правило «один Управляющий на область» было зашито на одну
+# область и не выключалось. Теперь это **переключатель проекта** (`driver` в
+# конфиге областей) + правило по умолчанию: если в области работает Управляющий
+# (живая сессия с маркером «ЗАДАНИЕ ОТ УПРАВЛЯЮЩЕГО — …»), водит он, а автомат
+# управления сессиями только наблюдает. Механика — в `minigen_core`
+# (`driver_of`, `live_manager_session`, `live_sessions`).
 RECOVERY_WAIT = 900      # после восстановления сети ждём 15 минут перед «Продолжай»
 REVIVE_COOLDOWN = 900    # не чаще одного «Продолжай» на сессию за 15 минут
 CONTEXT_LIMIT = 95       # верхняя граница: процент заполнения контекста, после которого ротация
@@ -409,6 +412,14 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
         v["verdict"] = "проба"
         v["reason"] = "служебная сессия-проба лечащего"
         return v
+    # ⚠️ ПРОМТ #174 (п. 4): сессия «Управляющего» (заголовок вида
+    # «ЗАДАНИЕ ОТ УПРАВЛЯЮЩЕГО — …») — автомат её не оживляет, не сбрасывает
+    # и не ротирует. Отдельный вердикт — видно и в окне, и в отчёте.
+    if core.is_manager_title(sess.get("title") or ""):
+        v["verdict"] = "управляющий"
+        v["reason"] = "сессия Управляющего — автомат её не трогает"
+        v["is_manager"] = True
+        return v
 
     # 1) Отказ провайдера по очкам — лечит лечащий, мы не лезем.
     if sess["error_code"] == BALANCE_CODE or "insufficient balance" in (sess["error_message"] or "").lower():
@@ -550,29 +561,13 @@ def probe_of(area: dict, sess: dict) -> bool:
 def live_manager_session(area: dict) -> str:
     """Живая сессия Управляющего в области (id или пусто).
 
-    «Живая» = идёт ход либо рантайм считает сессию занятой. Одна такая сессия на
-    область — и всё, что запускает вторую (оживление, ручное открытие), должно
-    остановиться: два писателя в одном worktree (G679).
+    ⚠️ ПРОМТ #174: раньше здесь было «любая живая сессия в зашитой области
+    MANAGER_AREAS». Теперь это **живая сессия с маркером Управляющего** в
+    заголовке («ЗАДАНИЕ ОТ УПРАВЛЯЮЩЕГО — …») — по любой области. Смысл тот
+    же (G679: один Управляющий на область), но правило стало переключателем,
+    а не зашитой константой.
     """
-    if area.get("slug") not in MANAGER_AREAS:
-        return ""
-    con = core.connect(core.area_db(area["dir"]))
-    if not con:
-        return ""
-    try:
-        for s in sessions_of(area["dir"]):
-            if s["archived"] or s["kind"] != "conversation":
-                continue
-            if is_probe(con, s):
-                continue
-            turn = last_turn(con, s["session_id"])
-            if turn.get("status") == "accepted" and not turn.get("completed_at_ms"):
-                return s["session_id"]
-            if s["status"] == "started":
-                return s["session_id"]
-    finally:
-        con.close()
-    return ""
+    return core.live_manager_session(area)
 
 
 def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
@@ -590,6 +585,12 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
     if not force and probe_of(area, sess):
         # Пробу не будим: сообщение в пробу = лишний ход и лишние очки.
         return {"ok": False, "why": "это проба лечащего — сообщение не отправлено"}
+    if not force and core.is_manager_title(sess.get("title") or ""):
+        # ⚠️ ПРОМТ #174 (п. 4): сессию Управляющего автомат не трогает — не
+        # оживляет, не сбрасывает, не ротирует (как служебные пробы).
+        # `force=True` — это ручная команда владельца/«Управляющего», она
+        # право имеет.
+        return {"ok": False, "why": "сессия Управляющего — автомат её не трогает"}
     folder = sess.get("workspace_dir") or area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
         return {"ok": False, "why": "папка проекта недоступна: %s" % folder}
@@ -616,26 +617,40 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
 
 
 def new_session(area: dict, prompt: str, force: bool = False,
-                folder: str = "") -> dict:
+                folder: str = "", by_decision: bool = False) -> dict:
     """Открыть НОВУЮ сессию в области с начальной командой.
 
     ⚠️ `folder` — рабочая папка **нитки**: у параллельных ниток одного
     репозитория она своя (свой worktree), и новая сессия обязана продолжить
     именно её ветку (ADR-0011: один пишущий агент — одно дерево).
 
-    В области Управляющего — только если там нет живой сессии (один
-    Управляющий на область, G679); `force` обходит запрет.
+    ⚠️ ПРОМТ #174 (п. 3): **вторая сессия не поднимается, пока в проекте живая
+    сессия** (своя или чужая). Живая = рантайм занят: идёт ход или сессия в
+    состоянии «started» (`core.live_sessions`). Порядок при переносе нитки
+    обязателен: сначала архив старой, потом новая (это делает
+    `apply_decision`, ветка «новая_сессия»).
+
+    Исключение — **только решение «Управляющего»** «новая сессия с
+    продолжением нитки»: к этому моменту старая сессия уже закрыта и
+    **архивирована** (порядок соблюдён), иначе перенос нитки был бы невозможен
+    вовсе. Поэтому флаг `by_decision` — только для этого пути.
+
+    `force` оставлен для совместимости вызовов, но запрет второй сессии он НЕ
+    обходит: правило «один водитель на проект» не обходится флагом.
     """
     # Прокси-переменные — из реестра (22.11, находка Управляющего): сетевой
     # сторож мог починить мёртвый прокси, а вызывающий процесс держит старые
     # значения ⇒ новый ход упал бы с «Connection error». В send_to_session()
     # это уже есть, здесь — нет.
     core.refresh_env()
-    if not force:
-        busy = live_manager_session(area)
-        if busy:
-            return {"ok": False, "why": "в области уже живая сессия Управляющего %s — "
-                                        "вторая не открывается (один Управляющий на область)" % busy[:12]}
+    if not by_decision:
+        live = core.live_sessions(area)
+        if live:
+            first = live[0]
+            return {"ok": False,
+                    "why": "в проекте уже живая сессия %s (%s) — вторая не поднимается: "
+                           "сначала завершите и заархивируйте её"
+                           % (first["session_id"][:12], (first["title"] or "")[:40])}
     folder = folder or area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
         return {"ok": False, "why": "папка проекта недоступна: %s" % folder}
@@ -1103,7 +1118,16 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         # ⚠️ Новая сессия открывается в **рабочей папке нитки** (свой
         # worktree), а не в общей папке области: иначе параллельная нитка
         # продолжилась бы в чужом дереве (ADR-0011).
-        opened = new_session(area, text, folder=str(passport.get("worktree") or ""))
+        #
+        # ⚠️ ПРОМТ #174 (п. 3): это **единственное исключение** из запрета
+        # «вторая сессия не поднимается, пока первая жива» — решение
+        # «Управляющего» «новая сессия с продолжением нитки». Старая сессия
+        # выше уже закрыта и архивирована, то есть порядок «архив старой →
+        # новая» соблюдён. Право на исключение есть только у решения
+        # «Управляющего» (правило-фолбэк перенос нитки не выбирает).
+        by_decision = str(decision.get("source") or "") == "Управляющий"
+        opened = new_session(area, text, folder=str(passport.get("worktree") or ""),
+                             by_decision=by_decision)
         report["steps"].append({"new_session": opened})
         report["ok"] = bool(opened.get("ok"))
         report["why"] = ("нитка перенесена в новую сессию с паспортом: %s"
@@ -1137,13 +1161,18 @@ def treat_session(area: dict, sess: dict, verdict: dict, state: dict) -> dict:
                            "instruction": decision.get("instruction"),
                            "model_why": decision.get("model_why", "")}
     report["passport_id"] = passport.get("thread_id")
-    core.log("СЕССИИ: лечение %s — %s (%s): %s"
+    # ⚠️ Промт #174 (п. 5): в отчёте видно, **кто водит** проект сейчас и
+    # какое действие по чьему решению.
+    drv = core.driver_of(area)
+    report["driver"] = drv
+    core.log("СЕССИИ: лечение %s — %s (%s), водитель — %s: %s"
              % (sess["session_id"][:12], decision.get("action"),
-                decision.get("source") or "правило", report.get("why")))
+                decision.get("source") or "правило", drv["title"], report.get("why")))
     core.report("warn" if decision.get("action") != thread.CONTINUE else "info",
-                "session", "лечение сессии %s: %s (%s) — %s"
+                "session", "лечение сессии %s: %s (%s), водитель — %s — %s"
                 % (sess["session_id"][:12], decision.get("action"),
-                   decision.get("source") or "правило", report.get("why")))
+                   decision.get("source") or "правило", drv["title"], report.get("why")),
+                area=str(area.get("slug") or ""))
     return report
 
 
@@ -1182,11 +1211,77 @@ def survey(area: dict, state: dict) -> list:
 def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
     """Действия по вердиктам: оживление и ротация."""
     actions = []
+    slug = area["slug"]
+    # ⚠️ ПРОМТ КАРМАНА #174: «жизнь сессии» принадлежит ОДНОМУ водителю.
+    # Водитель — либо Управляющий, либо автомат управления сессиями, либо
+    # никто. Считаем его один раз на проход (правило по умолчанию смотрит
+    # живую сессию Управляющего, переключатель проекта — важнее).
+    drv = core.driver_of(area)
+    # Пометки «видели отказ по очкам» для сессий, которые уже не в отказе,
+    # убираем — иначе они копятся и мешают.
+    by_id = {v["session_id"]: v for v in verdicts}
+    seen_map = state.setdefault("balance_seen", {})
+    for sid in list(seen_map.keys()):
+        if (by_id.get(sid) or {}).get("verdict") != "кончились очки":
+            seen_map.pop(sid, None)
     for v in verdicts:
-        slug = area["slug"]
         last = int((state.get("revived") or {}).get(v["session_id"]) or 0)
         cool = int(time.time()) - last < REVIVE_COOLDOWN
-        if v["verdict"] in ("готова", "работает", "кончились очки", "ждёт владельца"):
+        if v["verdict"] == "управляющий":
+            # Промт #174 (п. 4): сессия Управляющего — не оживляем, не
+            # сбрасываем, не ротируем (как служебные пробы).
+            actions.append({"session": v["session_id"],
+                            "action": "сессия Управляющего — не трогаем"})
+            continue
+        if v["verdict"] in ("готова", "работает", "ждёт владельца"):
+            continue
+        # Дальше — только решения, которые меняют жизнь сессии. Здесь решает
+        # водитель: если это не автомат — действие НЕ выполняется, но решение
+        # пишется в отчёт словами (промт #174, п. 2).
+        if drv["driver"] != core.DRIVER_AUTOMATON:
+            actions.append({"session": v["session_id"],
+                            "action": "водитель — %s, действие не выполнялось" % drv["title"],
+                            "driver": drv["driver"], "why": drv["why"]})
+            core.report("info", "session", "%s: водитель — %s, действие не выполнялось "
+                        "(вердикт: %s — %s)" % (slug, drv["title"], v["verdict"],
+                                               v.get("reason") or ""), area=slug)
+            core.log("СЕССИИ: %s — водитель — %s, действие не выполнялось (%s): %s"
+                     % (slug, drv["title"], v["verdict"], v.get("reason") or ""))
+            continue
+        if v["verdict"] == "кончились очки":
+            # ⚠️ ПРОМТ #174: аккаунты и сессии — РАЗНЫЕ автоматы. Лечащий
+            # (автомат аккаунтов) меняет аккаунт и в сессии не пишет ни одного
+            # сообщения; продолжить работу после смены аккаунта — дело здесь,
+            # у сторожа сессий. Поэтому ждём, когда лечащий обновит аккаунт
+            # (его состояние — `core.AUTHEAL_STATE`), и продолжаем сессию
+            # ОДНИМ «Продолжай» на каждую смену аккаунта.
+            failed_ms = int((v.get("last_turn") or {}).get("completed_at_ms")
+                            or v.get("updated_at_ms") or 0)
+            healed_at = int(float((core.read_state(core.AUTHEAL_STATE)
+                                   .get("last_heal") or {}).get(slug) or 0) * 1000)
+            sent_at = int(seen_map.get(v["session_id"]) or 0)
+            if healed_at and healed_at > failed_ms and healed_at > sent_at:
+                if cool:
+                    actions.append({"session": v["session_id"],
+                                    "action": "аккаунт обновлён — ждём кулдаун «Продолжай»"})
+                    continue
+                if dry_run:
+                    actions.append({"session": v["session_id"],
+                                    "action": "«Продолжай» после смены аккаунта (сухой прогон)"})
+                    continue
+                res = send_to_session(area, {"session_id": v["session_id"],
+                                      "workspace_dir": area.get("folder", "")},
+                                      REVIVE_PROMPT, background=True)
+                seen_map[v["session_id"]] = healed_at
+                state.setdefault("revived", {})[v["session_id"]] = int(time.time())
+                actions.append({"session": v["session_id"],
+                                "action": "«Продолжай» после смены аккаунта",
+                                "result": res})
+                core.log("СЕССИИ: %s — очки кончились, аккаунт обновлён лечащим: %s"
+                         % (slug, res.get("why")))
+                continue
+            actions.append({"session": v["session_id"],
+                            "action": "очки кончились — ждём новый аккаунт (автомат аккаунтов)"})
             continue
         if v["verdict"] in ("скомпактилась", "контекст заполнен"):
             # ⚠️ ПРОМТ КАРМАНА #172 (26.11): решение лечения принимает
@@ -1267,9 +1362,10 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                 slug, v["session_id"][:12], res.get("why")))
             continue
         if v["verdict"] in ("брошена", "есть оборванные субагенты"):
-            if area["slug"] in MANAGER_AREAS and live_manager_session(area) not in ("", v["session_id"]):
-                actions.append({"session": v["session_id"], "action": "место занято (один Управляющий на область)"})
-                continue
+            # ⚠️ ПРОМТ #174: вторая сессия в проекте не поднимается, пока
+            # живая сессия (своя или чужая). Здесь мы ничего не поднимаем —
+            # только оживляем существующую, — но решение «новая сессия» ниже
+            # запрет соблюдает (`new_session`).
             # «Ход завис» сюда НЕ входит: сорвать зависший ход и положить
             # «Продолжай» в начало умеет лечащий (перезапуск области) — если
             # послать «Продолжай» сюда, оно встанет в очередь за висящим ходом
@@ -1294,9 +1390,21 @@ def cycle(state: dict, dry_run: bool = False) -> dict:
     running = core.running_areas()
     report = {"at": core.now_ms(), "areas": [], "actions": []}
     for area in core.areas():
-        if area["autoheal"] is False and area["slug"] not in ("brain2",):
+        # ⚠️ ПРОМТ КАРМАНА #174: водитель проекта решает, смотрит ли сторож
+        # область и действует ли он в ней. «Никто» — не смотрим вовсе;
+        # «Управляющий» — смотрим, но не действуем; «автомат» — смотрим и
+        # действуем.
+        drv = core.driver_of(area)
+        if drv["driver"] == core.DRIVER_NONE:
+            report["areas"].append({"slug": area["slug"], "title": area["title"],
+                                    "driver": drv, "verdicts": [], "actions": [],
+                                    "skipped": "водитель — никто, область не смотрим"})
+            continue
+        if area["autoheal"] is False and drv["driver"] != core.DRIVER_MANAGER:
             # Ручные области лечатся вручную — но СЕССИИ в них сторож всё же
             # не трогает: правило владельца «незапущенные/ручные не трогаем».
+            # Исключение — область, где водитель «Управляющий»: там нитки
+            # ведёт он, а сторож только наблюдает.
             continue
         if area["dir"].name not in running:
             continue
@@ -1305,7 +1413,7 @@ def cycle(state: dict, dry_run: bool = False) -> dict:
         verdicts = survey(area, state)
         acts = act(area, verdicts, state, dry_run=dry_run)
         report["areas"].append({"slug": area["slug"], "title": area["title"],
-                                 "verdicts": verdicts, "actions": acts})
+                                 "driver": drv, "verdicts": verdicts, "actions": acts})
         report["actions"].extend(acts)
     state["last_run"] = report
     core.write_state(core.SESSION_STATE, state)
@@ -1512,6 +1620,12 @@ def cli_status(args) -> int:
     print("=== СЕССИИ (проход %s) ===" % core.fmt_ms(last.get("at") or 0))
     for a in last.get("areas") or []:
         print("  [%s]" % a["slug"])
+        # ⚠️ Промт #174 (п. 5): видно, кто водит проект сейчас.
+        drv = a.get("driver") or {}
+        if drv:
+            print("    водитель: %s (%s) — %s" % (drv.get("title") or "—",
+                                                  drv.get("source") or "правило",
+                                                  drv.get("why") or ""))
         for v in a.get("verdicts") or []:
             print("    %-12s %-26s %-7s %s" % (v["session_id"][:12], v["verdict"],
                                                ("%s%%" % v["fill"]) if v.get("fill") else "—",

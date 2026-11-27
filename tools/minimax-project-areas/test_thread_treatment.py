@@ -186,21 +186,32 @@ class Recorder:
         self.opened_in: list[str] = []
         self.reports: list[tuple] = []
         self.ask_calls: list[dict] = []
+        #: Порядок действий над сессией — «закрыть», «архив», «новая»:
+        #: по нему видно, что перенос нитки идёт «сначала архив старой, потом
+        #: новая» (промт КАРМАНА #174, п. 3).
+        self.order: list[str] = []
+        #: Право на исключение из запрета «вторая сессия не поднимается»:
+        #: его даёт только решение «Управляющего».
+        self.by_decision: list[bool] = []
 
     def install(self, watcher, answer: dict | None) -> None:
         rec = self
 
         def fake_send(area, sess, text, background=True, force=False):
             rec.sent.append(text)
+            rec.order.append("send")
             return {"ok": True, "why": "ход пошёл"}
 
         def fake_archive(area_dir, session_id):
             rec.archived.append(session_id)
+            rec.order.append("archive")
             return {"ok": True, "why": "архивирована"}
 
-        def fake_new(area, prompt, force=False, folder=""):
+        def fake_new(area, prompt, force=False, folder="", by_decision=False):
             rec.opened.append(prompt)
             rec.opened_in.append(folder)
+            rec.by_decision.append(bool(by_decision))
+            rec.order.append("new")
             return {"ok": True, "why": "новая сессия пошла"}
 
         def fake_ask(facts, area="", timeout=120):
@@ -336,6 +347,17 @@ def main() -> int:
               "старая сессия не закрыта перед переносом")
         check(rec3.archived == ["sess-a"], "старая сессия не архивирована")
         check(len(rec3.opened) == 1, "новая сессия не открыта")
+        # ⚠️ Промт #174 (п. 3): порядок обязателен — **сначала архив старой,
+        # потом новая**. Проверяем по порядку действий, а не по факту.
+        order = rec3.order
+        check("archive" in order and "new" in order,
+              "перенос нитки не архивировал и не открыл новую: %s" % order)
+        check(order.index("archive") < order.index("new"),
+              "новая сессия поднята раньше архива старой: %s" % order)
+        # Право на исключение из запрета второй сессии — только у решения
+        # «Управляющего» (не у правила-фолбэка).
+        check(rec3.by_decision == [True],
+              "перенос нитки без права на исключение: %s" % rec3.by_decision)
         opened = rec3.opened[0] if rec3.opened else ""
         for needle in ("ПАСПОРТ НИТКИ", "Ветка: feat/thread-a", "Критерии приёмки",
                        "ЧУЖИЕ ДЕРЕВЬЯ НЕ ТРОГАТЬ", "PR нитки"):
