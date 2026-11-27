@@ -56,6 +56,8 @@ jobs:
         run: python3 tools/minimax-project-areas/test_rollout_keeps_api.py
       - name: Приёмка версии по бандлу (окно и «версия на месте» — одно и то же)
         run: python3 tools/minimax-project-areas/test_rollout_version_from_build.py
+      - name: Приёмка пересборки окна перед раскаткой (окно не старше кода)
+        run: python3 tools/minimax-project-areas/test_rollout_rebuilds_window.py
       - name: Приёмка московского времени (время везде по Москве, Россия)
         run: python3 tools/minimax-project-areas/test_time_is_moscow.py
       - name: Приёмка окна глазами (окно умеет снимать свои вкладки)
