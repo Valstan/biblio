@@ -3,15 +3,17 @@ import { join } from 'path'
 import { describe, expect, it } from 'vitest'
 import { AREA_COLUMNS } from '../src/renderer/src/tabs/areas-sort'
 import { MODE_BUTTONS } from '../src/renderer/src/tabs/areas-mode'
-import { DRIVER_LABELS, DRIVER_VALUES } from '../src/renderer/src/tabs/driver-view'
+import { DRIVER_BUTTONS, DRIVER_LABELS, DRIVER_VALUES } from '../src/renderer/src/tabs/driver-view'
 
 /**
- * Сторож на переключатели в списке областей (промт КАРМАНА #177).
+ * Сторож на переключатели в списке областей (промт КАРМАНА #177; два
+ * положения водителя — заказ владельца 27.11).
  *
  * Падает, если:
  * - колонка «Водитель» снова уедет в конец (мимо «Режима»);
  * - «Режим» станет одной кнопкой с меняющейся надписью;
- * - набор значений водителя разойдётся с ядром (окно и ядро — разные словари).
+ * - «Водитель» снова станет выпадающим меню или разойдётся с ядром (окно и
+ *   ядро — разные словари).
  *
  * Ядро читается прямо из репозитория (`minigen_core.py`) — так словарь
  * сверяется с тем, что реально поедет на машину.
@@ -89,19 +91,29 @@ describe('сторож на переключатели списка област
     expect(styles).toContain('text-overflow: ellipsis')
   })
 
-  it('в окне ровно три варианта водителя — и те же, что в ядре', () => {
-    expect([...DRIVER_VALUES]).toHaveLength(3)
-    expect([...DRIVER_VALUES]).toEqual(coreDriverValues())
+  it('«Водитель» — тоже две кнопки, а не выпадающее меню (заказ владельца 27.11)', () => {
+    expect(DRIVER_BUTTONS.map((item) => item.label)).toEqual(['Миниген', 'Оператор'])
+    expect(DRIVER_BUTTONS.length).toBe(2)
+    expect(tab).toContain('DRIVER_BUTTONS.map')
+    expect(tab).toContain('driver-btn')
+    // Выпадающее меню водителя больше не используется.
+    expect(tab).not.toContain('driver-select')
+    expect(styles).toContain('.driver-switch')
   })
 
-  it('слова водителя в окне и в ядре совпадают', () => {
-    const titles = coreDriverTitles()
+  it('положения переключателя — те, что понимает ядро', () => {
+    expect([...DRIVER_VALUES]).toHaveLength(2)
     for (const value of DRIVER_VALUES) {
-      expect(DRIVER_LABELS[value]).toBe(titles[value])
+      expect(coreDriverValues()).toContain(value)
     }
-    expect(DRIVER_LABELS.manager).toBe('Внешнее управление')
-    expect(DRIVER_LABELS.automaton).toBe('Управление МиниГеном')
+  })
+
+  it('слова переключателя — владельческие, в его порядке', () => {
+    expect(DRIVER_LABELS.automaton).toBe('Миниген')
     expect(DRIVER_LABELS.none).toBe('Оператор')
+    // «Внешнее управление» и «Оператор» — одно положение (внешнее управление),
+    // и в ядре словарь остался прежним.
+    expect(coreDriverTitles().manager).toBe('Внешнее управление')
   })
 
   it('«по правилу» — не пункт переключателя (владелец просил три)', () => {

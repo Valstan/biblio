@@ -1,23 +1,28 @@
 import { describe, expect, it } from 'vitest'
 import {
+  CORE_DRIVER_VALUES,
+  DRIVER_BUTTONS,
   DRIVER_HINTS,
   DRIVER_LABELS,
   DRIVER_RULE,
   DRIVER_VALUES,
+  activeDriverButton,
   driverExplicit,
   driverHint,
   driverLabel,
+  driverPosition,
   driverValue
 } from '../src/renderer/src/tabs/driver-view'
 
 /**
  * Переключатель «водитель проекта» (промт КАРМАНА #174; слова и состав —
- * #177).
+ * #177; **два** положения — заказ владельца 27.11).
  *
- * В каждый момент у проекта один водитель сессий. В переключателе **ровно
- * три** варианта: «Внешнее управление», «Управление МиниГеном», «Оператор».
- * «По правилу» — не пункт меню, а правило ядра для области, где водитель
- * ещё не выбран явно.
+ * В каждый момент у проекта один водитель сессий. Положений переключателя
+ * **два**: «Миниген» и «Оператор». «Внешнее управление» и «Оператор» — одно и
+ * то же (управление внешнее; оператор или другой агент — без разницы).
+ * «По правилу» — не пункт переключателя, а правило ядра для области, где
+ * водитель ещё не выбран явно.
  */
 
 function area(over: Record<string, unknown> = {}) {
@@ -25,11 +30,17 @@ function area(over: Record<string, unknown> = {}) {
 }
 
 describe('переключатель «водитель проекта»', () => {
-  it('вариантов ровно три — и это слова владельца', () => {
-    expect([...DRIVER_VALUES]).toEqual(['manager', 'automaton', 'none'])
-    expect(DRIVER_LABELS.manager).toBe('Внешнее управление')
-    expect(DRIVER_LABELS.automaton).toBe('Управление МиниГеном')
+  it('положений ровно два — и это слова владельца, в его порядке', () => {
+    expect([...DRIVER_VALUES]).toEqual(['automaton', 'none'])
+    expect(DRIVER_LABELS.automaton).toBe('Миниген')
     expect(DRIVER_LABELS.none).toBe('Оператор')
+    expect(DRIVER_BUTTONS.map((b) => b.label)).toEqual(['Миниген', 'Оператор'])
+  })
+
+  it('кнопки пишут те значения, которые понимает ядро', () => {
+    for (const button of DRIVER_BUTTONS) {
+      expect(CORE_DRIVER_VALUES as readonly string[]).toContain(button.value)
+    }
   })
 
   it('«по правилу» — не пункт переключателя', () => {
@@ -38,22 +49,29 @@ describe('переключатель «водитель проекта»', () =>
     expect(Object.keys(DRIVER_LABELS)).not.toContain(DRIVER_RULE)
   })
 
-  it('у каждого варианта подсказка: кто водит и что делает', () => {
-    expect(DRIVER_HINTS.manager).toContain('внешний агент')
-    expect(DRIVER_HINTS.manager).toContain('аккаунты')
+  it('у каждого положения подсказка: кто водит и что делает', () => {
     expect(DRIVER_HINTS.automaton).toContain('нейросеть')
     expect(DRIVER_HINTS.automaton).toContain('архивирует')
-    expect(DRIVER_HINTS.none).toContain('оператор')
+    expect(DRIVER_HINTS.none).toContain('внешн')
     for (const value of DRIVER_VALUES) {
       expect(DRIVER_HINTS[value].length).toBeGreaterThan(30)
     }
+  })
+
+  it('«внешнее управление» и «Оператор» — одно положение', () => {
+    expect(driverPosition(area({ driver: 'manager' }))).toBe('none')
+    expect(driverPosition(area({ driver: 'none' }))).toBe('none')
+    expect(driverLabel(area({ driver: 'manager' }))).toBe('Оператор')
+    expect(driverLabel(area({ driver: 'none' }))).toBe('Оператор')
+    expect(activeDriverButton(area({ driver: 'manager' })).label).toBe('Оператор')
   })
 
   it('выбранное значение читается как есть', () => {
     expect(driverValue(area({ driver: 'manager' }))).toBe('manager')
     expect(driverValue(area({ driver: 'none' }))).toBe('none')
     expect(driverValue(area({ driver: 'automaton' }))).toBe('automaton')
-    expect(driverLabel(area({ driver: 'manager' }))).toBe('Внешнее управление')
+    expect(driverPosition(area({ driver: 'automaton' }))).toBe('automaton')
+    expect(driverLabel(area({ driver: 'automaton' }))).toBe('Миниген')
   })
 
   it('выбор явный — по нему и водит', () => {
@@ -73,7 +91,8 @@ describe('переключатель «водитель проекта»', () =>
       }
     })
     expect(driverValue(byRule)).toBe('manager')
-    expect(driverLabel(byRule)).toBe('Внешнее управление')
+    expect(driverPosition(byRule)).toBe('none')
+    expect(driverLabel(byRule)).toBe('Оператор')
     expect(driverExplicit(byRule)).toBe(false)
   })
 
@@ -88,6 +107,7 @@ describe('переключатель «водитель проекта»', () =>
       }
     })
     expect(driverValue(unknown)).toBe('')
+    expect(driverPosition(unknown)).toBe('')
     expect(driverLabel(unknown)).toBe('—')
     expect(driverHint(unknown)).toContain('ядро без правила водителя')
   })
@@ -95,17 +115,17 @@ describe('переключатель «водитель проекта»', () =>
   it('подсказка говорит и что значит значение, и кто водит сейчас', () => {
     const hint = driverHint(
       area({
-        driver: 'manager',
+        driver: 'none',
         driverNow: {
-          driver: 'manager',
-          title: 'Внешнее управление',
-          why: 'переключатель проекта: Внешнее управление',
+          driver: 'none',
+          title: 'Оператор',
+          why: 'переключатель проекта: Оператор',
           source: 'переключатель'
         }
       })
     )
-    expect(hint).toContain(DRIVER_HINTS.manager)
-    expect(hint).toContain('Внешнее управление')
+    expect(hint).toContain(DRIVER_HINTS.none)
+    expect(hint).toContain('Оператор')
     expect(hint).toContain('переключатель проекта')
   })
 

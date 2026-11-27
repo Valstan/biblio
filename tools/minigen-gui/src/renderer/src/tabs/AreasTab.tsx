@@ -4,7 +4,7 @@ import { api } from '../api'
 import { verdictClass } from '../format'
 import { AREA_COLUMNS, DEFAULT_AREA_SORT, nextSort, sortAreas, type AreaSortKey } from './areas-sort'
 import { MODE_BUTTONS } from './areas-mode'
-import { DRIVER_HINTS, DRIVER_LABELS, DRIVER_VALUES, driverHint, driverValue } from './driver-view'
+import { DRIVER_BUTTONS, driverHint, driverPosition } from './driver-view'
 
 interface Props {
   areas: Area[]
@@ -15,17 +15,14 @@ interface Props {
 
 /**
  * Переключатель «водитель проекта» (промт КАРМАНА #174, слова владельца —
- * #177): в каждый момент у проекта один водитель сессий. Вариантов **ровно
- * три**: «Внешнее управление», «Управление МиниГеном», «Оператор».
- * «По правилу» в переключателе нет (владелец просил три) — это правило ядра
- * для области, где водитель ещё не выбран явно; окно показывает, кто водит
- * фактически, и почему.
+ * #177; **два** положения — заказ владельца 27.11): в каждый момент у проекта
+ * один водитель сессий. Положений **два**: «Миниген» и «Оператор».
+ * «Внешнее управление» и «Оператор» — одно и то же: управление внешнее, а
+ * оператор или другой агент — без разницы.
+ * «По правилу» в переключателе нет (владелец просил без него) — это правило
+ * ядра для области, где водитель ещё не выбран явно; окно показывает, кто
+ * водит фактически, и почему.
  */
-const DRIVERS = DRIVER_VALUES.map((value) => ({
-  value,
-  label: DRIVER_LABELS[value],
-  hint: DRIVER_HINTS[value]
-}))
 
 export default function AreasTab({ areas, snapshot, run, busy }: Props) {
   const [creating, setCreating] = useState(false)
@@ -272,8 +269,13 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
 
 /**
  * Ячейка «Водитель» — узкая колонка сразу за «Режимом» (промт КАРМАНА #177,
- * п. 2): переключатель с тремя вариантами и короткая строка «сейчас: …»,
- * которая колонку не раздувает (полный текст — во всплывающей подсказке).
+ * п. 2; заказ владельца 27.11): **две небольшие кнопки**, как у «Режима» (не
+ * выпадающее меню), и короткая строка «сейчас: …», которая колонку не
+ * раздувает (полный текст — во всплывающей подсказке).
+ *
+ * ⚠️ Положений **два**: «Миниген» и «Оператор» (в этом порядке). «Внешнее
+ * управление» и «Оператор» — одно и то же положение: управление внешнее, а
+ * оператор или другой агент — без разницы.
  */
 function DriverCell({
   area,
@@ -284,7 +286,7 @@ function DriverCell({
   busy: boolean
   run: (action: () => Promise<unknown>) => Promise<void>
 }) {
-  const value = driverValue(area)
+  const position = driverPosition(area)
   const now = area.driverNow
   const byRule = now?.source === 'правило'
   const nowText = now?.title
@@ -293,19 +295,24 @@ function DriverCell({
   const nowTitle = now?.why ? `${nowText} — ${now.why}` : nowText
   return (
     <>
-      <select
-        className="driver-select"
-        value={value}
-        disabled={busy}
-        title={driverHint(area)}
-        onChange={(e) => void run(() => api.setDriver(area.slug, e.target.value))}
-      >
-        {DRIVERS.map((item) => (
-          <option key={item.value} value={item.value} title={item.hint}>
-            {item.label}
-          </option>
+      <div className="driver-switch">
+        {DRIVER_BUTTONS.map((button) => (
+          <button
+            key={button.value}
+            className={`driver-btn ${position === button.value ? 'on' : 'off'}`}
+            disabled={busy}
+            // У включённой кнопки — полная подсказка: что значит положение и
+            // кто водит на самом деле (и почему).
+            title={position === button.value ? driverHint(area) : button.hint}
+            aria-pressed={position === button.value}
+            onClick={() =>
+              void run(() => api.setDriver(area.slug, button.value))
+            }
+          >
+            {button.label}
+          </button>
         ))}
-      </select>
+      </div>
       <div className="muted small driver-now" title={nowTitle}>
         {nowText}
       </div>
