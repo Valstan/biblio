@@ -321,6 +321,34 @@ def write_projects(cfg: dict[str, Any]) -> tuple[bool, str]:
         return False, str(exc)
 
 
+def enforce_autoheal() -> list[str]:
+    """Привести области к автомату аккаунтов (промт КАРМАНА #182).
+
+    Ручного режима в «МиниГене» больше нет: колонка «Режим» убрана из окна
+    вместе с переключателем («Автомат / Вручную»), и **выключить автомат
+    нечем**. Значит в сохранённом состоянии области не должно остаться
+    области с выключенным автоматом — приводим их к автомату (решение
+    владельца: при обновлении автомат включается у всех областей
+    принудительно).
+
+    Возвращает список областей, которые переведены в автомат (пусто — все
+    уже в автомате, и тогда файл не трогаем вовсе).
+    """
+    cfg = read_projects()
+    projects = cfg.get("projects") or []
+    fixed: list[str] = []
+    for project in projects:
+        if not project.get("autoheal"):
+            project["autoheal"] = True
+            fixed.append(str(project.get("slug") or ""))
+    if not fixed:
+        return []
+    ok, _err = write_projects(cfg)
+    if not ok:
+        return []
+    return fixed
+
+
 def _copy_if_valid(src: Path, dst: Path) -> bool:
     """Скопировать файл в `dst`, **если он читается** (валидный JSON).
 
@@ -424,7 +452,11 @@ def areas_state(mods: dict[str, Any], include_sessions: bool = True,
             "title": area["title"],
             "folder": area.get("folder") or "",
             "karman": area.get("karman") or area["slug"],
-            "autoheal": bool(area.get("autoheal")),
+            # ⚠️ Промт КАРМАНА #182: автомат аккаунтов всегда включён. Берём
+            # правило из ядра, но с запасным значением `True` — на машине может
+            # стоять старое ядро (без константы), а ручного режима больше нет
+            # ни в какой версии.
+            "autoheal": bool(getattr(core, "AUTOHEAL_ALWAYS", True)),
             "dir": str(area["dir"]),
             "running": is_running,
             "exists": area["dir"].is_dir(),

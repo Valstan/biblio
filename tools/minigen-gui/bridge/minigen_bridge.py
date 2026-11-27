@@ -200,6 +200,38 @@ def _published_prompt_id(project: str, title: str, text: str) -> Any:
     return ""
 
 
+def enforce_autoheal() -> None:
+    """Привести области к автомату аккаунтов (промт КАРМАНА #182).
+
+    ⚠️ Ручного режима в «МиниГене» больше нет: переключатель «Автомат /
+    Вручную» убран из окна вместе с колонкой «Режим», и **выключить автомат
+    нечем**. Значит не должна остаться область, у которой в сохранённом
+    состоянии автомат выключен (решение владельца: при обновлении автомат
+    включается у всех областей принудительно).
+
+    Делается **один раз при старте программы** — это и есть «при обновлении»:
+    программа перезапускается ⇒ области приводятся к автомату. Ошибка здесь
+    не должна ронять программу.
+    """
+    try:
+        fixed = state.enforce_autoheal()
+    except Exception as exc:  # noqa: BLE001 — приведение не роняет программу
+        try:
+            state.load_daemons()["core"].log(
+                "Панель «МиниГен»: не удалось привести области к автомату: %s" % exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return
+    if not fixed:
+        return
+    try:
+        state.load_daemons()["core"].log(
+            "Панель «МиниГен»: автомат аккаунтов включён у областей: %s "
+            "(ручного режима больше нет)" % ", ".join(fixed))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class Bridge:
     """Программа «МиниГен» без окна: команды, состояние, чат."""
 
@@ -231,6 +263,7 @@ class Bridge:
         self._prompt_thread: threading.Thread | None = None
         self.handlers = self._build_handlers()
         self.migrate_legacy_prompts()
+        enforce_autoheal()
         self.start_daemon_supervision()
         self.start_prompt_dispatch()
 
@@ -583,7 +616,9 @@ class Bridge:
             "slug": area["slug"],
             "title": area["title"],
             "folder": area.get("folder") or "",
-            "autoheal": bool(area.get("autoheal")),
+            # ⚠️ Промт КАРМАНА #182: автомат аккаунтов всегда включён (см.
+            # `state.areas_state`) — и выключить его нечем.
+            "autoheal": bool(getattr(self.core, "AUTOHEAL_ALWAYS", True)),
             "running": area["dir"].name in (self.core.running_areas() or set()),
             "account": state.local_account(self.mods, area["dir"]),
             "sessions": state.session_verdicts(self.mods, area),
@@ -638,6 +673,18 @@ class Bridge:
 
     # ────────────────────────────────────────────────────────── обслуживание
     def cmd_set_autoheal(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Автомат аккаунтов области — **всегда включён** (промт КАРМАНА #182).
+
+        Ручного режима в «МиниГене» больше нет: колонка «Режим» убрана из
+        окна вместе с переключателем («Автомат / Вручную»), и **выключить
+        автомат нечем**. Команда осталась как «включить автомат» (ею пользуется
+        встроенная нейросеть) и заодно приводит область к автомату — как и
+        все остальные (решение владельца: при обновлении автомат включается
+        у всех областей принудительно).
+
+        ⚠️ Пишем всегда `autoheal: true`: пути «выключить автомат» в коде
+        нет, и сторож (приёмка `test_always_auto_182.py`) это проверяет.
+        """
         slug = str(args.get("slug") or "")
         want = bool(args.get("autoheal"))
         cfg = state.read_projects()
@@ -645,15 +692,19 @@ class Bridge:
         target = next((p for p in projects if p.get("slug") == slug), None)
         if target is None:
             return {"error": "нет такой области: %s" % slug}
-        if bool(target.get("autoheal")) == want:
-            return {"ok": True, "autoheal": want, "note": "уже так"}
-        target["autoheal"] = want
-        ok, err = state.write_projects(cfg)
-        if not ok:
-            return {"error": "конфиг не записан: %s" % err}
-        self.core.log("Панель «МиниГен»: %s — режим обслуживания %s" % (
-            slug, "АВТОМАТ" if want else "ВРУЧНУЮ"))
-        return {"ok": True, "autoheal": want}
+        changed = not bool(target.get("autoheal"))
+        target["autoheal"] = True
+        if changed:
+            ok, err = state.write_projects(cfg)
+            if not ok:
+                return {"error": "конфиг не записан: %s" % err}
+            self.core.log("Панель «МиниГен»: %s — автомат аккаунтов включён "
+                          "(ручного режима больше нет)" % slug)
+        if not want:
+            return {"error": "ручного режима больше нет: автомат аккаунтов "
+                             "всегда включён",
+                    "autoheal": True}
+        return {"ok": True, "autoheal": True}
 
     def cmd_set_driver(self, args: dict[str, Any]) -> dict[str, Any]:
         """Переключатель «водитель проекта»: кто водит сессиями области.
@@ -787,7 +838,10 @@ class Bridge:
             area_dir.mkdir(parents=True, exist_ok=True)
         projects.append({
             "slug": slug, "title": title, "folder": folder,
-            "karman": karman, "autoheal": True,
+            "karman": karman,
+            # ⚠️ Промт КАРМАНА #182: новая область стартует **в автомате** —
+            # автомат аккаунтов всегда включён, ручного режима нет.
+            "autoheal": True,
         })
         ok, err = state.write_projects(cfg)
         if not ok:
