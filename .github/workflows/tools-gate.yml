@@ -70,5 +70,7 @@ jobs:
         run: python3 tools/minimax-project-areas/test_session_driver_rules.py
       - name: Приёмка переключателей в списке областей (промт #177)
         run: python3 tools/minimax-project-areas/test_driver_switch_177.py
+      - name: Приёмка «всегда автомат» — колонка «Режим» убрана, колонки переименованы (промт #182)
+        run: python3 tools/minimax-project-areas/test_always_auto_182.py
       - name: Приёмка экосистемы агентов (заявка из зачитки и раздел КАРМАНА)
         run: python3 tools/minimax-project-areas/test_agents_ecosystem.py

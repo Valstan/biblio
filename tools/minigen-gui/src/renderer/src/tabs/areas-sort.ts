@@ -3,11 +3,22 @@ import { DRIVER_VALUES, driverPosition } from './driver-view'
 
 /**
  * Сортировка списка областей по клику на шапку столбца (заказ владельца
- * 24.11): «Область · Работает · Вход · Очки · Режим · Сессии».
+ * 24.11).
  *
- * ⚠️ ПРОМТ КАРМАНА #177 (27.11): колонка «Водитель» переехала **вплотную за
- * «Режимом»** (раньше её добавляли отдельным заголовком в конец таблицы), и
- * она тоже сортируется.
+ * ⚠️ ПРОМТ КАРМАНА #182 (зачитка владельца 27.11): колонки списка областей
+ * перестроены — ручного режима в «МиниГене» больше нет:
+ *
+ * - колонка **«Режим» убрана целиком**: автомат аккаунтов всегда включён,
+ *   переключателя («Автомат / Вручную») не осталось, сортировать по ней
+ *   нечем;
+ * - **«Водитель» → «Сессии»**: выбор водителя (кто водит сессиями) остался
+ *   тем же — поменялся только заголовок на экране;
+ * - **«Сессии» → «Состояние»**: там чипы состояний сессий (вердикт и
+ *   заполнение) — имя по делу.
+ *
+ * ⚠️ Внутренние ключи (`driver`, `sessions`) остались прежними: переименуются
+ * **заголовки на экране**, а не словари (промт #182, п. 7). В мосте, в отчёте
+ * о лечении и в журнале водитель остаётся водителем.
  *
  * Правила:
  *
@@ -23,7 +34,7 @@ import { DRIVER_VALUES, driverPosition } from './driver-view'
  * глазами (как карта генов и шапка окна).
  */
 
-export type AreaSortKey = 'area' | 'running' | 'account' | 'points' | 'mode' | 'driver' | 'sessions'
+export type AreaSortKey = 'area' | 'running' | 'account' | 'points' | 'driver' | 'sessions'
 export type AreaSortDir = 'asc' | 'desc'
 
 export interface AreaSort {
@@ -43,9 +54,11 @@ export const AREA_COLUMNS: AreaColumn[] = [
   { key: 'running', label: 'Работает', first: 'desc' },
   { key: 'account', label: 'Вход', first: 'asc' },
   { key: 'points', label: 'Очки', first: 'desc' },
-  { key: 'mode', label: 'Режим', first: 'desc' },
-  { key: 'driver', label: 'Водитель', first: 'asc' },
-  { key: 'sessions', label: 'Сессии', first: 'desc' }
+  // «Водитель» на экране стал «Сессиями» (промт #182) — по словарю это всё
+  // тот же выбор водителя сессий, ключ остался прежним.
+  { key: 'driver', label: 'Сессии', first: 'asc' },
+  // Бывшие «Сессии» (чипы состояний) стали «Состоянием».
+  { key: 'sessions', label: 'Состояние', first: 'desc' }
 ]
 
 /** По умолчанию — «Работает», работающие сверху. */
@@ -65,6 +78,17 @@ export function sortLabel(sort: AreaSort): string {
   const column = AREA_COLUMNS.find((item) => item.key === sort.key)
   const label = column ? column.label : sort.key
   return `${label} ${sort.dir === 'asc' ? '▲' : '▼'}`
+}
+
+/**
+ * Список колонок для подсказки сортировки — **ровно то, что на экране**.
+ *
+ * Промт #182: «список колонок в подсказке совпадает с тем, что на экране» —
+ * поэтому подсказка собирается из того же `AREA_COLUMNS`, а не из отдельного
+ * списка (который однажды разошёлся бы с шапкой).
+ */
+export function sortColumnsHint(): string {
+  return AREA_COLUMNS.map((column) => column.label).join(' · ')
 }
 
 function text(value: unknown): string {
@@ -105,8 +129,6 @@ function compare(a: Area, b: Area, key: AreaSortKey): number {
         text(a.account?.state).localeCompare(text(b.account?.state), 'ru') ||
         text(a.account?.email).localeCompare(text(b.account?.email), 'ru')
       )
-    case 'mode':
-      return Number(a.autoheal) - Number(b.autoheal)
     case 'driver':
       return driverRank(a) - driverRank(b)
     case 'sessions':

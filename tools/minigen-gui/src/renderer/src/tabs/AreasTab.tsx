@@ -2,8 +2,14 @@ import { useMemo, useState } from 'react'
 import type { Area, Snapshot } from '@shared/types'
 import { api } from '../api'
 import { verdictClass } from '../format'
-import { AREA_COLUMNS, DEFAULT_AREA_SORT, nextSort, sortAreas, type AreaSortKey } from './areas-sort'
-import { MODE_BUTTONS } from './areas-mode'
+import {
+  AREA_COLUMNS,
+  DEFAULT_AREA_SORT,
+  nextSort,
+  sortAreas,
+  sortColumnsHint,
+  type AreaSortKey
+} from './areas-sort'
 import { DRIVER_BUTTONS, driverHint, driverPosition } from './driver-view'
 
 interface Props {
@@ -46,8 +52,12 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
 
   /**
    * Ячейка строки по колонке. Порядок ячеек задаётся `AREA_COLUMNS` — тем же
-   * списком, что и шапки, — поэтому колонка «Водитель» не может «уехать» в
+   * списком, что и шапки, — поэтому колонка водителя не может «уехать» в
    * конец: она в том же списке, что и остальные (промт #177, п. 2, 10).
+   *
+   * ⚠️ Промт КАРМАНА #182: колонки «Режим» больше нет — ручного режима в
+   * «МиниГене» не осталось (автомат аккаунтов всегда включён, выключить его
+   * нечем). «Водитель» на экране стал «Сессиями», бывшие «Сессии» — «Состоянием».
    */
   const cell = (key: AreaSortKey, area: Area) => {
     switch (key) {
@@ -77,29 +87,9 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
         )
       case 'points':
         return <>{area.points?.points_today ?? '—'}</>
-      case 'mode':
-        // ⚠️ Промт КАРМАНА #177 (п. 1): «Режим» — две небольшие кнопки, обе
-        // подписи всегда на виду, включённая выделена. ОДНА кнопка с
-        // меняющейся надписью тут больше не годится.
-        return (
-          <div className="mode-switch">
-            {MODE_BUTTONS.map((button) => (
-              <button
-                key={button.label}
-                className={`mode-btn ${area.autoheal === button.autoheal ? 'on' : 'off'}`}
-                disabled={busy}
-                title={button.hint}
-                aria-pressed={area.autoheal === button.autoheal}
-                onClick={() =>
-                  void run(() => api.setAutoheal(area.slug, button.autoheal))
-                }
-              >
-                {button.label}
-              </button>
-            ))}
-          </div>
-        )
       case 'driver':
+        // ⚠️ Промт КАРМАНА #182: на экране эта колонка называется «Сессии»
+        // (словарь водителя прежний — поменялся только заголовок).
         return <DriverCell area={area} busy={busy} run={run} />
       case 'sessions':
         return area.sessions.length === 0 ? (
@@ -203,7 +193,10 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
                 <button
                   className={`sort${sort.key === column.key ? ' active' : ''}`}
                   onClick={() => setSort((current) => nextSort(current, column.key))}
-                  title="Сортировать по этому столбцу"
+                  // Список столбцов в подсказке — из того же `AREA_COLUMNS`,
+                  // что и шапки ⇒ подсказка всегда совпадает с экраном
+                  // (промт КАРМАНА #182, п. 6).
+                  title={`Сортировать по этому столбцу. Столбцы: ${sortColumnsHint()}`}
                 >
                   {column.label}
                   {sort.key === column.key ? (sort.dir === 'asc' ? ' ▲' : ' ▼') : ''}
@@ -239,7 +232,10 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
                   className="ghost"
                   disabled={busy}
                   onClick={() => void run(() => api.relogin(area.slug))}
-                  title="Взять следующий аккаунт у КАРМАНА"
+                  // Запасной **ручной** путь (промт КАРМАНА #182, п. 2):
+                  // автоматика сама берёт свежий аккаунт, а эта кнопка — на
+                  // случай сбоя автоматики.
+                  title="Запасной ручной путь: взять следующий аккаунт у КАРМАНА, если автоматика не сработала"
                 >
                   Новый вход
                 </button>
@@ -268,10 +264,10 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
 }
 
 /**
- * Ячейка «Водитель» — узкая колонка сразу за «Режимом» (промт КАРМАНА #177,
- * п. 2; заказ владельца 27.11): **две небольшие кнопки**, как у «Режима» (не
- * выпадающее меню), и короткая строка «сейчас: …», которая колонку не
- * раздувает (полный текст — во всплывающей подсказке).
+ * Ячейка «Сессии» (на экране так с 27.11, промт КАРМАНА #182; раньше колонка
+ * называлась «Водитель»): **две небольшие кнопки** — «Миниген» и «Оператор»,
+ * и короткая строка «сейчас: …», которая колонку не раздувает (полный текст —
+ * во всплывающей подсказке).
  *
  * ⚠️ Положений **два**: «Миниген» и «Оператор» (в этом порядке). «Внешнее
  * управление» и «Оператор» — одно и то же положение: управление внешнее, а
