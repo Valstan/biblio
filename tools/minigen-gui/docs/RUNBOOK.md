@@ -32,6 +32,10 @@ python -c "import json;json.load(open(r'C:\Users\valstan\bin\mcode-project-areas
 ```
 
 Если файл побит — восстановить из копии рядом (`mcode-project-areas.json.bak-mode`).
+Копия есть и в репозитории (`tools/minimax-project-areas/mcode-project-areas.json`) —
+но помни: она везёт **структуру** (какие области есть), а живое состояние
+(`autoheal`, `driver`) остаётся на машине ⇒ восстанавливать файл целиком из
+репозитория — значит откатить решение владельца про автолечение.
 
 ### Чат: «нейросеть недоступна»
 
