@@ -1,62 +1,95 @@
 import { describe, expect, it } from 'vitest'
-import type { Area } from '../src/shared/types'
 import {
   DRIVER_HINTS,
   DRIVER_LABELS,
+  DRIVER_RULE,
   DRIVER_VALUES,
+  driverExplicit,
   driverHint,
   driverLabel,
   driverValue
 } from '../src/renderer/src/tabs/driver-view'
 
 /**
- * Переключатель «водитель проекта» (промт КАРМАНА #174).
+ * Переключатель «водитель проекта» (промт КАРМАНА #174; слова и состав —
+ * #177).
  *
- * В каждый момент у проекта один водитель сессий: либо «Управляющий», либо
- * автомат управления сессиями, либо никто. Значение «по правилу» — то самое
- * правило по умолчанию: если в области работает Управляющий, водит он
- * (автомат только наблюдает), иначе — автомат.
+ * В каждый момент у проекта один водитель сессий. В переключателе **ровно
+ * три** варианта: «Внешнее управление», «Управление МиниГеном», «Оператор».
+ * «По правилу» — не пункт меню, а правило ядра для области, где водитель
+ * ещё не выбран явно.
  */
 
-function area(over: Partial<Area> = {}): Area {
-  return {
-    slug: 'a',
-    title: 'Область',
-    folder: '',
-    karman: '',
-    autoheal: true,
-    dir: 'p-a',
-    running: true,
-    exists: true,
-    account: {},
-    sessions: [],
-    ...over
-  } as Area
+function area(over: Record<string, unknown> = {}) {
+  return over as Parameters<typeof driverValue>[0]
 }
 
 describe('переключатель «водитель проекта»', () => {
-  it('значения — как в ядре', () => {
-    expect([...DRIVER_VALUES]).toEqual(['auto', 'manager', 'automaton', 'none'])
-    expect(DRIVER_LABELS.manager).toBe('Управляющий')
-    expect(DRIVER_LABELS.automaton).toBe('автомат')
-    expect(DRIVER_LABELS.none).toBe('никто')
-    expect(DRIVER_LABELS.auto).toBe('по правилу')
+  it('вариантов ровно три — и это слова владельца', () => {
+    expect([...DRIVER_VALUES]).toEqual(['manager', 'automaton', 'none'])
+    expect(DRIVER_LABELS.manager).toBe('Внешнее управление')
+    expect(DRIVER_LABELS.automaton).toBe('Управление МиниГеном')
+    expect(DRIVER_LABELS.none).toBe('Оператор')
   })
 
-  it('пустое значение — «по правилу»', () => {
-    expect(driverValue(area())).toBe('auto')
-    expect(driverValue(area({ driver: '' }))).toBe('auto')
-    expect(driverLabel(area({ driver: '' }))).toBe('по правилу')
+  it('«по правилу» — не пункт переключателя', () => {
+    expect([...DRIVER_VALUES]).not.toContain(DRIVER_RULE)
+    expect(DRIVER_RULE).toBe('auto')
+    expect(Object.keys(DRIVER_LABELS)).not.toContain(DRIVER_RULE)
   })
 
-  it('незнакомое значение — «по правилу», а не выдумка', () => {
-    expect(driverValue(area({ driver: 'кто-то' }))).toBe('auto')
+  it('у каждого варианта подсказка: кто водит и что делает', () => {
+    expect(DRIVER_HINTS.manager).toContain('внешний агент')
+    expect(DRIVER_HINTS.manager).toContain('аккаунты')
+    expect(DRIVER_HINTS.automaton).toContain('нейросеть')
+    expect(DRIVER_HINTS.automaton).toContain('архивирует')
+    expect(DRIVER_HINTS.none).toContain('оператор')
+    for (const value of DRIVER_VALUES) {
+      expect(DRIVER_HINTS[value].length).toBeGreaterThan(30)
+    }
   })
 
   it('выбранное значение читается как есть', () => {
     expect(driverValue(area({ driver: 'manager' }))).toBe('manager')
     expect(driverValue(area({ driver: 'none' }))).toBe('none')
-    expect(driverLabel(area({ driver: 'manager' }))).toBe('Управляющий')
+    expect(driverValue(area({ driver: 'automaton' }))).toBe('automaton')
+    expect(driverLabel(area({ driver: 'manager' }))).toBe('Внешнее управление')
+  })
+
+  it('выбор явный — по нему и водит', () => {
+    expect(driverExplicit(area({ driver: 'manager' }))).toBe(true)
+    expect(driverExplicit(area({ driver: '' }))).toBe(false)
+    expect(driverExplicit(area({ driver: DRIVER_RULE }))).toBe(false)
+  })
+
+  it('без явного выбора водителя определяет ядро (правило)', () => {
+    const byRule = area({
+      driver: '',
+      driverNow: {
+        driver: 'manager',
+        title: 'Внешнее управление',
+        why: 'по правилу: в области работает сессия Управляющего (abc123)',
+        source: 'правило'
+      }
+    })
+    expect(driverValue(byRule)).toBe('manager')
+    expect(driverLabel(byRule)).toBe('Внешнее управление')
+    expect(driverExplicit(byRule)).toBe(false)
+  })
+
+  it('ядро без правила водителя — честное «—», а не выдумка', () => {
+    const unknown = area({
+      driver: '',
+      driverNow: {
+        driver: '',
+        title: '—',
+        why: 'ядро без правила водителя (обновите демоны)',
+        source: ''
+      }
+    })
+    expect(driverValue(unknown)).toBe('')
+    expect(driverLabel(unknown)).toBe('—')
+    expect(driverHint(unknown)).toContain('ядро без правила водителя')
   })
 
   it('подсказка говорит и что значит значение, и кто водит сейчас', () => {
@@ -65,20 +98,36 @@ describe('переключатель «водитель проекта»', () =>
         driver: 'manager',
         driverNow: {
           driver: 'manager',
-          title: 'Управляющий',
-          why: 'переключатель проекта: Управляющий',
+          title: 'Внешнее управление',
+          why: 'переключатель проекта: Внешнее управление',
           source: 'переключатель'
         }
       })
     )
     expect(hint).toContain(DRIVER_HINTS.manager)
-    expect(hint).toContain('Управляющий')
+    expect(hint).toContain('Внешнее управление')
     expect(hint).toContain('переключатель проекта')
   })
 
+  it('правило видно в подсказке отдельно', () => {
+    const hint = driverHint(
+      area({
+        driver: 'auto',
+        driverNow: {
+          driver: 'automaton',
+          title: 'Управление МиниГеном',
+          why: 'по правилу: сессии Управляющего в области нет',
+          source: 'правило'
+        }
+      })
+    )
+    expect(hint).toContain('по правилу')
+    expect(hint).toContain('Управление МиниГеном')
+  })
+
   it('без водителя подсказка не выдумывает', () => {
-    const hint = driverHint(area({ driver: 'auto' }))
-    expect(hint).toContain(DRIVER_HINTS.auto)
+    const hint = driverHint(area({ driver: 'automaton' }))
+    expect(hint).toContain(DRIVER_HINTS.automaton)
     expect(hint).not.toContain('Сейчас водит')
   })
 })

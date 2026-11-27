@@ -70,5 +70,7 @@ jobs:
         run: python3 tools/minimax-project-areas/test_autheal_accounts_only.py
       - name: Приёмка водителя сессий (промт #174)
         run: python3 tools/minimax-project-areas/test_session_driver_rules.py
+      - name: Приёмка переключателей в списке областей (промт #177)
+        run: python3 tools/minimax-project-areas/test_driver_switch_177.py
       - name: Приёмка экосистемы агентов (заявка из зачитки и раздел КАРМАНА)
         run: python3 tools/minimax-project-areas/test_agents_ecosystem.py
