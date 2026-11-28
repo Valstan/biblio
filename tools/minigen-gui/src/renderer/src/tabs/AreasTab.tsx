@@ -1,10 +1,11 @@
 import { useMemo, useState } from 'react'
-import type { Area, Snapshot } from '@shared/types'
+import type { AgentDeletePlan, AgentDeleteResult, Area, Snapshot } from '@shared/types'
 import { api } from '../api'
 import { verdictClass } from '../format'
 import {
   AREA_COLUMNS,
   DEFAULT_AREA_SORT,
+  activityOf,
   nextSort,
   sortAreas,
   sortColumnsHint,
@@ -35,9 +36,13 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
   const [form, setForm] = useState({ slug: '', title: '', folder: '', karman: '' })
   const [message, setMessage] = useState('')
   // Сортировка по клику на шапку столбца (заказ владельца 24.11).
-  // По умолчанию — по статусу «Работает», работающие сверху.
+  // ⚠️ Промт КАРМАНА #208: по умолчанию — **по активности** внутри двух
+  // блоков (работающие сверху); блок «работающие сверху» держится всегда.
   const [sort, setSort] = useState(DEFAULT_AREA_SORT)
   const sorted = useMemo(() => sortAreas(areas, sort), [areas, sort])
+  // Удаление агента (промт КАРМАНА #208): сначала план, потом подтверждение.
+  const [deleting, setDeleting] = useState<{ slug: string; plan: AgentDeletePlan } | null>(null)
+  const [deleteResult, setDeleteResult] = useState<AgentDeleteResult | null>(null)
 
   const submit = async () => {
     const res = await api.createArea(form)
@@ -58,6 +63,10 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
    * ⚠️ Промт КАРМАНА #182: колонки «Режим» больше нет — ручного режима в
    * «МиниГене» не осталось (автомат аккаунтов всегда включён, выключить его
    * нечем). «Водитель» на экране стал «Сессиями», бывшие «Сессии» — «Состоянием».
+   *
+   * ⚠️ Промт КАРМАНА #208: колонки **«Работает» больше нет** — признак виден
+   * теперь цветом всей строки (класс `row-running`), а порядок задан двумя
+   * блоками (работающие сверху) и активностью внутри блока.
    */
   const cell = (key: AreaSortKey, area: Area) => {
     switch (key) {
@@ -69,13 +78,7 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
               {area.slug}
               {area.folder ? ` · ${area.folder}` : ''}
             </div>
-          </>
-        )
-      case 'running':
-        return (
-          <>
-            <span className={`dot ${area.running ? 'ok' : 'off'}`} />
-            {area.running ? 'да' : 'нет'}
+            <ActivityLine area={area} />
           </>
         )
       case 'account':
@@ -114,6 +117,31 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
       default:
         return null
     }
+  }
+
+  /** Спросить план удаления агента (ничего ещё не удалено). */
+  const askDelete = async (area: Area) => {
+    setDeleteResult(null)
+    await run(async () => {
+      const plan = await api.deleteAgentPlan(area.slug)
+      setDeleting({ slug: area.slug, plan })
+    })
+  }
+
+  /** Подтверждение: удалить. */
+  const confirmDelete = async () => {
+    if (!deleting) return
+    const slug = deleting.slug
+    await run(async () => {
+      const res = await api.deleteAgent(slug)
+      setDeleteResult(res)
+      if (res.ok) {
+        setDeleting(null)
+        setMessage(`агент ${slug} удалён`)
+      } else {
+        setMessage(`удаление не прошло: ${res.error ?? 'причина неизвестна'}`)
+      }
+    })
   }
 
   return (
@@ -185,6 +213,86 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
         </div>
       )}
 
+      {deleting && (
+        <div className="card delete-card">
+          <h3>Удаление агента: {deleting.plan.title || deleting.slug}</h3>
+          <p className="muted small">
+            Удаление <strong>необратимо</strong>: агента не будет ни в списке
+            областей, ни среди запущенных, ни в разборе сессий. Ниже — что
+            именно исчезнет.
+          </p>
+          <div className="delete-list">
+            {deleting.plan.targets.map((target) => (
+              <div className="delete-target" key={`${target.what}:${target.path}`}>
+                <span className="delete-what">{target.what}</span>
+                <span className="muted small">{target.path}</span>
+                {!target.exists && <span className="muted small"> — на диске нет</span>}
+              </div>
+            ))}
+            <div className="delete-target">
+              <span className="delete-what">запись в настройке областей</span>
+              <span className="muted small">{deleting.plan.slug}</span>
+            </div>
+          </div>
+          {deleting.plan.note && (
+            <p className="muted small">{deleting.plan.note}</p>
+          )}
+          {!deleting.plan.can_delete && (
+            <div className="banner bad">
+              <div>Удаление не проходит: {deleting.plan.why}</div>
+              {deleting.plan.git.unpushed.length > 0 && (
+                <>
+                  <div>Не отправлено на GitHub (коммиты):</div>
+                  <ul>
+                    {deleting.plan.git.unpushed.map((line) => (
+                      <li key={line}>{line}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+              {deleting.plan.git.dirty.length > 0 && (
+                <>
+                  <div>Не закоммичено (файлы):</div>
+                  <ul>
+                    {deleting.plan.git.dirty.map((file) => (
+                      <li key={file}>{file}</li>
+                    ))}
+                  </ul>
+                </>
+              )}
+            </div>
+          )}
+          <div className="row">
+            <button
+              className="danger"
+              disabled={busy || !deleting.plan.can_delete}
+              onClick={() => void confirmDelete()}
+            >
+              Удалить
+            </button>
+            <button className="ghost" onClick={() => setDeleting(null)} disabled={busy}>
+              Отмена
+            </button>
+          </div>
+        </div>
+      )}
+
+      {deleteResult && !deleteResult.ok && (
+        <div className="banner bad">
+          Удаление не прошло: {deleteResult.error ?? 'причина неизвестна'}
+          {deleteResult.failed && deleteResult.failed.length > 0 && (
+            <ul>
+              {deleteResult.failed.map((item) => (
+                <li key={item.what}>
+                  {item.what}
+                  {item.why ? ` — ${item.why}` : ''}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       <table className="grid">
         <thead>
           <tr>
@@ -195,7 +303,8 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
                   onClick={() => setSort((current) => nextSort(current, column.key))}
                   // Список столбцов в подсказке — из того же `AREA_COLUMNS`,
                   // что и шапки ⇒ подсказка всегда совпадает с экраном
-                  // (промт КАРМАНА #182, п. 6).
+                  // (промт КАРМАНА #182, п. 6; #208 — колонка «Работает» убрана
+                  // и из шапки, и из подсказки).
                   title={`Сортировать по этому столбцу. Столбцы: ${sortColumnsHint()}`}
                 >
                   {column.label}
@@ -208,7 +317,9 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
         </thead>
         <tbody>
           {sorted.map((area) => (
-            <tr key={area.slug}>
+            // ⚠️ Промт КАРМАНА #208: работающий агент помечен **цветом всей
+            // строки** (класс `row-running`) — колонки «Работает» больше нет.
+            <tr key={area.slug} className={area.running ? 'row-running' : undefined}>
               {AREA_COLUMNS.map((column) => (
                 <td key={column.key} className={`col-${column.key}`}>
                   {cell(column.key, area)}
@@ -247,6 +358,17 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
                     Папка
                   </button>
                 )}
+                {/* ⚠️ Промт КАРМАНА #208: удаление агента целиком — рядом с
+                    остальными действиями строки. Кнопка сначала показывает,
+                    что именно исчезнет, и спрашивает подтверждение. */}
+                <button
+                  className="ghost danger-ghost"
+                  disabled={busy}
+                  onClick={() => void askDelete(area)}
+                  title="Удалить агента целиком: папку проекта, запись из настроек, папку агента, паспорта ниток, авторизацию и ярлык. Перед удалением — проверка, что всё отправлено на GitHub."
+                >
+                  Удалить
+                </button>
               </td>
             </tr>
           ))}
@@ -264,14 +386,36 @@ export default function AreasTab({ areas, snapshot, run, busy }: Props) {
 }
 
 /**
+ * Счётчик активности области (промт КАРМАНА #208): сколько раз агент получал
+ * аккаунты и обновления аккаунтов MiniMax из Кармана. Значение приходит из
+ * моста — его считает автомат аккаунтов по журналу, а не человек на глаз.
+ *
+ * ⚠️ Порядок списка внутри блока строится по этому же счётчику (см.
+ * `areas-sort.ts`), поэтому он виден не только в отчёте, но и в проверке.
+ */
+function ActivityLine({ area }: { area: Area }) {
+  const activity = area.activity
+  const total = activityOf(area)
+  const granted = activity?.granted ?? 0
+  const updated = activity?.updated ?? 0
+  const title = activity?.last
+    ? `Активность: ${total} (выдач: ${granted}, обновлений: ${updated}); последнее событие ${activity.last}`
+    : `Активность: ${total} (выдач: ${granted}, обновлений: ${updated})`
+  return (
+    <div className="muted small activity" title={title}>
+      активность: {total} · выдач {granted} · обновлений {updated}
+    </div>
+  )
+}
+
+/**
  * Ячейка «Сессии» (на экране так с 27.11, промт КАРМАНА #182; раньше колонка
  * называлась «Водитель»): **две небольшие кнопки** — «Миниген» и «Оператор»,
  * и короткая строка «сейчас: …», которая колонку не раздувает (полный текст —
  * во всплывающей подсказке).
  *
  * ⚠️ Положений **два**: «Миниген» и «Оператор» (в этом порядке). «Внешнее
- * управление» и «Оператор» — одно и то же положение: управление внешнее, а
- * оператор или другой агент — без разницы.
+ * управление» и «Оператор» — одно положение (внешнее управление).
  */
 function DriverCell({
   area,

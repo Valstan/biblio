@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { Area } from '../src/shared/types'
 import {
+  ACTIVITY_LABEL,
   AREA_COLUMNS,
   DEFAULT_AREA_SORT,
+  activityOf,
   nextSort,
   sortAreas,
   sortColumnsHint,
@@ -10,14 +12,14 @@ import {
 } from '../src/renderer/src/tabs/areas-sort'
 
 /**
- * Сортировка списка областей по клику на шапку столбца (заказ владельца
- * 24.11): «Область · Работает · Вход · Очки · Сессии · Состояние · Действия».
+ * Порядок списка областей (промт КАРМАНА #208).
  *
- * ⚠️ Промт КАРМАНА #182 (27.11): колонка «Режим» **убрана** (ручного режима
- * больше нет), «Водитель» стал «Сессиями», бывшие «Сессии» — «Состоянием».
- * Сортировки по «Режиму» больше нет; по новым колонкам — есть.
+ * ⚠️ Промт КАРМАНА #208 (зачитка владельца 28.11): колонка **«Работает»
+ * убрана целиком** — признак «работает» виден теперь по цвету всей строки.
+ * Порядок — **два блока** (работающие сверху) и **активность** внутри блока.
  *
- * По умолчанию — по статусу «Работает», работающие сверху.
+ * ⚠️ Промт КАРМАНА #182 (27.11): колонка «Режим» убрана, «Водитель» стал
+ * «Сессиями», бывшие «Сессии» — «Состоянием».
  */
 
 function area(over: Partial<Area> = {}): Area {
@@ -32,24 +34,117 @@ function area(over: Partial<Area> = {}): Area {
     exists: true,
     account: {},
     sessions: [],
+    activity: { granted: 0, updated: 0, total: 0 },
     ...over
   } as Area
 }
 
 const areas: Area[] = [
-  area({ slug: 'brain', title: 'Мозг', running: true, account: { state: 'есть вход' } }),
-  area({ slug: 'sarafan', title: 'Сарафан', running: false, account: { state: 'нет входа' } }),
-  area({ slug: 'karman', title: 'Карман', running: true, account: { state: 'есть вход' } })
+  area({
+    slug: 'brain',
+    title: 'Мозг',
+    running: true,
+    account: { state: 'есть вход' },
+    activity: { granted: 3, updated: 3, total: 6 }
+  }),
+  area({
+    slug: 'sarafan',
+    title: 'Сарафан',
+    running: false,
+    account: { state: 'нет входа' },
+    activity: { granted: 1, updated: 1, total: 2 }
+  }),
+  area({
+    slug: 'karman',
+    title: 'Карман',
+    running: true,
+    account: { state: 'есть вход' },
+    activity: { granted: 1, updated: 1, total: 2 }
+  })
 ]
 
 describe('сортировка областей', () => {
-  it('по умолчанию — по статусу «Работает», работающие сверху', () => {
-    expect(DEFAULT_AREA_SORT).toEqual({ key: 'running', dir: 'desc' })
+  it('колонки — ровно те, что на экране: «Работает» среди них нет', () => {
+    // ⚠️ Промт КАРМАНА #208: колонка «Работает» убрана целиком — и заголовок,
+    // и ячейка «да/нет». Значит, её нет и в списке столбцов.
+    expect(AREA_COLUMNS.map((item) => item.label)).toEqual([
+      'Область',
+      'Вход',
+      'Очки',
+      'Сессии',
+      'Состояние'
+    ])
+    expect(AREA_COLUMNS.map((item) => item.label)).not.toContain('Работает')
+    expect(AREA_COLUMNS.some((item) => String(item.key) === 'running')).toBe(false)
+  })
+
+  it('подсказка сортировки перечисляет ровно те столбцы, что на экране', () => {
+    expect(sortColumnsHint()).toBe(
+      AREA_COLUMNS.map((item) => item.label).join(' · ')
+    )
+    expect(sortColumnsHint()).toBe('Область · Вход · Очки · Сессии · Состояние')
+    // убранной колонки в подсказке тоже нет — иначе она перечисляла бы то,
+    // чего на экране нет
+    expect(sortColumnsHint()).not.toContain('Работает')
+  })
+
+  it('по умолчанию — по активности, самые активные выше', () => {
+    expect(DEFAULT_AREA_SORT).toEqual({ key: 'activity', dir: 'desc' })
+    expect(sortLabel(DEFAULT_AREA_SORT)).toBe(`${ACTIVITY_LABEL} ▼`)
     expect(sortAreas(areas, DEFAULT_AREA_SORT).map((item) => item.slug)).toEqual([
       'brain',
       'karman',
       'sarafan'
     ])
+  })
+
+  it('два блока: работающие выше, независимо от активности', () => {
+    // «Карман» не запущен, но активен; «Мозг» запущен и активен. Работающие
+    // всё равно выше.
+    const mixed = [
+      area({ slug: 'не-работает-но-активен', running: false, activity: { granted: 9, updated: 9, total: 18 } }),
+      area({ slug: 'работает-но-тише', running: true, activity: { granted: 1, updated: 1, total: 2 } })
+    ]
+    expect(sortAreas(mixed, DEFAULT_AREA_SORT).map((item) => item.slug)).toEqual([
+      'работает-но-тише',
+      'не-работает-но-активен'
+    ])
+  })
+
+  it('блок «работающие сверху» не теряется от клика по шапке', () => {
+    const mixed = [
+      area({ slug: 'тихий-не-работает', running: false, activity: { granted: 0, updated: 0, total: 0 } }),
+      area({ slug: 'громкий-работает', running: true, activity: { granted: 5, updated: 5, total: 10 } })
+    ]
+    // кликнули «Область» — по названию; но блок остался: работающий выше
+    const byName = nextSort(DEFAULT_AREA_SORT, 'area')
+    expect(sortAreas(mixed, byName).map((item) => item.slug)).toEqual([
+      'громкий-работает',
+      'тихий-не-работает'
+    ])
+    // и по очкам — тоже
+    const byPoints = nextSort(DEFAULT_AREA_SORT, 'points')
+    expect(sortAreas(mixed, byPoints).map((item) => item.slug)).toEqual([
+      'громкий-работает',
+      'тихий-не-работает'
+    ])
+  })
+
+  it('внутри блока — по активности: два агента с разной частотой', () => {
+    const mixed = [
+      area({ slug: 'редкий', running: true, activity: { granted: 1, updated: 0, total: 1 } }),
+      area({ slug: 'частый', running: true, activity: { granted: 7, updated: 4, total: 11 } })
+    ]
+    expect(sortAreas(mixed, DEFAULT_AREA_SORT).map((item) => item.slug)).toEqual([
+      'частый',
+      'редкий'
+    ])
+  })
+
+  it('счётчик активности виден в состоянии и считается как сумма', () => {
+    expect(activityOf(area({ activity: { granted: 2, updated: 3, total: 5 } }))).toBe(5)
+    // без счётчика — ноль, а не «нет данных»
+    expect(activityOf(area())).toBe(0)
   })
 
   it('клик по шапке — сортировка по этому столбцу', () => {
@@ -66,10 +161,13 @@ describe('сортировка областей', () => {
     const once = nextSort(DEFAULT_AREA_SORT, 'area')
     const twice = nextSort(once, 'area')
     expect(twice).toEqual({ key: 'area', dir: 'desc' })
+    // ⚠️ Направление меняется **внутри блоков**: работающие остаются выше
+    // (Мозг, Карман), и только внутри своего блока порядок по названию
+    // переворачивается. Блок «работающие сверху» не переворачивается.
     expect(sortAreas(areas, twice).map((item) => item.title)).toEqual([
-      'Сарафан',
       'Мозг',
-      'Карман'
+      'Карман',
+      'Сарафан'
     ])
   })
 
@@ -125,22 +223,10 @@ describe('сортировка областей', () => {
   })
 
   it('подпись шапки показывает столбец и направление', () => {
-    expect(sortLabel(DEFAULT_AREA_SORT)).toBe('Работает ▼')
     expect(sortLabel({ key: 'area', dir: 'asc' })).toBe('Область ▲')
     // переименованные колонки (#182)
     expect(sortLabel({ key: 'driver', dir: 'asc' })).toBe('Сессии ▲')
     expect(sortLabel({ key: 'sessions', dir: 'desc' })).toBe('Состояние ▼')
-  })
-
-  it('столбцы — все, кроме «Действия»', () => {
-    expect(AREA_COLUMNS.map((item) => item.label)).toEqual([
-      'Область',
-      'Работает',
-      'Вход',
-      'Очки',
-      'Сессии',
-      'Состояние'
-    ])
   })
 
   it('сортировки по «Режиму» больше нет', () => {
@@ -155,13 +241,6 @@ describe('сортировка областей', () => {
     const labels = AREA_COLUMNS.map((item) => item.label)
     expect(labels.indexOf('Сессии')).toBe(labels.indexOf('Очки') + 1)
     expect(labels.indexOf('Сессии')).toBeLessThan(labels.indexOf('Состояние'))
-  })
-
-  it('подсказка со списком колонок совпадает с экраном', () => {
-    expect(sortColumnsHint()).toBe(
-      AREA_COLUMNS.map((item) => item.label).join(' · ')
-    )
-    expect(sortColumnsHint()).toBe('Область · Работает · Вход · Очки · Сессии · Состояние')
   })
 
   it('по водителю (колонка «Сессии») — в порядке самого переключателя', () => {

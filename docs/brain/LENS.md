@@ -47,7 +47,8 @@
 | модуль | путь | что даёт |
 |---|---|---|
 | Мост | `tools/minigen-gui/bridge/minigen_bridge.py` | протокол JSON-lines, реестр команд, действия, чат |
-| Состояние | `tools/minigen-gui/bridge/minigen_state.py` | сбор состояния из источников в одно, статистика, настройки |
+| Состояние | `tools/minigen-gui/bridge/minigen_state.py` | сбор состояния из источников в одно, статистика, настройки, **счётчик активности области** (по журналу автомата аккаунтов) |
+| Удаление агента | `tools/minigen-gui/bridge/minigen_delete.py` | удаление агента целиком: проверка синхронизации с GitHub → план → подтверждение → чистка |
 | Хранилище | `tools/minigen-gui/bridge/minigen_db.py` | локальная база «МиниГена»: универсальный контейнер записей, выгрузка/импорт |
 | Агент | `tools/minigen-gui/bridge/minigen_agent.py` | клиент модели (Anthropic-протокол), агент-цикл, подтверждения |
 | Реестр агентов | `tools/minigen-gui/bridge/minigen_agents.py` | агенты проекта: репозиторий, область, заявки |

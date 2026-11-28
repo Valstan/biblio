@@ -2,39 +2,45 @@ import type { Area } from '@shared/types'
 import { DRIVER_VALUES, driverPosition } from './driver-view'
 
 /**
- * Сортировка списка областей по клику на шапку столбца (заказ владельца
- * 24.11).
+ * Порядок списка областей (промт КАРМАНА #208).
  *
- * ⚠️ ПРОМТ КАРМАНА #182 (зачитка владельца 27.11): колонки списка областей
- * перестроены — ручного режима в «МиниГене» больше нет:
+ * ⚠️ ПРОМТ КАРМАНА #208 (зачитка владельца 28.11): колонка **«Работает»
+ * убрана целиком** — и заголовок, и ячейка «да/нет». Признак «работает» виден
+ * теперь **по цвету всей строки**, а порядок задан **двумя блоками**:
  *
- * - колонка **«Режим» убрана целиком**: автомат аккаунтов всегда включён,
- *   переключателя («Автомат / Вручную») не осталось, сортировать по ней
- *   нечем;
- * - **«Водитель» → «Сессии»**: выбор водителя (кто водит сессиями) остался
- *   тем же — поменялся только заголовок на экране;
- * - **«Сессии» → «Состояние»**: там чипы состояний сессий (вердикт и
- *   заполнение) — имя по делу.
+ * 1. **работающие агенты — сверху**, незапущенные — ниже. Это правило
+ *    **встроено** в сортировку и не зависит от того, на какую шапку кликнул
+ *    владелец: ни один незапущенный агент не окажется над работающим, сколько
+ *    бы активен он ни был;
+ * 2. **внутри блока — по активности**: агент, который чаще получает аккаунты
+ *    и обновления аккаунтов из Кармана, выше. Активность приходит из моста
+ *    (`area.activity`) — её считает автомат аккаунтов по журналу, а не
+ *    человек на глаз.
  *
- * ⚠️ Внутренние ключи (`driver`, `sessions`) остались прежними: переименуются
- * **заголовки на экране**, а не словари (промт #182, п. 7). В мосте, в отчёте
- * о лечении и в журнале водитель остаётся водителем.
+ * Клик по шапке по-прежнему сортирует **внутри** блоков (см. `sortAreas`).
+ *
+ * ⚠️ ПРОМТ КАРМАНА #182 (зачитка владельца 27.11): колонка «Режим» убрана
+ * целиком, «Водитель» стал «Сессиями», бывшие «Сессии» — «Состоянием».
+ * Внутренние ключи (`driver`, `sessions`) остались прежними: переименуются
+ * **заголовки на экране**, а не словари.
  *
  * Правила:
  *
- * - **по умолчанию — по статусу «Работает»**, работающие сверху: владелец
- *   открывает список, чтобы увидеть, что живо, а что нет;
+ * - **по умолчанию — по активности** (самые активные выше в своём блоке);
  * - клик по шапке — сортировка по этому столбцу, повторный клик — обратное
  *   направление;
  * - столбец «Действия» не сортируется (там кнопки);
  * - области без очков («—») уходят **в конец** в обоих направлениях: пустое
- *   значение не должно оказываться наверху и мешать видеть настоящие числа.
+ *   значение не должно оказываться наверху и мешать видеть настоящие числа;
+ * - равные значения по выбранному столбцу разводятся **по активности**
+ *   (самые активные выше) — порядок внутри блока всегда отражает реальную
+ *   активность.
  *
  * Вынесено в отдельный модуль, чтобы правила проверялись тестом, а не
  * глазами (как карта генов и шапка окна).
  */
 
-export type AreaSortKey = 'area' | 'running' | 'account' | 'points' | 'driver' | 'sessions'
+export type AreaSortKey = 'area' | 'activity' | 'account' | 'points' | 'driver' | 'sessions'
 export type AreaSortDir = 'asc' | 'desc'
 
 export interface AreaSort {
@@ -49,9 +55,15 @@ export interface AreaColumn {
   first: AreaSortDir
 }
 
+/**
+ * Столбцы таблицы — **ровно те, что на экране**.
+ *
+ * ⚠️ Колонки «Режим» (промт #182) и «Работает» (промт #208) убраны целиком.
+ * Подсказка сортировки собирается из этого же списка — значит, она всегда
+ * совпадает с экраном.
+ */
 export const AREA_COLUMNS: AreaColumn[] = [
   { key: 'area', label: 'Область', first: 'asc' },
-  { key: 'running', label: 'Работает', first: 'desc' },
   { key: 'account', label: 'Вход', first: 'asc' },
   { key: 'points', label: 'Очки', first: 'desc' },
   // «Водитель» на экране стал «Сессиями» (промт #182) — по словарю это всё
@@ -61,8 +73,17 @@ export const AREA_COLUMNS: AreaColumn[] = [
   { key: 'sessions', label: 'Состояние', first: 'desc' }
 ]
 
-/** По умолчанию — «Работает», работающие сверху. */
-export const DEFAULT_AREA_SORT: AreaSort = { key: 'running', dir: 'desc' }
+/** Подпись активности — её нет на экране как столбца, но она видна в строке. */
+export const ACTIVITY_LABEL = 'Активность'
+
+/**
+ * По умолчанию — **по активности** (промт КАРМАНА #208): работающие сверху,
+ * а внутри блока — самые активные.
+ *
+ * ⚠️ Ключа `running` больше нет: колонки «Работает» нет, и сортировать по
+ * ней нечем. Два блока (работающие сверху) задаёт сам `sortAreas`.
+ */
+export const DEFAULT_AREA_SORT: AreaSort = { key: 'activity', dir: 'desc' }
 
 /** Что делает клик по шапке: тот же столбец — обратное направление. */
 export function nextSort(current: AreaSort, key: AreaSortKey): AreaSort {
@@ -73,10 +94,10 @@ export function nextSort(current: AreaSort, key: AreaSortKey): AreaSort {
   return { key, dir: column ? column.first : 'asc' }
 }
 
-/** Подпись шапки: «Работает ▼» (пусто — столбец не активен). */
+/** Подпись шапки: «Вход ▼» (пусто — столбец не активен). */
 export function sortLabel(sort: AreaSort): string {
   const column = AREA_COLUMNS.find((item) => item.key === sort.key)
-  const label = column ? column.label : sort.key
+  const label = column ? column.label : sort.key === 'activity' ? ACTIVITY_LABEL : sort.key
   return `${label} ${sort.dir === 'asc' ? '▲' : '▼'}`
 }
 
@@ -101,6 +122,16 @@ function pointsOf(area: Area): number | null {
 }
 
 /**
+ * Активность области — сколько раз она получала аккаунты и обновления
+ * аккаунтов из Кармана. Значение приходит из моста (`area.activity`); если
+ * мост его не прислал — считаем нулём (а не «нет данных»).
+ */
+export function activityOf(area: Area): number {
+  const total = area.activity?.total
+  return typeof total === 'number' ? total : 0
+}
+
+/**
  * Ранг водителя для сортировки — в порядке самого переключателя: «Миниген»,
  * «Оператор». Кто водит на самом деле (по правилу ядра) — смотрим и на это:
  * сортировка должна отвечать на вопрос «кто сейчас водит», а не «что записано
@@ -115,6 +146,7 @@ function driverRank(area: Area): number {
   return index < 0 ? DRIVER_VALUES.length : index
 }
 
+/** Сравнение по одному столбцу (без направления: «больше — после»). */
 function compare(a: Area, b: Area, key: AreaSortKey): number {
   switch (key) {
     case 'area':
@@ -122,8 +154,8 @@ function compare(a: Area, b: Area, key: AreaSortKey): number {
         text(a.title).localeCompare(text(b.title), 'ru') ||
         text(a.slug).localeCompare(text(b.slug), 'ru')
       )
-    case 'running':
-      return Number(a.running) - Number(b.running)
+    case 'activity':
+      return activityOf(a) - activityOf(b)
     case 'account':
       return (
         text(a.account?.state).localeCompare(text(b.account?.state), 'ru') ||
@@ -138,20 +170,48 @@ function compare(a: Area, b: Area, key: AreaSortKey): number {
   }
 }
 
-/** Отсортированный список областей (исходный массив не трогаем). */
+/** Сравнение по выбранному столбцу — с учётом направления и «пусто в конец». */
+function compareBy(areas: Area, other: Area, key: AreaSortKey, sign: number): number {
+  if (key === 'points') {
+    const left = pointsOf(areas)
+    const right = pointsOf(other)
+    if (left === null || right === null) {
+      // без очков — всегда в конце
+      if (left === null && right === null) return 0
+      return left === null ? 1 : -1
+    }
+    return sign * (left - right)
+  }
+  return sign * compare(areas, other, key)
+}
+
+/**
+ * Отсортированный список областей (исходный массив не трогаем).
+ *
+ * Порядок (промт КАРМАНА #208):
+ *
+ * 1. **два блока**: работающие сверху, незапущенные ниже — **всегда**, что бы
+ *    владелец ни выбрал в шапке;
+ * 2. внутри блока — выбранный столбец (по умолчанию — активность);
+ * 3. равные значения — по активности (самые активные выше);
+ * 4. дальше — порядок исходного списка (сортировка устойчива).
+ */
 export function sortAreas(areas: Area[], sort: AreaSort): Area[] {
   const sign = sort.dir === 'asc' ? 1 : -1
-  return [...areas].sort((a, b) => {
-    if (sort.key === 'points') {
-      const left = pointsOf(a)
-      const right = pointsOf(b)
-      if (left === null || right === null) {
-        // без очков — всегда в конце
-        if (left === null && right === null) return 0
-        return left === null ? 1 : -1
-      }
-      return sign * (left - right)
-    }
-    return sign * compare(a, b, sort.key)
+  const indexed = areas.map((area, index) => ({ area, index }))
+  indexed.sort((x, y) => {
+    // 1) блоки: работающие ВЫШЕ — всегда
+    const blockX = x.area.running ? 0 : 1
+    const blockY = y.area.running ? 0 : 1
+    if (blockX !== blockY) return blockX - blockY
+    // 2) внутри блока — выбранный столбец
+    const cmp = compareBy(x.area, y.area, sort.key, sign)
+    if (cmp !== 0) return cmp
+    // 3) равные значения — по активности: самые активные выше
+    const act = activityOf(y.area) - activityOf(x.area)
+    if (act !== 0) return act
+    // 4) порядок исходного списка (устойчиво)
+    return x.index - y.index
   })
+  return indexed.map((item) => item.area)
 }
