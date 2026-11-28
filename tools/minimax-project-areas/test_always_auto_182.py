@@ -73,7 +73,9 @@ def main() -> int:
     # где боевой папки нет вовсе).
     os.environ["MINIGEN_DAEMON_DIR"] = str(HERE)
 
-    tab_src = read(TABS / "AreasTab.tsx")
+    # ⚠️ Заказ владельца 28.11: «Области» и «Агенты» — одна вкладка,
+    # файл `AreasTab.tsx` удалён ⇒ смотрим объединённую «Агенты».
+    tab_src = read(TABS / "AgentsTab.tsx")
     sort_src = read(TABS / "areas-sort.ts")
     styles_src = read(GUI / "src" / "renderer" / "src" / "styles.css")
     api_ts = read(GUI / "src" / "renderer" / "src" / "api.ts")
