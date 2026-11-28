@@ -70,6 +70,39 @@ SESSION_STATE = LOCAL / "sessionwatch-state.json"
 REPORTS = LOCAL / "reports.jsonl"
 REPORTS_MAX_BYTES = 512 * 1024      # больше — подрезаем хвост
 REPORTS_KEEP_LINES = 800
+
+# ── свои критические ошибки (промт КАРМАНА #185)
+#
+# Отчёт о сбое **самой программы** и отчёт об ошибке инструмента — разные
+# вещи: «мост вызвал инструмент, тот вернул ошибку» (обычный отчёт) и
+# «упал поток демона, не поднялся мост, сломался разбор ответа» (сбой
+# программы — это уже задача на правку кода). Различать их будем **явным
+# видом** отчёта:
+#
+# | вид | что значит | уровень |
+# |---|---|---|
+# | `crash` | сбой самой программы «МиниГен» | `error` |
+# | `tool` | ошибка вызова инструмента | `error` |
+# | `network` / `heal` | сеть или вендор | `error`/`warn` |
+# | `session` | вывод сессии другого агента | по ситуации |
+# | `log` | просто журнал | `info` |
+#
+# ⚠️ Порог «критической» ошибки (промт #185, п. 6): в задачу попадает ТОЛЬКО
+# вид `crash`. Сбои сети, отказ вендора и чужие машины остаются отчётами.
+KIND_CRASH = "crash"
+#: Вид отчёта, который несёт **вывод сессии другого агента** (сторож сессий).
+KIND_SESSION = "session"
+#: Источник сообщения: сбой самой программы «МиниГен».
+SOURCE_PROGRAM = "minigen"
+#: Источник сообщения: вывод сессии другого агента.
+SOURCE_AGENT = "agent"
+#: Сколько одинаковых сбоев подряд не пишем в «ящик отчётов» (секунды).
+#: ⚠️ Иначе один и тот же сбой (например, упавший мост) забил бы ящик
+#: тысячами одинаковых записей — ровно та же причина, по которой опрос
+#: статуса не отчитывается вовсе.
+CRASH_REPEAT_GAP_MS = 60_000
+#: Последние сбои (чтобы не писать один и тот же текст подряд).
+_CRASH_RECENT: dict[str, int] = {}
 #: Состояние автомата аккаунтов (лечащего). Сторож сессий читает его,
 #: чтобы узнать, что аккаунт уже обновлён (промт КАРМАНА #174: аккаунты и
 #: сессии — разные автоматы; «Продолжай» после смены аккаунта отдаёт
@@ -108,18 +141,36 @@ def log(msg: str) -> None:
     report("info", "log", msg)
 
 
-def report(level: str, kind: str, text: str, area: str = "") -> None:
+def default_source(kind: str) -> str:
+    """Источник сообщения по умолчанию — его определяет вид отчёта.
+
+    ⚠️ Промт КАРМАНА #185, п. 2: «Управляющий» должен знать, откуда пришло
+    сообщение. Отчёт сторожа сессий несёт **вывод сессии другого агента** —
+    это не сбой программы; всё остальное (журнал, инструмент, сеть, лечащий)
+    говорит сама программа.
+    """
+    return SOURCE_AGENT if (kind or "") == KIND_SESSION else SOURCE_PROGRAM
+
+
+def report(level: str, kind: str, text: str, area: str = "",
+           source: str = "") -> None:
     """Отчёт о работе программы — в «ящик отчётов».
 
     Отчёт — это **не** журнал: он короткий, с уровнем (info/warn/error) и
-    видом (log/tool/network/heal/session). Их читает встроенная нейросеть
+    видом (log/tool/network/heal/session/crash). Их читает встроенная нейросеть
     (инструмент `reports.recent` и автоподача в чат).
+
+    `source` — откуда сообщение: сбой самой программы (`minigen`) или вывод
+    сессии другого агента (`agent`). Если не указан — берётся по виду отчёта
+    (см. `default_source`).
 
     Никогда не бросает: отчёт — дополнительный канал, его поломка не должна
     ломать саму работу.
     """
+    kind = (kind or "log")[:24]
     record = {"ts": now_ms(), "level": (level or "info")[:16],
-              "kind": (kind or "log")[:24], "area": (area or "")[:64],
+              "kind": kind, "area": (area or "")[:64],
+              "source": (source or default_source(kind))[:24],
               "text": (text or "")[:900]}
     try:
         REPORTS.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +179,29 @@ def report(level: str, kind: str, text: str, area: str = "") -> None:
     except OSError:
         return
     _trim_reports()
+
+
+def report_crash(text: str, area: str = "", source: str = SOURCE_PROGRAM,
+                 min_gap_ms: int = CRASH_REPEAT_GAP_MS) -> None:
+    """Сбой программы — в «ящик отчётов» явным видом `crash` и уровнем `error`.
+
+    ⚠️ Промт КАРМАНА #185, п. 2: отчёт о сбое программы отличается от отчёта
+    об ошибке инструмента — по виду и по источнику. Именно вид `crash` делает
+    сообщение задачей «починить код программы» (для источника `agent` —
+    «ответить агенту или управлять им»).
+
+    Один и тот же текст подряд не пишется (`min_gap_ms`): иначе один сбой,
+    повторяющийся каждую секунду, забил бы «ящик отчётов» (проверка на
+    повтор — у получателя задачи, см. `minigen_errors.py`).
+    """
+    text = str(text or "")
+    key = "%s|%s|%s" % (source or "", area or "", text)
+    now = now_ms()
+    last = int(_CRASH_RECENT.get(key) or 0)
+    if last and min_gap_ms and (now - last) < int(min_gap_ms):
+        return
+    _CRASH_RECENT[key] = now
+    report("error", KIND_CRASH, text, area=area, source=source)
 
 
 def reports(limit: int = 50, level: str = "", since_ms: int = 0) -> list:
@@ -139,6 +213,7 @@ def reports(limit: int = 50, level: str = "", since_ms: int = 0) -> list:
     except OSError:
         return []
     out = []
+    broken = 0
     for line in reversed(lines):
         line = line.strip()
         if not line:
@@ -146,6 +221,13 @@ def reports(limit: int = 50, level: str = "", since_ms: int = 0) -> list:
         try:
             rec = json.loads(line)
         except ValueError:
+            # ⚠️ Нечитаемая запись — это сбой самой программы (промт #185,
+            # п. 1: «нечитаемый отчёт» — признак критической ошибки). Такое
+            # само по себе чинится правкой кода, а не повтором сети.
+            broken += 1
+            continue
+        if not isinstance(rec, dict):
+            broken += 1
             continue
         if level and str(rec.get("level") or "") != level:
             continue
@@ -154,6 +236,9 @@ def reports(limit: int = 50, level: str = "", since_ms: int = 0) -> list:
         out.append(rec)
         if len(out) >= max(int(limit or 0), 1):
             break
+    if broken:
+        report_crash("в «ящике отчётов» нечитаемых записей: %d (файл %s)"
+                     % (broken, REPORTS.name))
     return out
 
 
