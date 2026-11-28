@@ -480,6 +480,10 @@ class Bridge:
             "genes.suggest": self.cmd_genes_suggest,
             "genes.export": self.cmd_genes_export,
             "genes.import": self.cmd_genes_import,
+            # откат гена, оценки и пометка «не ставить» (промт КАРМАНА #187)
+            "genes.rollback": self.cmd_genes_rollback,
+            "genes.rate": self.cmd_genes_rate,
+            "genes.dismiss": self.cmd_genes_dismiss,
             # режимы копии и первый запуск (25.11, промт #131)
             "copy.first_run": self.cmd_copy_first_run,
             "copy.answer": self.cmd_copy_answer,
@@ -1087,10 +1091,16 @@ class Bridge:
             notes=str(args.get("notes") or "")))
 
     def cmd_genes_adopt(self, args: dict[str, Any]) -> dict[str, Any]:
-        """Внедрить чужой ген: ветка → проверки → PR (решение за владельцем)."""
+        """Внедрить чужой ген: ветка → проверки → PR (решение за владельцем).
+
+        ⚠️ Ген, трогающий внешний вид, без `allow_appearance` не внедряется
+        (промт КАРМАНА #187): вид программы по умолчанию не меняется.
+        """
+        allow = args.get("allow_appearance")
         return state.jsonable(genes_mod.adopt(
             gene=str(args.get("gene") or ""),
-            title=str(args.get("title") or "")))
+            title=str(args.get("title") or ""),
+            allow_appearance=bool(allow)))
 
     def cmd_genes_suggest(self, args: dict[str, Any]) -> dict[str, Any]:
         """Чужие наработки, которые стоит посмотреть (с причиной совпадения)."""
@@ -1103,6 +1113,31 @@ class Bridge:
     def cmd_genes_import(self, args: dict[str, Any]) -> dict[str, Any]:
         """Внести наработки из выгруженной папки (обмен вручную, без сети)."""
         return state.jsonable(genes_mod.import_pool(str(args.get("path") or "")))
+
+    def cmd_genes_rollback(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Откатить внедрённый ген: вернуть состояние «как было» (#187).
+
+        ⚠️ Откат меняет код программы ⇒ только после подтверждения владельца
+        (окно спрашивает само).
+        """
+        return state.jsonable(genes_mod.rollback(str(args.get("gene") or "")))
+
+    def cmd_genes_rate(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Оценка гену от 1 до 10 (звёздочки) — от любой копии (#187)."""
+        score = args.get("score")
+        try:
+            value = int(score)
+        except (TypeError, ValueError):
+            value = 0
+        return state.jsonable(genes_mod.rate(str(args.get("gene") or ""), value))
+
+    def cmd_genes_dismiss(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Пометить ген «не ставить» (или снять пометку) — #187."""
+        on = args.get("on")
+        return state.jsonable(genes_mod.dismiss(
+            str(args.get("gene") or ""),
+            on=True if on is None else bool(on),
+            reason=str(args.get("reason") or "")))
 
     def cmd_copy_first_run(self, args: dict[str, Any]) -> dict[str, Any]:
         """Первый запуск: спрашивали ли про регистрацию папки копии."""

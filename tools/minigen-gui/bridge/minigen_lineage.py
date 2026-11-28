@@ -9,9 +9,11 @@
 
 - **экземпляр** (`instance.json`) — кто эта копия: непрозрачный
   `instance_id` (случайный, не выводится из имени машины), семейство,
-  поколение, от какой версии форк, кто родитель;
+  поколение, от какой версии форк, кто родитель; там же — какие гены стоят
+  (`genes`: свой коммит, куда ген встал), какие откатывались
+  (`rolled_back`) и какие помечены «не ставить» (`not_wanted`);
 - **летопись** (`lineage.jsonl`) —append-only: « форк », « принят ген от
-  такого-то », « опубликован ген »;
+  такого-то », « откатан ген », « опубликован ген »;
 - **родословная** (`genealogy()`) — то и другое вместе.
 
 Правила:
@@ -138,12 +140,26 @@ def record(event: str, **fields: Any) -> None:
 
 
 def adopt(gene_id: str, from_instance: str = "", from_commit: str = "",
-          note: str = "") -> dict[str, Any]:
-    """Принять «ген» (наработку другой копии): родословная обновляется."""
+          note: str = "", local_commit: str = "", branch: str = "") -> dict[str, Any]:
+    """Принять «ген» (наработку другой копии): родословная обновляется.
+
+    ⚠️ **Два коммита, и это не одно и то же** (промт КАРМАНА #187):
+
+    - `from_commit` — **база гена**: версия, на которой ген был сделан автором.
+      По ней ген узнают («это наработка поверх такой-то версии»);
+    - `local_commit` — **свой коммит**: тот, в который ген встал **в этой
+      копии**. Без него ген нечем откатить: revert отменяет конкретный
+      коммит, а не «что-то похожее».
+
+    Раньше в поле `commit` клалась только база гена — и отката не было
+    вовсе (в `minigen_code.py` есть только `create_worktree`, `apply_patch`,
+    `commit`, `open_pr`, `discard_worktree`).
+    """
     data = instance()
     genes = list(data.get("genes") or [])
     genes.append({"gene": gene_id, "from": from_instance,
-                  "commit": from_commit, "ts": _now_ms()})
+                  "commit": from_commit, "local_commit": local_commit,
+                  "branch": branch, "ts": _now_ms()})
     data["genes"] = genes[-50:]
     data["generation"] = int(data.get("generation") or 1) + 1
     if from_instance:
@@ -151,13 +167,105 @@ def adopt(gene_id: str, from_instance: str = "", from_commit: str = "",
                           "commit": from_commit}
     _write_json(INSTANCE_FILE, data)
     record("adopt", gene=gene_id, source=from_instance, commit=from_commit,
-           note=note)
+           local_commit=local_commit, branch=branch, note=note)
     return data
+
+
+def gene_record(gene_id: str) -> dict[str, Any]:
+    """Запись о внедрении гена в этой копии (пусто — ген не внедряли)."""
+    data = instance()
+    for item in reversed(list(data.get("genes") or [])):
+        if str(item.get("gene") or "") == str(gene_id or ""):
+            return dict(item)
+    return {}
+
+
+def rolled_back(gene_id: str, commit: str = "", reason: str = "",
+                branch: str = "") -> dict[str, Any]:
+    """Отметить откат гена: стоял — убрали, и больше не ставим.
+
+    Записывается и в `instance.json` (своя копия), и в летопись
+    (`lineage.jsonl`) — видно, **какой** ген откатан и **когда**.
+    """
+    data = instance()
+    genes = list(data.get("genes") or [])
+    stamp = _now_ms()
+    for item in genes:
+        if str(item.get("gene") or "") == str(gene_id or ""):
+            item["rolled_back"] = True
+            item["rolled_back_at"] = stamp
+            if commit:
+                item["revert_commit"] = commit
+    data["genes"] = genes[-50:]
+    entry = {"gene": gene_id, "ts": stamp, "commit": commit,
+             "reason": reason, "branch": branch}
+    data["rolled_back"] = _with_entry(data.get("rolled_back"), entry)
+    _write_json(INSTANCE_FILE, data)
+    record("rollback", gene=gene_id, commit=commit, branch=branch,
+           reason=reason)
+    return entry
+
+
+def dismiss(gene_id: str, reason: str = "") -> dict[str, Any]:
+    """Пометить ген «не ставить» (личное решение владельца копии).
+
+    ⚠️ Это **локальное** решение: «не хочу ставить» — дело одного человека.
+    А вот «мы уже откатывали» полезно видеть соседним копиям — поэтому
+    откат пишется ещё и в пул (событие `rolled_back`).
+    """
+    data = instance()
+    entry = {"gene": gene_id, "ts": _now_ms(), "reason": reason}
+    data["not_wanted"] = _with_entry(data.get("not_wanted"), entry)
+    _write_json(INSTANCE_FILE, data)
+    record("dismiss", gene=gene_id, reason=reason)
+    return entry
+
+
+def undismiss(gene_id: str) -> dict[str, Any]:
+    """Снять пометку «не ставить» (владелец передумал)."""
+    data = instance()
+    items = [item for item in list(data.get("not_wanted") or [])
+             if str(item.get("gene") or "") != str(gene_id or "")]
+    data["not_wanted"] = items
+    _write_json(INSTANCE_FILE, data)
+    record("undismiss", gene=gene_id)
+    return {"gene": gene_id}
+
+
+def not_wanted_genes() -> set[str]:
+    """Гены, которые эта копия помечала «не ставить»."""
+    data = instance()
+    return {str(item.get("gene") or "")
+            for item in (data.get("not_wanted") or []) if item.get("gene")}
+
+
+def rolled_back_genes() -> list[dict[str, Any]]:
+    """Гены, которые эта копия внедряла и откатывала."""
+    data = instance()
+    out: list[dict[str, Any]] = []
+    for item in (data.get("rolled_back") or []):
+        gene = str(item.get("gene") or "")
+        if gene:
+            out.append(dict(item))
+    return out
 
 
 def published(gene_id: str, commit: str = "", note: str = "") -> None:
     """Отметить публикацию своей наработки в общий пул."""
     record("publish", gene=gene_id, commit=commit, note=note)
+
+
+def _with_entry(items: Any, entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Дописать запись в список (без повторов по гену), limit — 50."""
+    out: list[dict[str, Any]] = []
+    for item in list(items or []):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("gene") or "") == str(entry.get("gene") or ""):
+            continue
+        out.append(item)
+    out.append(entry)
+    return out[-50:]
 
 
 def ledger(limit: int = 100) -> list[dict[str, Any]]:

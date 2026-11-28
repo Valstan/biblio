@@ -7,7 +7,10 @@ import {
   exchangeView,
   localOfferView,
   modeConfirmText,
+  notWantedRows,
+  rollbackConfirmText,
   SHARED_MODE_OPTION,
+  STAR_MAX,
   suggestionRows,
   type SuggestionRow
 } from './copy-view'
@@ -223,12 +226,16 @@ export default function GenesTab({
   /**
    * Внедрение чужой наработки: сначала подтверждение (решение за владельцем),
    * потом мост готовит ветку и PR.
+   *
+   * ⚠️ Ген, трогающий **внешний вид**, внедряется только после явного
+   * решения владельца: без подтверждения вида мост откажется (промт
+   * КАРМАНА #187) — вид программы по умолчанию не меняется.
    */
   const adopt = async (row: SuggestionRow) => {
     if (!window.confirm(adoptConfirmText(row))) return
     setBusy(true)
     try {
-      const res = await api.genesAdopt(row.gene)
+      const res = await api.genesAdopt(row.gene, '', row.touchesAppearance)
       if (res.ok === false) {
         setNote(res.error || res.why || 'мост не внедрил наработку')
         return
@@ -247,11 +254,75 @@ export default function GenesTab({
     }
   }
 
+  /**
+   * Оценка гена звёздочками (1–10). Голос уходит в пул — его видят все копии.
+   */
+  const rate = async (gene: string, score: number) => {
+    setBusy(true)
+    try {
+      const res = await api.genesRate(gene, score)
+      if (res.ok === false) {
+        setNote(res.error || res.why || 'мост не принял оценку')
+        return
+      }
+      setNote(res.why || `оценка ${score} из 10 поставлена`)
+      await loadCopy()
+    } catch (err) {
+      setNote(`оценка не прошла: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /**
+   * Откат внедрённого гена: отменить его коммит и вернуть состояние «как
+   * было». Опасное действие ⇒ подтверждение владельца.
+   */
+  const rollback = async (gene: string, title?: string) => {
+    if (!window.confirm(rollbackConfirmText(gene, title))) return
+    setBusy(true)
+    try {
+      const res = await api.genesRollback(gene)
+      if (res.ok === false) {
+        setNote(res.error || res.why || 'мост не откатил ген')
+        return
+      }
+      setNote(res.why || `ген ${gene} откатан`)
+      await loadCopy()
+    } catch (err) {
+      setNote(`откат не вышел: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  /** Пометить ген «не ставить» (или снять пометку). */
+  const dismiss = async (gene: string, on: boolean) => {
+    setBusy(true)
+    try {
+      const res = await api.genesDismiss(gene, on)
+      if (res.ok === false) {
+        setNote(res.error || res.why || 'мост не пометил ген')
+        return
+      }
+      setNote(res.why || (on ? 'ген помечен «не ставить»' : 'пометка снята'))
+      await loadCopy()
+    } catch (err) {
+      setNote(`пометка не поставилась: ${String((err as Error).message || err)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const exchange = exchangeView(cloneStatus)
   const localOffer = localOfferView(cloneStatus)
   const rows = suggestionRows(suggestions)
   const fits = rows.filter((row) => row.fits)
   const others = rows.filter((row) => !row.fits)
+  // откатанные и помеченные «не ставить» — отдельным списком (промт #187)
+  const refused = notWantedRows(suggestions)
+  // гены, которые эта копия внедрила: их можно откатить
+  const installed = suggestions?.installed ?? []
   // Раскладка карты — считаем один раз на отрисовку (как было раньше).
   const layout = map ? layoutMap(map) : null
 
@@ -397,6 +468,8 @@ export default function GenesTab({
                       <th>Что сделано</th>
                       <th>Автор</th>
                       <th>Почему подходит</th>
+                      <th>Рейтинг</th>
+                      <th>Оценить</th>
                       <th>Дата</th>
                       <th>Действия</th>
                     </tr>
@@ -405,9 +478,55 @@ export default function GenesTab({
                     {fits.map((row) => (
                       <tr key={row.gene}>
                         <td className="muted">{row.gene}</td>
-                        <td>{row.title}</td>
+                        <td>
+                          {row.title}
+                          {/* ⚠️ Промт КАРМАНА #187: «меняет вид» видно
+                              **до** кнопки «Внедрить», а не после внедрения. */}
+                          {row.touchesAppearance && (
+                            <div>
+                              <span className="chip warn">меняет внешний вид</span>
+                              <div className="muted small">
+                                {row.appearanceFiles.join(', ') || DASH}
+                              </div>
+                            </div>
+                          )}
+                          {row.rolledBackElsewhere && (
+                            <div>
+                              <span className="chip bad">откатывали в другой копии</span>
+                            </div>
+                          )}
+                        </td>
                         <td className="muted">{row.author}</td>
                         <td className="muted small">{row.why}</td>
+                        <td className="muted small">
+                          {row.rating.has ? (
+                            <>
+                              <div>
+                                {row.rating.score} {row.rating.stars}
+                              </div>
+                              <div>голосов: {row.rating.votes}</div>
+                            </>
+                          ) : (
+                            'оценок нет'
+                          )}
+                        </td>
+                        <td>
+                          <div className="stars" title="Оценка от 1 до 10 звёздочками">
+                            {Array.from({ length: STAR_MAX }, (_, index) => index + 1).map(
+                              (value) => (
+                                <button
+                                  key={value}
+                                  className="star"
+                                  title={`${value} из 10`}
+                                  disabled={busy}
+                                  onClick={() => void rate(row.gene, value)}
+                                >
+                                  {row.rating.mine >= value ? '★' : '☆'}
+                                </button>
+                              )
+                            )}
+                          </div>
+                        </td>
                         <td className="muted small">{row.created}</td>
                         <td className="actions">
                           <button
@@ -416,6 +535,14 @@ export default function GenesTab({
                             disabled={busy}
                           >
                             Внедрить
+                          </button>
+                          <button
+                            className="ghost"
+                            onClick={() => void dismiss(row.gene, true)}
+                            disabled={busy}
+                            title="Не ставить этот ген"
+                          >
+                            Не ставить
                           </button>
                         </td>
                       </tr>
@@ -434,6 +561,7 @@ export default function GenesTab({
                           <th>Ген</th>
                           <th>Что сделано</th>
                           <th>Автор</th>
+                          <th>Рейтинг</th>
                           <th>Дата</th>
                         </tr>
                       </thead>
@@ -443,6 +571,11 @@ export default function GenesTab({
                             <td className="muted">{row.gene}</td>
                             <td>{row.title}</td>
                             <td className="muted">{row.author}</td>
+                            <td className="muted small">
+                              {row.rating.has
+                                ? `${row.rating.score} ${row.rating.stars} · голосов: ${row.rating.votes}`
+                                : 'оценок нет'}
+                            </td>
                             <td className="muted small">{row.created}</td>
                           </tr>
                         ))}
@@ -453,6 +586,111 @@ export default function GenesTab({
               </>
             )}
           </div>
+
+          {/* ⚠️ Откатанные и помеченные «не ставить» — отдельным списком
+              (промт КАРМАНА #187): в чужих наработках их нет, иначе ген
+              снова предложился бы. */}
+          {refused.length > 0 && (
+            <div className="card">
+              <h3>Не ставим</h3>
+              <p className="muted small">
+                Эти гены эта копия уже внедряла и откатывала (или пометила «не
+                ставить»). В списке чужих наработок их нет — и не будет.
+              </p>
+              <table className="grid compact">
+                <thead>
+                  <tr>
+                    <th>Ген</th>
+                    <th>Что сделано</th>
+                    <th>Пометка</th>
+                    <th>Рейтинг</th>
+                    <th>Дата</th>
+                    <th>Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {refused.map((row) => (
+                    <tr key={row.gene}>
+                      <td className="muted">{row.gene}</td>
+                      <td>{row.title}</td>
+                      <td>
+                        <span className={row.rolledBack ? 'chip warn' : 'chip muted'}>
+                          {row.why}
+                        </span>
+                      </td>
+                      <td className="muted small">
+                        {row.rating.has
+                          ? `${row.rating.score} ${row.rating.stars} · голосов: ${row.rating.votes}`
+                          : 'оценок нет'}
+                      </td>
+                      <td className="muted small">{row.created}</td>
+                      <td className="actions">
+                        <button
+                          className="ghost"
+                          onClick={() => void dismiss(row.gene, false)}
+                          disabled={busy}
+                        >
+                          Разрешить снова
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Внедрённые гены — их можно откатить (промт КАРМАНА #187). */}
+          {installed.length > 0 && (
+            <div className="card">
+              <h3>Внедрённые гены</h3>
+              <p className="muted small">
+                Что эта копия взяла у соседей: коммит, в который ген встал, и
+                откат — вернуть состояние к тому, что было до внедрения.
+              </p>
+              <table className="grid compact">
+                <thead>
+                  <tr>
+                    <th>Ген</th>
+                    <th>Что сделано</th>
+                    <th>Коммит</th>
+                    <th>Ветка</th>
+                    <th>Когда</th>
+                    <th>Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {installed.map((item) => (
+                    <tr key={item.gene}>
+                      <td className="muted">{item.gene}</td>
+                      <td>
+                        {item.title || DASH}
+                        {item.rolled_back && (
+                          <div>
+                            <span className="chip warn">откатан</span>
+                          </div>
+                        )}
+                      </td>
+                      <td className="muted small">{item.commit || DASH}</td>
+                      <td className="muted small">{item.branch || DASH}</td>
+                      <td className="muted small">
+                        {formatDateTime(item.ts) || DASH}
+                      </td>
+                      <td className="actions">
+                        <button
+                          className="ghost"
+                          onClick={() => void rollback(item.gene, item.title)}
+                          disabled={busy || item.rolled_back}
+                        >
+                          Откатить
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
         </>
       )}
 

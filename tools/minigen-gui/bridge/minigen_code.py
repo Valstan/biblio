@@ -568,8 +568,12 @@ def commit(message: str) -> dict[str, Any]:
             err = ("не задана identity git в этом репозитории "
                    "(git config user.name / user.email)")
         return {"error": "коммит не прошёл: %s" % err}
+    # ⚠️ Свой коммит нужен не только для истории: по нему ген потом
+    # **откатывается** (промт КАРМАНА #187) — revert отменяет конкретный
+    # коммит, а не «что-то похожее».
+    sha = git(["rev-parse", "HEAD"], worktree).get("out") or ""
     return {"ok": True, "branch": branch, "files": files, "note": note,
-            "out": res["out"]}
+            "commit": sha, "out": res["out"]}
 
 
 
@@ -786,3 +790,138 @@ def discard_worktree() -> dict[str, Any]:
         git(["branch", "-D", branch], REPO, timeout=60)
     write_state({})
     return {"ok": True, "removed": str(worktree)}
+
+
+# ──────────────────────────────────────────────────────────────── откат
+
+def branch_locations(repo: Path | None = None) -> dict[str, str]:
+    """Где открыта каждая ветка: `ветка → путь дерева`."""
+    repo = repo or REPO
+    out: dict[str, str] = {}
+    res = git(["worktree", "list", "--porcelain"], repo)
+    if not res["ok"]:
+        return out
+    path = ""
+    for line in (res["out"] or "").splitlines():
+        line = line.strip()
+        if line.startswith("worktree "):
+            path = line[len("worktree "):].strip()
+        elif line.startswith("branch ") and path:
+            name = line[len("branch "):].strip()
+            short = name[len("refs/heads/"):] if name.startswith("refs/heads/") else name
+            out[short] = path
+    return out
+
+
+def branch_exists(repo: Path | None = None, branch: str = "") -> bool:
+    """Есть ли такая ветка в репозитории?"""
+    if not branch:
+        return False
+    repo = repo or REPO
+    res = git(["branch", "--list", branch], repo)
+    return bool(res["ok"] and (res["out"] or "").strip())
+
+
+def commit_exists(repo: Path | None = None, commit: str = "") -> bool:
+    """Есть ли такой коммит в репозитории?"""
+    if not commit:
+        return False
+    repo = repo or REPO
+    res = git(["cat-file", "-e", "%s^{commit}" % commit], repo)
+    return bool(res["ok"])
+
+
+def branch_contains(repo: Path | None = None, branch: str = "",
+                    commit: str = "") -> bool:
+    """Ветка содержит этот коммит (коммит — её предок)?"""
+    repo = repo or REPO
+    if not branch or not commit:
+        return False
+    res = git(["merge-base", "--is-ancestor", commit, branch], repo)
+    return bool(res["ok"])
+
+
+def find_commit_by_gene(gene: str, repo: Path | None = None) -> str:
+    """Найти коммит гена по слову в сообщении (для генов, взятых раньше).
+
+    ⚠️ Комит гена теперь пишется с идентификатором гена («… (ген gene-…-001)»),
+    поэтому ген, взятый до этого, находится поиском по сообщению.
+    """
+    repo = repo or REPO
+    if not gene:
+        return ""
+    res = git(["log", "--all", "--grep", gene, "--pretty=format:%H"], repo,
+              timeout=120)
+    if not res["ok"]:
+        return ""
+    lines = [line.strip() for line in (res["out"] or "").splitlines() if line.strip()]
+    return lines[0] if lines else ""
+
+
+def rollback_commit(commit: str, branch: str = "") -> dict[str, Any]:
+    """Отменить коммит гена: вернуть состояние «как было».
+
+    ⚠️ Откат — это обычный `git revert`: история не выбрасывается, а
+    добавляется коммит, который отменяет коммит гена. После отката дерево
+    совпадает с состоянием до внедрения гена (если ген был единственной
+    правкой) — это и есть проверяемый результат: «тот же список изменённых
+    файлов и тот же diff».
+
+    Куда откатываем: в ту ветку, где ген стоит (её помнит родословная), а
+    если её уже нет — в текущую ветку, если коммит гена в ней есть.
+    """
+    commit = str(commit or "").strip()
+    if not commit:
+        return {"error": "не указан коммит гена"}
+    repo = REPO
+    if not commit_exists(repo, commit):
+        return {"error": "коммита гена нет в этой копии: %s" % commit}
+
+    target = ""
+    if branch and branch_exists(repo, branch) and branch_contains(repo, branch, commit):
+        target = branch
+    if not target:
+        current = current_branch(repo)
+        if current and current != "HEAD" and branch_contains(repo, current, commit):
+            target = current
+    if not target:
+        return {"error": "ветку с геном не нашли (ген уже слит и ветка удалена?) "
+                         "— откатывать нечем"}
+
+    # где эта ветка открыта: там и откатываем (иначе — во временном worktree)
+    location = branch_locations(repo).get(target)
+    temporary = False
+    worktree: Path | None = None
+    if location:
+        worktree = Path(location)
+    else:
+        WORKTREES.mkdir(parents=True, exist_ok=True)
+        worktree = WORKTREES / ("rollback-%s" % slugify(target))
+        if worktree.exists():
+            git(["worktree", "remove", "--force", str(worktree)], repo, timeout=180)
+        res = git(["worktree", "add", str(worktree), target], repo, timeout=180)
+        if not res["ok"]:
+            return {"error": "не открыть ветку гена для отката: %s"
+                             % (res["err"] or res["out"])}
+        temporary = True
+
+    try:
+        # ⚠️ Незакоммиченные правки владельца не трогаем: revert их не
+        # тронет, но дерево останется «грязным» — говорим честно.
+        dirty = changed_files(worktree)
+        rev = git(["revert", "--no-edit", commit], worktree, timeout=180)
+        if not rev["ok"]:
+            git(["revert", "--abort"], worktree)
+            return {"error": "откат не прошёл: коммит гена не отменяется "
+                             "чисто (правки пересеклись с другими) — %s"
+                             % ((rev["err"] or rev["out"]) or "")[:300],
+                    "conflict": True}
+        head = git(["rev-parse", "HEAD"], worktree).get("out") or ""
+        files = changed_files(worktree)
+        diff = git(["diff", "HEAD"], worktree, timeout=120).get("out") or ""
+        return {"ok": True, "commit": head, "reverted": commit, "branch": target,
+                "files": files, "dirty_before": dirty, "diff": diff[:40_000],
+                "worktree": str(worktree)}
+    finally:
+        if temporary and worktree is not None:
+            git(["worktree", "remove", "--force", str(worktree)], repo, timeout=180)

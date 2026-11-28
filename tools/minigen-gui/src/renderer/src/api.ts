@@ -178,12 +178,25 @@ export const api = {
     ),
   genesPublish: (payload: { title: string; summary?: string; notes?: string }) =>
     call<GeneActionResult>('genes.publish', payload),
-  genesAdopt: (gene: string, title?: string) =>
-    call<GeneActionResult>('genes.adopt', title ? { gene, title } : { gene }),
+  genesAdopt: (gene: string, title?: string, allowAppearance?: boolean) =>
+    call<GeneActionResult>('genes.adopt', {
+      gene,
+      ...(title ? { title } : {}),
+      ...(allowAppearance ? { allow_appearance: true } : {})
+    }),
   genesSuggest: () => call<GeneSuggestions>('genes.suggest'),
   genesExport: (path?: string) =>
     call<GeneActionResult>('genes.export', path ? { path } : {}),
   genesImport: (path: string) => call<GeneActionResult>('genes.import', { path }),
+  // ── откат, оценки и пометка «не ставить» (промт КАРМАНА #187) ──────────
+  /** Откатить внедрённый ген: вернуть состояние «как было». */
+  genesRollback: (gene: string) => call<GeneActionResult>('genes.rollback', { gene }),
+  /** Оценка гену от 1 до 10 (звёздочки). */
+  genesRate: (gene: string, score: number) =>
+    call<GeneActionResult>('genes.rate', { gene, score }),
+  /** Пометить ген «не ставить» (или снять пометку). */
+  genesDismiss: (gene: string, on = true, reason?: string) =>
+    call<GeneActionResult>('genes.dismiss', { gene, on, ...(reason ? { reason } : {}) }),
   copyFirstRun: () => call<CopyFirstRunSnapshot>('copy.first_run'),
   copyAnswer: (agree: boolean, mode?: CopyMode) =>
     call<GeneActionResult>('copy.answer', mode ? { agree, mode } : { agree }),
