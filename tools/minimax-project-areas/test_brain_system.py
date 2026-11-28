@@ -560,14 +560,30 @@ def check_walkthrough(failures: list[str]) -> None:
             failures.append("в обкатке нет задания характера «%s»" % kind)
             print("   FAIL: в обкатке нет задания характера «%s»" % kind)
     # Разбор лежит в передаче смены — не в отдельном хранилище.
-    handoff = norm(read(REPO / "docs" / "SESSION_HANDOFF.md"))
-    if "199" not in handoff:
+    handoff_raw = read(REPO / "docs" / "SESSION_HANDOFF.md")
+    if "199" not in norm(handoff_raw):
         failures.append("в SESSION_HANDOFF.md нет разбора промта #199")
         print("   FAIL: в SESSION_HANDOFF.md нет разбора промта #199")
+    # Разбор задачи — **последний** в передаче смены (смена новая сверху).
+    blocks = handoff_raw.split("Разбор задачи:")
+    if len(blocks) < 2:
+        failures.append("в SESSION_HANDOFF.md нет разбора задачи")
+        print("   FAIL: в SESSION_HANDOFF.md нет разбора задачи")
+        section = ""
+    else:
+        # Сам блок разбора (до следующего заголовка), а не вся запись о смене:
+        # иначе проверка ловит чужое «#199» и проходит не по той причине.
+        section = blocks[1].split("\n### ")[0].split("\n## ")[0]
+    section_norm = norm(section)
     for stage in stages:
-        if stage not in handoff:
-            failures.append("в разборe в SESSION_HANDOFF.md нет этапа «%s»" % stage)
+        if stage not in section_norm:
+            failures.append("в разборе в SESSION_HANDOFF.md нет этапа «%s»" % stage)
             print("   FAIL: в разборе в SESSION_HANDOFF.md нет этапа «%s»" % stage)
+    # Разбор должен называть PR: по нему видно, какая правка закрыла задание.
+    # Именно PR, а не номер промта: «#199» — это промт, а не правка.
+    if not re.search(r"PR[^\n]{0,24}#\s*\d{2,4}", section):
+        failures.append("в разборе в SESSION_HANDOFF.md не назван PR")
+        print("   FAIL: в разборе в SESSION_HANDOFF.md не назван PR")
     if not failures:
         print("   ок: разбор прогона есть, обкатка трёх характеров на месте")
 
