@@ -80,6 +80,7 @@ REPO = "Valstan/MatricaRMZ"
 POLL_SEC = 45
 CLOSE_GRACE_FOREIGN = 480      # пауза перед закрытием чужой сессии, сек
 CLOSE_WAIT_SEC = 900           # сколько ждать завершения «закрывающего» хода, сек
+DEAD_TURN_WAIT_SEC = 900       # сколько ждать, пока сторож поднимет оборванный ход, сек
 RETRY_COOLDOWN_SEC = 900       # пауза после упавшего хода (кредиты/сеть), сек
 MAX_REQUEUE = 2                # сколько раз промт можно вернуть в очередь
 PROMPT_ID_RE = re.compile(r"#(\d{2,4})")
@@ -461,6 +462,7 @@ def default_state() -> dict:
                 "failed": [],
                 "tries": {},
                 "not_before": 0,
+                "dead_turn": "",   # sid сессии, чей ход упал (ждём сторож)
             }
             for lane in LANES
         },
@@ -874,11 +876,13 @@ def handle_lane(lane: dict, ls: dict, snap: dict, now: float) -> str:
     #    панели, без команд сессии).
     if cur is None:
         ls["cur"] = None
+        ls["dead_turn"] = ""
         return "free"
 
     sess = by_sid.get(cur.get("sid"))
     if sess is None:
         ls["cur"] = None
+        ls["dead_turn"] = ""
         return "free"
 
     # ⚠️ КЛЮЧЕВОЕ (26.11): если промта в работе НЕТ (pending == 0) и сессия не
@@ -911,6 +915,7 @@ def handle_lane(lane: dict, ls: dict, snap: dict, now: float) -> str:
     con = core.connect(core.area_db(area_dir(lane)))
     try:
         turn = sw.last_turn(con, cur["sid"])
+        final = sw.last_message(con, cur["sid"], final_only=True)
     finally:
         con.close()
     busy = bool(turn.get("status") == "accepted" and not turn.get("completed_at_ms"))
@@ -928,6 +933,32 @@ def handle_lane(lane: dict, ls: dict, snap: dict, now: float) -> str:
     # phase == "run": ход промта идёт или завершился
     if busy:
         return "busy"
+
+    # ⚠️ ХОД УПАЛ, А ИТОГОВОЙ СВОДКИ НЕТ ⇒ агент оборвался на полпути.
+    #    Живой случай 28.11.2026, полоса 1, промт #176: в 14:03:27 лечащий
+    #    сменил аккаунт области (очки кончались) ⇒ провайдер отказал ⇒ ход
+    #    «failed». Карусель читала это как «сессия свободна» и через 40 секунд
+    #    слала «Завершай работу в этой сессии правильно» В ЖИВОЙ КОД — агент
+    #    продолжал работу, а команда висела в его переписке.
+    #    Оборванный ход — это НЕ «сделано», это «нужно поднять»: поднимает
+    #    сторож сессий («Продолжай»), карусель ждёт и не вмешивается.
+    if turn.get("status") == "failed" and not sw.looks_finished(final.get("text") or ""):
+        dead_since = int(turn.get("completed_at_ms") or 0) or int(cur.get("since") or now)
+        if ls.get("dead_turn") != cur.get("sid"):
+            log("ПОЛОСА %d: ход сессии %s упал, итоговой сводки нет — агент оборвался "
+                "(чаще всего смена аккаунта лечащим посреди хода). Закрывать такую "
+                "сессию НЕЛЬЗЯ — жду, пока поднимет сторож сессий"
+                % (lane["n"], str(cur.get("sid"))[:12]))
+            ls["dead_turn"] = cur.get("sid")
+        if now - dead_since > DEAD_TURN_WAIT_SEC:
+            log("ПОЛОСА %d: оборванный ход сессии %s не поднят за %d с — отдаю промт "
+                "в новую сессию" % (lane["n"], str(cur.get("sid"))[:12], DEAD_TURN_WAIT_SEC))
+            ls["cur"] = None
+            ls["dead_turn"] = ""
+            return "free"
+        return "busy"
+    ls["dead_turn"] = ""
+
     cur["phase"] = "closing"
     cur["turn_at_close"] = turn.get("turn_id") or ""
     cur["since"] = now
