@@ -2097,7 +2097,8 @@ def cli_send(args) -> int:
     if not sess:
         print("сессии нет")
         return 1
-    res = send_to_session(area, sess, text, background=False, force=bool(args.force))
+    res = send_to_session(area, sess, text, background=False, force=bool(args.force),
+                           force_closed=bool(args.force))
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("ok") else 1
 
@@ -2115,6 +2116,8 @@ def cli_close(args) -> int:
         return 1
     res = send_to_session(area, sess, CLOSE_COMMAND, background=True,
                           force=bool(args.force),
+                          force_closed=bool(args.force),
+                          is_close=True,
                           tag="закрытие:вручную:%s" % sess["session_id"][:12],
                           why="команда закрытия вручную")
     print(json.dumps(res, ensure_ascii=False))

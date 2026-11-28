@@ -145,7 +145,8 @@ def make_area(root: pathlib.Path, name: str = "p-test") -> pathlib.Path:
 
 def add_session(area: pathlib.Path, repo: pathlib.Path, sid: str,
                 kind: str = "finished", title: str = TITLE,
-                summary: str = FINAL_SUMMARY) -> None:
+                summary: str = FINAL_SUMMARY, error_code=None,
+                error_message: str = "") -> None:
     """Сессия в базе рантайма.
 
     `kind`:
@@ -161,7 +162,7 @@ def add_session(area: pathlib.Path, repo: pathlib.Path, sid: str,
         con.execute("insert into local_runtime_sessions values "
                     "(?,?,?,?,?,?,?,?,?,?,?,?)",
                     (sid, "idle", 0, "conversation", title, str(repo),
-                     now - 3600000, now - 600000, None, "",
+                     now - 3600000, now - 600000, error_code, error_message,
                      '{"effectiveModelContextWindow": 1000000}', "{}"))
         if kind == "running":
             con.execute("insert into local_runtime_turn_ingress values (?,?,?,?,?,?)",
@@ -557,8 +558,44 @@ def main() -> int:
         check(fb.get("action") == watcher.thread.CONTINUE,
               "фолбэк без отчёта требует завершения: %s" % fb)
 
-        # ── 7) Временная правка: без проверки «работа закончена» приёмка падает ──
-        print("7) временная правка: без проверки «работа закончена» приёмка падает")
+        # ── 7) Смена аккаунта: ровно одно «Продолжай» на смену, тег счётчик не ломает ──
+        print("7) смена аккаунта: ровно одно «Продолжай» на смену (тег не ломает счётчик)")
+        lane, area, area_dir, repo = scenario("s7")
+        add_session(area_dir, repo, "sess-bal", "abandoned", title=TITLE_PLAIN,
+                    error_code=50110, error_message="insufficient balance")
+        healed = {"last_heal": {area["slug"]: time_module.time()}}
+        real_read_state = watcher.core.read_state
+
+        def fake_read_state(path):
+            # Подменяем ТОЛЬКО состояние автомата аккаунтов: лекарка команд
+            # и всё остальное читается как обычно.
+            if "autheal" in str(path):
+                return healed
+            return real_read_state(path)
+
+        watcher.core.read_state = fake_read_state
+        state = {}
+        verdicts = watcher.survey(area, state)
+        for _ in range(3):                       # три прохода подряд
+            watcher.act(area, verdicts, state)
+        balance_sends = [t for t in rec.sent_texts() if "Продолжай нитку" in t]
+        check(len(balance_sends) == 1,
+              "на смену аккаунта ушло «Продолжай» %d раз (ожидано 1)"
+              % len(balance_sends))
+        # ⚠️ НОВАЯ смена аккаунта — тег другой ⇒ «Продолжай» обязан уйти ещё раз
+        # (иначе тег сломал счётчик смен аккаунта).
+        healed["last_heal"][area["slug"]] = time_module.time() + 10
+        state = {}
+        verdicts = watcher.survey(area, state)
+        watcher.act(area, verdicts, state)
+        balance_sends = [t for t in rec.sent_texts() if "Продолжай нитку" in t]
+        check(len(balance_sends) == 2,
+              "после новой смены аккаунта «Продолжай» не ушёл (тег сломал счётчик): %d"
+              % len(balance_sends))
+        watcher.core.read_state = real_read_state
+
+        # ── 8) Временная правка: без проверки «работа закончена» приёмка падает ──
+        print("8) временная правка: без проверки «работа закончена» приёмка падает")
         broken = load_carousel(tmp, broken="finished")
         rec2 = Recorder()
         rec2.install(broken.sw)
