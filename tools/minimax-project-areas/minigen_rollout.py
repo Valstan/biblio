@@ -72,7 +72,15 @@ FILES = ("minigen_core.py", "minimax-netwatch.py", "minimax-sessionwatch.py",
          # грузит его как **мягкую зависимость** (рядом с собой) ⇒ без него в
          # списке раскатка затирала бы свежую правку лечащего старым модулем,
          # а порог «остаток очков» на машине жил бы не из master'а.
-         "minimax-points.py")
+         "minimax-points.py",
+         # 28.11 (источник истины карусели): каркас ночной карусели и обёртки
+         # проектов. До этого они жили ТОЛЬКО на машине ⇒ правка дефекта самой
+         # карусели не могла попасть в репозиторий (промт КАРМАНА #184). Лежат в
+         # подкаталоге `carousel/` ⇒ на машине — тоже подкаталогом: каркас берёт
+         # сторожа из каталога уровнем выше, обёртки — каркас рядом с собой.
+         "carousel/matrica-night-carousel.py",
+         "carousel/minigen-night-carousel.py",
+         "carousel/sarafan-night-carousel.py")
 # ⚠️ **Конфиг областей (`mcode-project-areas.json`) в списке раскатки НЕТ — и
 # это решение, а не забывчивость** (канон владельца 27.11):
 #
@@ -955,7 +963,9 @@ def main() -> int:
     print("--- файлы ---")
     for name in FILES:
         data = master_file(name, ref)
-        (BIN / name).write_bytes(data)
+        target = BIN / name
+        target.parent.mkdir(parents=True, exist_ok=True)   # подкаталоги (carousel/)
+        target.write_bytes(data)
         print("   записан %-26s %d байт" % (name, len(data)))
 
     print("--- остановка демонов (поднимет программа «МиниГен», дублей не будет) ---")
@@ -977,7 +987,9 @@ def main() -> int:
     print("--- проверка ---")
     ok = True
     for name in ("minigen_core.py", "minigen_thread.py", "minimax-netwatch.py",
-                 "minimax-sessionwatch.py", "minimax-autheal.py", "minimax-points.py"):
+                 "minimax-sessionwatch.py", "minimax-autheal.py", "minimax-points.py",
+                 "carousel/matrica-night-carousel.py", "carousel/minigen-night-carousel.py",
+                 "carousel/sarafan-night-carousel.py"):
         r = subprocess.run([sys.executable, "-m", "py_compile", str(BIN / name)],
                            capture_output=True, text=True)
         good = r.returncode == 0
