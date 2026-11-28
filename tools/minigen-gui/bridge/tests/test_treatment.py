@@ -34,6 +34,7 @@ if str(BRIDGE_DIR) not in sys.path:
 
 import minigen_agent as agent_mod  # noqa: E402
 import minigen_api as api  # noqa: E402
+import minigen_bridge as minigen_bridge  # noqa: E402
 import minigen_treatment as treatment  # noqa: E402
 
 
@@ -198,8 +199,14 @@ class ApiDecisionTest(unittest.TestCase):
             api.TOKEN_FILE = Path(tmp) / "bridge-token.txt"
             seen: list[dict] = []
 
-            def decider(facts):
-                seen.append(facts)
+            def decider(args):
+                # ⚠️ Промт КАРМАНА #184: решатель получает **конверт**
+                # {"facts": …, "area": …} — ровно то, что ждёт живой мост
+                # (`Bridge.cmd_treat_decision`) и что шлёт демон. Раньше здесь
+                # стояла заглушка `decider(facts)`, и проверка проходила, даже
+                # когда живая связка была сломана (проверка по неверной
+                # причине).
+                seen.append(args)
                 return {"ok": True, "action": treatment.CONTINUE,
                         "instruction": "доделай", "reason": "отчёта нет"}
 
@@ -208,7 +215,7 @@ class ApiDecisionTest(unittest.TestCase):
             port = server.server_address[1]
             try:
                 token = api.token()
-                body = json.dumps({"facts": FACTS}).encode("utf-8")
+                body = json.dumps({"facts": FACTS, "area": "minigen"}).encode("utf-8")
                 req = urllib.request.Request(
                     "http://127.0.0.1:%d/treat-decision?token=%s" % (port, token),
                     data=body, method="POST")
@@ -216,7 +223,8 @@ class ApiDecisionTest(unittest.TestCase):
                 with urllib.request.urlopen(req, timeout=5) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 self.assertEqual(data.get("action"), treatment.CONTINUE)
-                self.assertEqual(seen[0].get("verdict"), "скомпактилась")
+                self.assertEqual(seen[0]["facts"].get("verdict"), "скомпактилась")
+                self.assertEqual(seen[0].get("area"), "minigen")
             finally:
                 server.shutdown()
                 server.server_close()
@@ -264,6 +272,117 @@ class ApiDecisionTest(unittest.TestCase):
             finally:
                 server.shutdown()
                 server.server_close()
+
+
+class RealDeciderWiringTest(unittest.TestCase):
+    """Решатель — **настоящий мост**, а не заглушка (промт КАРМАНА #184).
+
+    ⚠️ Живая находка 28.11: API звал решателя как `decider(facts)`, а мост ждал
+    конверт `{"facts": …, "area": …}` ⇒ живой решатель отвечал «нужны факты о
+    ситуации», и решение «Управляющего» **никогда** не доходило до сторожа
+    (в журнале все лечения — «(правило)»).
+
+    Прежняя проверка подставляла свою заглушку — и потому проходила, даже когда
+    живая связка была сломана. Теперь ставим **настоящий** обработчик моста.
+    """
+
+    def setUp(self) -> None:
+        self._old_token = api.TOKEN_FILE
+        self._old_local = api.LOCAL
+        self._old_decider = api.DECIDER
+
+    def tearDown(self) -> None:
+        api.TOKEN_FILE = self._old_token
+        api.LOCAL = self._old_local
+        api.set_decider(self._old_decider)
+
+    def _server(self):
+        server = api.HTTPServer(("127.0.0.1", 0), api.Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server
+
+    def test_real_bridge_handler_gets_the_decision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            api.LOCAL = Path(tmp)
+            api.TOKEN_FILE = Path(tmp) / "bridge-token.txt"
+            seen: list[dict] = []
+
+            class FakeAgent:
+                def decide_treatment(self, facts, area_slug="minigen", model=""):
+                    seen.append({"facts": facts, "area": area_slug})
+                    return {"ok": True, "action": treatment.NEW_SESSION,
+                            "instruction": "продолжи нитку", "reason": "работа закончена"}
+
+            class FakeCore:
+                def refresh_env(self):
+                    return {}
+
+            bridge = minigen_bridge.Bridge.__new__(minigen_bridge.Bridge)
+            bridge.agent = FakeAgent()
+            bridge.core = FakeCore()
+            api.set_decider(bridge.cmd_treat_decision)
+            server = self._server()
+            port = server.server_address[1]
+            try:
+                token = api.token()
+                body = json.dumps({"facts": FACTS, "area": "minigen"}).encode("utf-8")
+                req = urllib.request.Request(
+                    "http://127.0.0.1:%d/treat-decision?token=%s" % (port, token),
+                    data=body, method="POST")
+                req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                self.assertTrue(data.get("ok"), data)
+                self.assertEqual(data.get("action"), treatment.NEW_SESSION, data)
+                self.assertEqual(len(seen), 1, seen)
+                self.assertEqual(seen[0]["facts"].get("verdict"), "скомпактилась")
+                self.assertEqual(seen[0]["area"], "minigen")
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_bridge_handler_accepts_both_forms(self) -> None:
+        """Мост понимает и конверт, и «факты напрямую»."""
+        with tempfile.TemporaryDirectory() as tmp:
+            api.LOCAL = Path(tmp)
+            api.TOKEN_FILE = Path(tmp) / "bridge-token.txt"
+
+            class FakeAgent:
+                def decide_treatment(self, facts, area_slug="minigen", model=""):
+                    return {"ok": True, "action": treatment.CONTINUE,
+                            "instruction": "доделай", "reason": "отчёта нет"}
+
+            class FakeCore:
+                def refresh_env(self):
+                    return {}
+
+            bridge = minigen_bridge.Bridge.__new__(minigen_bridge.Bridge)
+            bridge.agent = FakeAgent()
+            bridge.core = FakeCore()
+            res = bridge.cmd_treat_decision({"facts": FACTS})
+            self.assertTrue(res.get("ok"), res)
+            res = bridge.cmd_treat_decision(dict(FACTS))
+            self.assertTrue(res.get("ok"), res)
+            res = bridge.cmd_treat_decision({})
+            self.assertFalse(res.get("ok"), res)
+
+
+class SessionOutputTest(unittest.TestCase):
+    """Управляющий видит **вывод сессии** (промт КАРМАНА #184, п. 4)."""
+
+    def test_output_is_in_the_request(self) -> None:
+        facts = dict(FACTS)
+        facts["last_output"] = "Итог сессии\nСессия закрыта, незакрытых дел нет."
+        prompt = treatment.user_prompt(facts)
+        self.assertIn("вывод последнего сообщения сессии", prompt)
+        self.assertIn("Итог сессии", prompt)
+        self.assertIn("Сессия закрыта", prompt)
+        # Вывод идёт **до** технических фактов — модель читает его первой.
+        self.assertLess(prompt.index("Итог сессии"), prompt.index("нить"))
+
+    def test_system_prompt_requires_leaning_on_the_output(self) -> None:
+        self.assertIn("вывод последнего сообщения сессии", treatment.SYSTEM_PROMPT)
 
 
 if __name__ == "__main__":
