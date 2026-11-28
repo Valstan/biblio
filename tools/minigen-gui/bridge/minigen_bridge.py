@@ -969,7 +969,11 @@ class Bridge:
         if watcher is None:
             return {"error": "сторож сессий недоступен"}
         sess = self._session(area, str(args.get("session_id") or ""))
-        res = watcher.send_to_session(area, sess, watcher.CLOSE_COMMAND, background=True)
+        # ⚠️ Промт КАРМАНА #186: команда закрытия в одну сессию уходит ОДИН раз —
+        # кто бы её ни послал (панель, сторож, карусель полос). `is_close=True` —
+        # отметка в общей лекарке команд.
+        res = watcher.send_to_session(area, sess, watcher.CLOSE_COMMAND, background=True,
+                                      is_close=True)
         self.core.log("Панель «МиниГен»: %s — закрытие сессии %s" % (
             area["slug"], sess["session_id"][:12]))
         return state.jsonable(res)

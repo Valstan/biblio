@@ -200,7 +200,11 @@ class Recorder:
     def install(self, watcher, answer: dict | None) -> None:
         rec = self
 
-        def fake_send(area, sess, text, background=True, force=False, tag="", why=""):
+        def fake_send(area, sess, text, background=True, force=False, tag="", why="",
+                      is_close=False, finished=None, force_closed=False,
+                      check_closed=True):
+            # ⚠️ Ключи повторяют `send_to_session()` (промт КАРМАНА #186):
+            # заглушка должна принимать всё, чем сторож зовёт отправку.
             rec.sent.append(text)
             rec.order.append("send")
             rec.tags.append(tag)
