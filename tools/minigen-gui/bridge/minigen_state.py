@@ -436,13 +436,140 @@ def driver_of_area(mods: dict[str, Any], area: dict[str, Any]) -> dict[str, Any]
             "source": str(out.get("source") or "")}
 
 
+# ────────────────────────────────────────────────────────── активность области
+#
+# Промт КАРМАНА #208: у области должен быть **счётчик активности** — сколько
+# раз она получала аккаунты и обновления аккаунтов MiniMax из Кармана.
+#
+# Считаем **по журналу автомата аккаунтов** — это единственное место, где
+# видно, кому и когда Карман отдал аккаунт. Ничего не придумывается на глаз:
+# счётчик — это посчитанные следы.
+#
+# Два события (слова владельца — «получение аккаунтов и обновления аккаунтов»):
+#
+# - **«Карман отдал: id=…»** — Карман выдал области аккаунт;
+# - **«аккаунт получен»** — автомат поставил этот аккаунт в область (обновил
+#   вход).
+#
+# ⚠️ «Карман отдал негодный токен — пробую следующий» — это **отказ**, а не
+# выдача: поэтому маркер с двоеточием («Карман отдал:»), а не без него.
+
+ACTIVITY_GRANTED_MARK = "карман отдал:"
+ACTIVITY_UPDATED_MARK = "аккаунт получен"
+
+#: Кэш счёта: пересчитываем, только когда журнал изменился (подпись — время
+#: и размер файла). Журнал на машине — мегабайты, а окно спрашивает список
+#: областей каждые несколько секунд.
+_ACTIVITY_CACHE: dict[str, Any] = {"key": None, "data": {}}
+
+
+def _journal_signature(path: Path) -> tuple[str, int, int]:
+    """Подпись журнала (путь + время изменения + размер) — для кэша счёта."""
+    try:
+        st = path.stat()
+        return (str(path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (str(path), 0, 0)
+
+
+def activity_counters(mods: dict[str, Any],
+                       areas: list[dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+    """Счётчики активности областей — по журналу автомата аккаунтов.
+
+    Возвращает словарь `slug → {granted, updated, total, last}`:
+
+    - `granted` — сколько раз Карман отдал области аккаунт;
+    - `updated` — сколько раз автомат обновил вход области;
+    - `total` — сумма (её и показывает окно);
+    - `last` — когда было последнее такое событие.
+
+    Пустой счётчик у области, вовсе не получавшей аккаунтов, — это **ноль**,
+    а не «нет данных»: так владелец видит, что агент простаивал.
+    """
+    core = mods["core"]
+    path = core.JOURNAL
+    signature = _journal_signature(path)
+    if _ACTIVITY_CACHE.get("key") == signature:
+        return dict(_ACTIVITY_CACHE.get("data") or {})
+    areas = list(areas if areas is not None else core.areas())
+    counters: dict[str, dict[str, Any]] = {
+        str(area["slug"]): {"granted": 0, "updated": 0, "total": 0, "last": ""}
+        for area in areas
+    }
+    # заголовок строки журнала — название области («Память: …»)
+    by_title: dict[str, str] = {}
+    # раздел КАРМАНА → области (может быть несколько — тогда по разделу не
+    # определяем: счётчик не должен достаться не той области)
+    by_karman: dict[str, list[str]] = {}
+    for area in areas:
+        slug = str(area["slug"])
+        by_title[str(area.get("title") or slug).strip().lower()] = slug
+        by_karman.setdefault(str(area.get("karman") or slug).strip().lower(),
+                              []).append(slug)
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        raw = []
+    for line in raw:
+        ts, rest = split_journal_line(line)
+        low = rest.lower()
+        granted = ACTIVITY_GRANTED_MARK in low
+        updated = ACTIVITY_UPDATED_MARK in low
+        if not granted and not updated:
+            continue
+        slug = _journal_area_slug(rest, by_title, by_karman)
+        if not slug:
+            continue
+        rec = counters.get(slug)
+        if rec is None:
+            continue
+        if granted:
+            rec["granted"] += 1
+        if updated:
+            rec["updated"] += 1
+        rec["total"] = rec["granted"] + rec["updated"]
+        if ts and ts > str(rec.get("last") or ""):
+            rec["last"] = ts
+    _ACTIVITY_CACHE["key"] = signature
+    _ACTIVITY_CACHE["data"] = counters
+    return dict(counters)
+
+
+def _journal_area_slug(text: str, by_title: dict[str, str],
+                       by_karman: dict[str, list[str]]) -> str:
+    """К какой области относится строка журнала.
+
+    Порядок:
+
+    1. **заголовок строки** («Память: …») — название области: самое точное;
+    2. **раздел КАРМАНА** («(проект memory)») — только если он указывает на
+       одну область (у нескольких областей раздел бывает общий);
+    3. **имя каталога** («p-brain») — запасной путь.
+    """
+    head = text.split(":", 1)[0].strip().lower()
+    if head and head in by_title:
+        return by_title[head]
+    m = re.search(r"\(проект\s+([^)]+)\)", text, re.IGNORECASE)
+    if m:
+        names = by_karman.get(m.group(1).strip().lower()) or []
+        if len(names) == 1:
+            return names[0]
+    m = AREA_RE.search(text)
+    if m:
+        return m.group(1)
+    return ""
+
+
 def areas_state(mods: dict[str, Any], include_sessions: bool = True,
                 only_running: bool = False) -> list[dict[str, Any]]:
     """Список областей с их живым состоянием."""
     core = mods["core"]
     running = core.running_areas() or set()
+    all_areas = core.areas()
+    # счётчик активности — по журналу автомата аккаунтов (промт КАРМАНА #208)
+    activity = activity_counters(mods, all_areas)
     out: list[dict[str, Any]] = []
-    for area in core.areas():
+    for area in all_areas:
         dir_name = area["dir"].name
         is_running = dir_name in running
         if only_running and not is_running:
@@ -461,6 +588,11 @@ def areas_state(mods: dict[str, Any], include_sessions: bool = True,
             "running": is_running,
             "exists": area["dir"].is_dir(),
             "account": local_account(mods, area["dir"]),
+            # ⚠️ Промт КАРМАНА #208: счётчик активности области — сколько раз
+            # она получала аккаунты и обновления аккаунтов из Кармана. Считает
+            # автомат аккаунтов (по журналу), а не человек на глаз.
+            "activity": dict(activity.get(str(area["slug"]))
+                             or {"granted": 0, "updated": 0, "total": 0, "last": ""}),
             # водитель сессий проекта (промт КАРМАНА #174)
             "driver": str(area.get("driver") or ""),
             "driverNow": driver_of_area(mods, area),

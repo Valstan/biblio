@@ -55,6 +55,7 @@ import minigen_files as files_mod      # noqa: E402
 import minigen_map as map_mod          # noqa: E402
 import minigen_update as update_mod    # noqa: E402
 import minigen_daemons as daemons      # noqa: E402
+import minigen_delete as delete_mod    # noqa: E402 — удаление агента целиком (#208)
 import minigen_lock as minigen_lock    # noqa: E402
 import minigen_lineage as lineage      # noqa: E402
 import minigen_provider as provider_mod  # noqa: E402
@@ -401,6 +402,7 @@ class Bridge:
             "areas.restart": self.cmd_restart,
             "areas.relogin": self.cmd_relogin,
             "areas.create": self.cmd_create,
+            "areas.delete_agent": self.cmd_delete_agent,
             "sessions.list": self.cmd_sessions_list,
             "sessions.read": self.cmd_sessions_read,
             "sessions.send": self.cmd_sessions_send,
@@ -901,6 +903,49 @@ class Bridge:
                 "auth_from": copied, "folder": folder,
                 "shortcut": shortcut_note, "folder_note": folder_note,
                 "skipped": skipped}
+
+    def cmd_delete_agent(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Удалить агента целиком (промт КАРМАНА #208).
+
+        Удаление **необратимо**, поэтому оно в два шага:
+
+        - **без `confirm`** — план: что именно исчезнет (папки, запись в
+          настройке, паспорта, ярлыки) и что с синхронизацией с GitHub.
+          Ничего не удаляется;
+        - **с `confirm: true`** — удаление. Проверка GitHub повторяется: если
+          что-то не отправлено — удаление **не проходит**, и в ответе видно,
+          что именно осталось неотправленным.
+
+        ⚠️ Раздел КАРМАНА агента не трогаем: там история заявок, её удаление —
+        отдельное решение владельца (риск для данных).
+        """
+        slug = str(args.get("slug") or "").strip()
+        if not slug:
+            return {"error": "не указан агент"}
+        area = state.area_by_slug(self.mods, slug)
+        if not area:
+            return {"error": "нет такой области: %s" % slug}
+        title = str(area.get("title") or slug)
+        folder = str(area.get("folder") or "")
+        area_dir = str(area.get("dir") or "")
+        sync = delete_mod.git_sync_state(Path(folder)) if folder else {
+            "is_repo": False, "branch": "", "remote": "", "upstream": "",
+            "dirty": [], "unpushed": [], "ok": True,
+            "why": "у агента нет своей рабочей папки — проверять нечего"}
+        plan = delete_mod.collect(slug, title, folder, area_dir)
+        if not bool(args.get("confirm")):
+            return {"ok": True, "planned": True, "slug": slug, "title": title,
+                    "folder": folder, "targets": plan["targets"], "git": sync,
+                    "can_delete": bool(sync.get("ok")),
+                    "why": str(sync.get("why") or ""),
+                    "note": "раздел КАРМАНА не трогаем — это отдельное "
+                            "решение владельца"}
+        result = delete_mod.delete_agent(self.core, self.mods, slug, title,
+                                         folder, area_dir)
+        if not result.get("ok"):
+            self.core.log("Панель «МиниГен»: удаление агента %s НЕ прошло — %s" % (
+                slug, result.get("error") or "не удалено"))
+        return result
 
     # ────────────────────────────────────────────────────────────── сессии
     def _area(self, slug: str) -> dict[str, Any]:
