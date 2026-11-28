@@ -104,6 +104,13 @@ class RolloutUsesTheRuleTest(unittest.TestCase):
         # Тянуть общий репозиторий программы нельзя: копия слилась бы с ним.
         self.assertNotIn('["pull", "--ff-only", remote, "master"]', source)
 
+    def test_the_rollout_warns_when_the_own_branch_is_behind(self):
+        """⚠️ Живой случай 28.11: своя ветка копии отставала на 153 коммита —
+        демоны молча встали бы на неделю старше. Раскатка обязана сказать."""
+        source = (HERE / "minigen_rollout.py").read_text(encoding="utf-8")
+        self.assertIn("rev-list", source)
+        self.assertIn("отстаёт от кода в этом дереве", source)
+
 
 if __name__ == "__main__":
     unittest.main()
