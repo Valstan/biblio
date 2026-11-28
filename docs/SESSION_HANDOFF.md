@@ -15,7 +15,7 @@ Updated: 2026-11-28 (двадцать шестая смена — **дефект
 
 | где что | состояние |
 |---|---|
-| репозиторий | ветка `fix/carousel-rework-done-threshold` (от свежего `origin/master` `79b6d51`): каркас карусели `tools/minimax-project-areas/carousel/matrica-night-carousel.py` (`verify_prompt()` + выбор промта в `tick()`), приёмка `tools/minimax-project-areas/test_carousel_rework_done.py` (новая), гейт `.github/workflows/tools-gate.yml` (шаг приёмки), письмо Мозгу `mailbox/to-brain/2026-11-28-the-rework-promise-is-not-unlimited.md` |
+| репозиторий | PR **#276** (ветка `fix/carousel-rework-done-threshold`, от свежего `origin/master` `79b6d51`): каркас карусели `tools/minimax-project-areas/carousel/matrica-night-carousel.py` (`verify_prompt()` + выбор промта в `tick()`), приёмка `tools/minimax-project-areas/test_carousel_rework_done.py` (новая), гейт `.github/workflows/tools-gate.yml` (шаг приёмки), письмо Мозгу `mailbox/to-brain/2026-11-28-the-rework-promise-is-not-unlimited.md` |
 | живая машина | **не раскатывалась** (раскатка — только по слову владельца). Каркас на машине **старше** `master` (правок #263–#265 там ещё нет) ⇒ без раскатки дефект на машине остаётся |
 | живой случай | подтверждён по журналу `%LOCALAPPDATA%\mcode-web\matrica-carousel.log` (полоса 1, промт #176): в 14:34:52 промт взят **второй раз**, в 14:40:11 доработка закрыта («слитый PR #2163») ⇒ к моменту второго взятия она была уже закрыта |
 | приёмка на `master` **до** правки | **падает** (6 расхождений) ⇒ дефект воспроизводится на текущем `master` |
