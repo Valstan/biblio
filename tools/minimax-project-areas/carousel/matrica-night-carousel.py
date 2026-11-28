@@ -772,9 +772,11 @@ def verify_prompt(prompt_id: int, min_number: int = 0, rework: bool = False) -> 
         return True, "архив в КАРМАНе"
     pr = merged_pr_for(prompt_id, min_number=min_number)
     if pr:
+        why = ("новый слитый PR #%d (выше after_pr=%d)" % (pr, min_number) if rework
+               else "слитый PR #%d" % pr)
         if karman_archive(prompt_id):
-            return True, "слитый PR #%d; архив проставлен супервизором" % pr
-        return True, "слитый PR #%d (архив не проставился)" % pr
+            return True, "%s; архив проставлен супервизором" % why
+        return True, "%s (архив не проставился)" % why
     if rework:
         return False, "нет нового слитого PR после начала доработки"
     return False, "ни архива в КАРМАНе, ни слитого PR"
@@ -1211,7 +1213,6 @@ def tick(st: dict) -> None:
         queue = list(ls.get("queue") or [])
         reserve = list(st.get("reserve") or [])
         rework_all = st.get("rework") or {}
-        rework_ids = set(int(k) for k in rework_all)
         pick = None
         source = None
 
@@ -1233,12 +1234,25 @@ def tick(st: dict) -> None:
                 break
 
             # уже выполнено? (архив в КАРМАНе или слитый PR) — не переделываем.
-            # ⚠️ ИСКЛЮЧЕНИЕ — ДОРАБОТКА: промт в st["rework"] выполняется заново
-            # (старый PR/архив ему не зачёт), и агент получает список остатков.
-            if pick not in rework_ids and (prompt_archived(pick) or merged_pr_for(pick)):
-                log("ПОЛОСА %d: промт #%d уже выполнен (архив/слитый PR) — пропускаю"
-                    % (lane["n"], pick))
+            # ⚠️ ДОРАБОТКА: старый слитый PR/архив ему не зачёт — но ЗАЧЁТ новый
+            # слитый PR (номер выше `after_pr`): доработка закрыта, второй раз её
+            # выполнять нельзя. Раньше проверка для доработок ПРОПУСКАЛАСЬ ЦЕЛИКОМ
+            # ⇒ карусель брала доработку заново даже после нового слитого PR
+            # (живой случай 28.11, полоса 1 «Матрица РМЗ», промт #176: карусель
+            # взяла доработку в 14:34, а PR #2163 был слит в 14:39 ⇒ дубль-сессия
+            # на том же дереве).
+            rework_rec = rework_all.get(str(pick)) or {}
+            ok, why = verify_prompt(pick, min_number=int(rework_rec.get("after_pr") or 0),
+                                     rework=bool(rework_rec))
+            if ok:
+                log("ПОЛОСА %d: промт #%d уже выполнен (%s) — пропускаю"
+                    % (lane["n"], pick, why))
                 ls["done"] = list(ls.get("done") or []) + [pick]
+                if rework_rec:
+                    # доработка закрыта — убираем её из состояния (как в finish_prompt)
+                    rework_all.pop(str(pick), None)
+                    st["rework"] = rework_all
+                    log("ПОЛОСА %d: ДОРАБОТКА промта #%d закрыта" % (lane["n"], pick))
                 if source == "queue":
                     queue.remove(pick)
                     ls["queue"] = queue          # ← запись обратно, иначе промт
