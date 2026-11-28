@@ -278,14 +278,24 @@ def load_watcher(passport_file: pathlib.Path, sends_file: pathlib.Path,
     """
     os.environ["MINIGEN_PASSPORTS_FILE"] = str(passport_file)
     source = (HERE / "minimax-sessionwatch.py").read_text(encoding="utf-8-sig")
+    original = source
     if broken == "closed":
         # Ломаем стражи «сессия уже закрыта» — приёмка должна это заметить.
-        source = source.replace('if st.get("closed"):', 'if False:')
+        # ⚠️ Промт КАРМАНА #186: стража переехала в `send_to_session()` и
+        #    получила флаг `check_closed` (карусель полос ею не пользуется —
+        #    у неё своё понимание «работа закончена»). Правка должна бить по
+        #    тому же месту.
+        source = source.replace('if check_closed and st.get("closed"):', 'if False:')
     elif broken == "cooldown":
         # Ломаем «решение не переспрашивается на каждом проходе».
         source = source.replace(
             "if last_at and int(time.time()) - last_at < DECISION_COOLDOWN and last_sig == sig:",
             "if False:")
+    if broken and source == original:
+        # Правка не применилась ⇒ приёмка проверяла бы не то. Лучше падать
+        # сразу и прямо (как в приёмке #185).
+        raise SystemExit("временная правка «%s» не применилась — код поменялся, "
+                         "приёмку надо поправить" % broken)
     tmp = pathlib.Path(tempfile.gettempdir()) / (
         "sessionwatch-broken-%s.py" % (broken or "ok"))
     tmp.write_text(source, encoding="utf-8")

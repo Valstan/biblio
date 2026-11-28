@@ -651,7 +651,7 @@ def start_session(lane: dict, prompt_text: str) -> bool:
     return True
 
 
-def close_session(lane: dict, session_id: str) -> bool:
+def close_session(lane: dict, session_id: str, done_prompts: list = None) -> bool:
     """Корректно закрыть сессию: попросить итоговую сводку и остановиться.
 
     ⚠️ `force=True` — НЕ лишний флаг (28.11.2026, находка по промту #184):
@@ -661,6 +661,15 @@ def close_session(lane: dict, session_id: str) -> bool:
     оставалась живой, а карусель подхватывала её снова — цикл «закрываю → не
     наша» (15 минут на попытку, 36 команд закрытия за 74 минуты).
     Карусель — водитель своих полос ⇒ команду она имеет право слать (force).
+
+    ⚠️ ПРОМТ КАРМАНА #186: `force` снимает запрет «это сессия Управляющего»,
+    но **не** стражи «работа уже закончена» и «команда закрытия уже уходила».
+    Теперь это **одно** правило для сторожа и карусели (`send_to_session` +
+    общий файл состояния `session-sends-state.json`):
+      * работа сессии уже закончена (промт сдан и выполнен) ⇒ команду закрытия
+        **не шлём** (живой случай 27–28.11: 36 команд закрытия в сессию, чья
+        работа была закончена);
+      * команду закрытия в одну сессию уходит **один раз** — кто бы ни послал.
     """
     area = {"slug": lane["slug"], "dir": area_dir(lane), "folder": lane["folder"]}
     sess = None
@@ -670,7 +679,19 @@ def close_session(lane: dict, session_id: str) -> bool:
             break
     if not sess:
         return False
-    res = sw.send_to_session(area, sess, sw.CLOSE_COMMAND, background=True, force=True)
+    if sess.get("archived"):
+        log("ПОЛОСА %d: сессия %s уже архивирована — команду закрытия не шлю"
+            % (lane["n"], session_id[:12]))
+        return False
+    # «работа этой сессии уже закончена?» — карусель знает свои сданные промты.
+    pid = prompt_id_from_title(sess.get("title") or "")
+    finished = {"done": False, "why": ""}
+    if pid and pid in [int(x) for x in (done_prompts or [])]:
+        finished = {"done": True, "why": "промт #%d уже выполнен" % pid}
+    res = sw.send_to_session(area, sess, sw.CLOSE_COMMAND, background=True, force=True,
+                             is_close=True, check_closed=False, finished=finished,
+                             tag="карусель:закрытие:%d" % pid,
+                             why="команда закрытия (карусель полосы %d)" % lane["n"])
     log("ПОЛОСА %d: команда закрытия сессии %s — %s"
         % (lane["n"], session_id[:12], res.get("why", "")))
     return bool(res.get("ok"))
@@ -942,6 +963,26 @@ def handle_lane(lane: dict, ls: dict, snap: dict, now: float) -> str:
     if busy:
         return "busy"
 
+    # ⚠️ ПРОМТ КАРМАНА #186: РАБОТА СЕССИИ УЖЕ ЗАКОНЧЕНА ⇒ команду закрытия
+    #    НЕ шлём, сессию архивируем. «Работа закончена» для карусели — это
+    #    ЕЁ собственный список сданных промтов (`ls["done"]`): промт выполнен,
+    #    делать больше нечего, а команда закрытия — пустой ход в никуда.
+    #    Живой случай 27–28.11: сессия `mvs_47c60cc5` (оба PR смержены, сводка
+    #    о выполнении в сессии есть) получила 36 команд закрытия, 35 из них —
+    #    в цикле с 27.11 22:55 до 28.11 00:09, раз в ~1,5 минуты.
+    #    ⚠️ Проверка идёт ДО проверки «ход упал» (#263): если промт уже
+    #    выполнен, поднимать оборванный ход незачем — работа сделана.
+    pid_done = int(cur.get("prompt_id") or 0)
+    if (not pending and pid_done
+            and pid_done in [int(x) for x in (ls.get("done") or [])]):
+        log("ПОЛОСА %d: сессия %s — работа уже закончена (промт #%d выполнен): "
+            "команда закрытия не отправлялась, архивирую"
+            % (lane["n"], str(cur.get("sid"))[:12], pid_done))
+        archive_session(lane, cur["sid"])
+        ls["cur"] = None
+        ls["dead_turn"] = ""
+        return "free"
+
     # ⚠️ ХОД УПАЛ, А ИТОГОВОЙ СВОДКИ НЕТ ⇒ агент оборвался на полпути.
     #    Живой случай 28.11.2026, полоса 1, промт #176: в 14:03:27 лечащий
     #    сменил аккаунт области (очки кончались) ⇒ провайдер отказал ⇒ ход
@@ -970,7 +1011,7 @@ def handle_lane(lane: dict, ls: dict, snap: dict, now: float) -> str:
     cur["phase"] = "closing"
     cur["turn_at_close"] = turn.get("turn_id") or ""
     cur["since"] = now
-    close_session(lane, cur["sid"])
+    close_session(lane, cur["sid"], done_prompts=ls.get("done") or [])
     return "busy"
 
 
@@ -980,6 +1021,19 @@ def finish_prompt(lane: dict, ls: dict, prompt_id: int, now: float, st: dict = N
         return
     rework = (st or {}).get("rework") or {}
     rec = rework.get(str(prompt_id)) or {}
+    # ⚠️ ПРОМТ КАРМАНА #186: промт, который уже в списке выполненных, повторно
+    # НЕ проверяем и в очередь НЕ возвращаем. Раньше сюда попадала осиротевшая
+    # сессия уже выполненного промта (работа закончена — команду закрытия мы
+    # теперь не шлём, а архивируем сессию) ⇒ проверка выполнения шла второй
+    # раз, и при временном сбое проверки (например, `gh` не ответил) промт
+    # возвращался в очередь и выполнялся заново.
+    # ⚠️ ДОРАБОТКА — исключение: её проверка своя (старый PR не зачёт), её и
+    # проверяем, как прежде.
+    if not rec and prompt_id in [int(x) for x in (ls.get("done") or [])]:
+        log("ПОЛОСА %d: промт #%d уже в списке выполненных — повторно не проверяю"
+            % (lane["n"], prompt_id))
+        ls["pending"] = 0
+        return
     ok, why = verify_prompt(prompt_id, min_number=int(rec.get("after_pr") or 0),
                              rework=bool(rec))
     if ok:
