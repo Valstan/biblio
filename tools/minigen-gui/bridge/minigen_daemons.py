@@ -392,6 +392,39 @@ def restart_all() -> dict[str, Any]:
     return {"results": [dict(restart(spec), name=spec["name"]) for spec in DAEMONS]}
 
 
+def _report_crash(text: str) -> None:
+    """Сбой программы — в «ящик отчётов» (промт КАРМАНА #185).
+
+    Отчёт с видом `crash` доходит до «Управляющего» как **задача**: починить
+    код и выпустить обновление. Падение демона — это не «ошибка инструмента»:
+    программа осталась без половины своих функций.
+    """
+    try:
+        from minigen_state import load_daemons
+        import minigen_errors as errors_mod
+        errors_mod.report_crash(load_daemons()["core"], text)
+    except Exception:  # noqa: BLE001 — отчёт не должен ронять надзирателя
+        pass
+
+
+def _just_replaced(spec: dict[str, str]) -> bool:
+    """Скрипт демона только что положили на место (раскатка) — не сбой.
+
+    ⚠️ Раскатка **останавливает** демонов и поднимает их заново. Если
+    надзиратель увидит их мёртвыми в этот момент — это не падение программы,
+    а плановая операция. Признак — свежий файл скрипта (раскатка его только
+    что скопировала). Без этой проверки раскатка рождала бы ложную задачу
+    «починить программу» (риск петли из промта #185).
+    """
+    try:
+        path = script_path(spec)
+        if not path.is_file():
+            return False
+        return (time.time() - path.stat().st_mtime) < 300
+    except OSError:
+        return False
+
+
 def supervise_loop(stop_flag: threading.Event | None = None,
                     lock: minigen_lock.SupervisorLock | None = None) -> None:
     """Следить за демонами: поднимать упавшего (пока программа жива).
@@ -407,9 +440,15 @@ def supervise_loop(stop_flag: threading.Event | None = None,
     процессу, кто первый её взял; остальные молча ждут своей очереди (и
     подхватят надзор, если владелец умрёт — блокировку снимет ОС). Поэтому
     окно программы и фоновая копия не мешают друг другу.
+
+    ⚠️ Промт КАРМАНА #185: демон, который **был жив и упал**, — это сбой самой
+    программы ⇒ отчёт с видом `crash` ⇒ задача «Управляющему» (починить код
+    и выпустить обновление). Отчёт идёт только по переходу «жив → мёртв»:
+    при старте программы демоны ещё не подняты — это не сбой.
     """
     stop_flag = stop_flag or threading.Event()
     lock = lock if lock is not None else minigen_lock.get_lock()
+    alive_seen: dict[str, bool] = {}
     while not stop_flag.is_set():
         if not lock.acquire():
             # надзиратель есть — второй не нужен (две копии лечащего брали
@@ -418,7 +457,14 @@ def supervise_loop(stop_flag: threading.Event | None = None,
             continue
         for spec in DAEMONS:
             try:
-                if not daemon_pids(spec):
+                key = str(spec.get("script") or "")
+                alive = bool(daemon_pids(spec))
+                was_alive = bool(alive_seen.get(key))
+                alive_seen[key] = alive
+                if was_alive and not alive and not _just_replaced(spec):
+                    _report_crash("демон «%s» (%s) упал — программа осталась без "
+                                  "этой функции" % (spec["name"], spec["role"]))
+                if not alive:
                     res = start(spec, grace=GRACE)
                     if res.get("ok"):
                         try:
