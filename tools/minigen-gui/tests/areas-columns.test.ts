@@ -2,6 +2,7 @@ import { existsSync, readFileSync } from 'fs'
 import { join } from 'path'
 import { describe, expect, it } from 'vitest'
 import { AREA_COLUMNS, sortColumnsHint } from '../src/renderer/src/tabs/areas-sort'
+import { TABS } from '../src/renderer/src/tabs/tabs'
 import { DRIVER_BUTTONS, DRIVER_LABELS, DRIVER_VALUES } from '../src/renderer/src/tabs/driver-view'
 
 /**
@@ -9,13 +10,19 @@ import { DRIVER_BUTTONS, DRIVER_LABELS, DRIVER_VALUES } from '../src/renderer/sr
  * положения водителя — заказ владельца 27.11; **колонки переименованы и
  * «Режим» убран** — промт КАРМАНА #182).
  *
+ * ⚠️ Заказ владельца 28.11: «Области» и «Агенты» — одна вкладка. Сторож
+ * смотрит в **объединённую** вкладку «Агенты»: отдельного файла вкладки
+ * «Области» больше нет, и он не должен появиться снова (иначе в окне опять
+ * будут две таблицы, показывающие разное).
+ *
  * Падает, если:
  * - колонка «Режим» вернётся (или вернётся её модуль с кнопками);
  * - появится путь, отключающий автомат аккаунтов из окна;
  * - колонка «Сессии» (бывшая «Водитель») или «Состояние» (бывшие «Сессии»)
  *   переименуется обратно или съедет из шапки;
  * - «Водитель» снова станет выпадающим меню или разойдётся с ядром (окно и
- *   ядро — разные словари).
+ *   ядро — разные словари);
+ * - вернётся отдельная вкладка «Области».
  *
  * Ядро читается прямо из репозитория (`minigen_core.py`) — так словарь
  * сверяется с тем, что реально поедет на машину.
@@ -27,7 +34,7 @@ const core = readFileSync(
   join(__dirname, '../../minimax-project-areas/minigen_core.py'),
   'utf8'
 )
-const tab = readFileSync(join(tabs, 'AreasTab.tsx'), 'utf8')
+const tab = readFileSync(join(tabs, 'AgentsTab.tsx'), 'utf8')
 const api = readFileSync(join(src, 'renderer', 'src', 'api.ts'), 'utf8')
 const styles = readFileSync(join(src, 'renderer', 'src', 'styles.css'), 'utf8')
 
@@ -170,5 +177,15 @@ describe('сторож на переключатели списка област
     )
     expect(watcher).toContain('водитель — %s')
     expect(core).toContain('водитель сессий проекта')
+  })
+
+  it('отдельной вкладки «Области» больше нет: список один — «Агенты»', () => {
+    // Заказ владельца 28.11: «Области» и «Агенты» — одно и то же. Две
+    // таблицы, показывающие разное, и породили живую беду: агент, созданный
+    // в «Агентах», не появлялся в «Рабочих областях».
+    expect(existsSync(join(tabs, 'AreasTab.tsx'))).toBe(false)
+    expect(TABS.map((item) => item.id)).not.toContain('areas')
+    expect(TABS.map((item) => item.label)).not.toContain('Области')
+    expect(TABS.map((item) => item.label)).toContain('Агенты')
   })
 })

@@ -87,6 +87,12 @@ export const api = {
   relogin: (slug: string) => call<{ ok: boolean; error?: string }>('areas.relogin', { slug }),
   createArea: (payload: Record<string, unknown>) =>
     call<{ ok: boolean; error?: string; slug?: string }>('areas.create', payload),
+  /**
+   * Пересобрать список областей по машине (после потери локального
+   * конфига): конфиг, его копия, каталоги данных и реестр агентов.
+   */
+  areasRebuild: () =>
+    call<{ ok: boolean; error?: string; areas?: number; added?: string[] }>('areas.rebuild'),
   sessions: (slug: string) => call<{ sessions: unknown[] }>('sessions.list', { slug }),
   networkCheck: () => call<NetworkState>('network.check'),
   journal: (params: { limit?: number; contains?: string; tag?: string }) =>

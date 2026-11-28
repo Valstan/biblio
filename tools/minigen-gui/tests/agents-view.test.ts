@@ -1,10 +1,11 @@
 import { describe, expect, it } from 'vitest'
-import type { AgentsSnapshot, KarmanChannel } from '../src/shared/types'
+import type { AgentsSnapshot, Area, KarmanChannel } from '../src/shared/types'
 import {
   agentRows,
   applyConfirmText,
   channelView,
   createConfirmText,
+  mergedRows,
   registrySummary,
   registryWarning,
   validateDraft
@@ -70,7 +71,10 @@ describe('вкладка «Агенты»', () => {
     expect(rows[0].title).toBe('Идеи')
     expect(rows[0].slug).toBe('ideas')
     expect(rows[0].repo).toBe('Valstan/ideas')
-    expect(rows[0].area).toBe('p-ideas')
+    // ⚠️ Имя области — **без** `p-`: каталог данных называется `p-ideas`,
+    // а в списке — имя. Живой случай 28.11: манифест лежал с `area: p-ideas`,
+    // и области `p-ideas` не существовало — агент и область не сошлись.
+    expect(rows[0].area).toBe('ideas')
     expect(rows[0].role).toContain('зачиток')
     expect(rows[0].requests).toBe(1)
     expect(rows[0].missing).toEqual([])
@@ -82,7 +86,7 @@ describe('вкладка «Агенты»', () => {
     )
     expect(rows[0].title).toBe('sarafan')
     expect(rows[0].role).toBe('—')
-    expect(rows[0].area).toBe('p-sarafan')
+    expect(rows[0].area).toBe('sarafan')
     expect(rows[0].missing).toEqual(['название', 'роль', 'область'])
   })
 
@@ -145,7 +149,74 @@ describe('вкладка «Агенты»', () => {
     const row = agentRows(snapshot())[0]
     const apply = applyConfirmText(row)
     expect(apply).toContain('Valstan/ideas')
-    expect(apply).toContain('p-ideas')
+    expect(apply).toContain('ideas')
     expect(apply).toContain('Продолжить?')
+  })
+})
+
+/**
+ * Объединённый список «Агенты» (заказ владельца 28.11: «Области» и
+ * «Агенты» — одно и то же).
+ *
+ * Живой случай, который всё это чинит: в окне было две таблицы, и агент,
+ * созданный в «Агентах», **не появлялся** в «Рабочих областях». Список
+ * один — строка это область, а агент её содержание.
+ */
+function area(over: Partial<Area> = {}): Area {
+  return {
+    slug: 'ideas',
+    title: 'Идеи',
+    folder: 'D:/valstan/REPO/ideas',
+    karman: 'ideas',
+    autoheal: true,
+    dir: 'C:/Users/valstan/.minimax-areas/p-ideas',
+    running: true,
+    exists: true,
+    account: { state: 'есть вход' },
+    sessions: [],
+    ...over
+  }
+}
+
+describe('объединённый список «Агенты»', () => {
+  it('агент и его область — одна строка', () => {
+    const rows = mergedRows([area()], snapshot())
+    expect(rows).toHaveLength(1)
+    expect(rows[0].area).toBe('ideas')
+    expect(rows[0].agent?.title).toBe('Идеи')
+    expect(rows[0].live?.slug).toBe('ideas')
+    expect(rows[0].areaMissing).toBe(false)
+    expect(rows[0].requests).toBe(1)
+  })
+
+  it('манифест со старым `p-ideas` сошёлся с областью `ideas`', () => {
+    // Мост отдаёт имя области без префикса, но старый манифест может ещё
+    // лежать с `p-ideas` — и тогда агент и область не сошлись бы.
+    const rows = mergedRows([area()], snapshot())
+    expect(rows[0].agent).not.toBeNull()
+    expect(rows[0].areaMissing).toBe(false)
+  })
+
+  it('агент без области — строка с пометкой «область не заведена»', () => {
+    const rows = mergedRows([], snapshot())
+    expect(rows).toHaveLength(1)
+    expect(rows[0].area).toBe('ideas')
+    expect(rows[0].live).toBeNull()
+    expect(rows[0].areaMissing).toBe(true)
+    expect(rows[0].agent?.title).toBe('Идеи')
+  })
+
+  it('область без агента — тоже строка (обычная рабочая область)', () => {
+    const rows = mergedRows([area({ slug: 'sarafan', title: 'Сарафан' })], snapshot())
+    expect(rows).toHaveLength(2)
+    const sarafan = rows.find((row) => row.area === 'sarafan')
+    expect(sarafan?.agent).toBeNull()
+    expect(sarafan?.live?.title).toBe('Сарафан')
+    expect(sarafan?.areaMissing).toBe(false)
+  })
+
+  it('пустой реестр и пустые области — пустой список, а не ошибка', () => {
+    expect(mergedRows([], snapshot({ agents: [] }))).toEqual([])
+    expect(mergedRows([], null)).toEqual([])
   })
 })
