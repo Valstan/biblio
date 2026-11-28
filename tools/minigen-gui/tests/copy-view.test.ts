@@ -16,6 +16,9 @@ import {
   modeView,
   newWorksPhrase,
   newWorksView,
+  notWantedRows,
+  ratingView,
+  rollbackConfirmText,
   suggestionRows
 } from '../src/renderer/src/tabs/copy-view'
 
@@ -362,5 +365,109 @@ describe('локальный режим: окно предлагает выхо�
 
   it('нет ответа моста — предложения нет, а не выдуманный локальный режим', () => {
     expect(localOfferView(null).local).toBe(false)
+  })
+})
+
+/**
+ * Рейтинг, откат и внешний вид (промт КАРМАНА #187).
+ *
+ * Проверяем то, что владелец видит **до** решения «ставить ген или нет»:
+ * число голосов и среднюю оценку, пометку «уже ставили и откатывали» и
+ * предупреждение, что ген меняет оформление.
+ */
+describe('рейтинг генов и откат (промт #187)', () => {
+  it('рейтинг без голосов — честное «оценок нет», а не ноль', () => {
+    const view = ratingView({ votes: 0, average: 0, my_vote: 0 })
+    expect(view.has).toBe(false)
+    expect(view.score).toBe('—')
+    expect(view.text).toContain('оценок нет')
+    expect(view.stars).toBe('')
+  })
+
+  it('рейтинг с голосами — средняя оценка, звёздочки и число голосов', () => {
+    const view = ratingView({ votes: 5, average: 8.3, my_vote: 8 })
+    expect(view.has).toBe(true)
+    expect(view.score).toBe('8,3')
+    expect(view.votes).toBe(5)
+    expect(view.stars).toBe('★★★★★★★★☆☆')
+    expect(view.text).toContain('голосов: 5')
+    expect(view.mine).toBe(8)
+  })
+
+  it('нет данных моста — рейтинга нет, а не «ноль голосов»', () => {
+    expect(ratingView(null).has).toBe(false)
+  })
+
+  it('откатанные гены — отдельной строкой с пометкой', () => {
+    const rows = notWantedRows({
+      ...suggestions(),
+      not_wanted: [
+        {
+          id: 'g-9',
+          title: 'Спорная наработка',
+          summary: '',
+          author: 'mg-abc123',
+          created_at: Date.UTC(2026, 10, 28, 9, 0, 0),
+          files: [],
+          why: 'уже ставили и откатывали — ставить не хотим'
+        },
+        {
+          id: 'g-10',
+          title: 'Не нужная',
+          summary: '',
+          author: 'mg-abc123',
+          created_at: Date.UTC(2026, 10, 28, 9, 0, 0),
+          files: [],
+          why: 'помечен «не ставить»'
+        }
+      ]
+    })
+    expect(rows).toHaveLength(2)
+    expect(rows[0].gene).toBe('g-9')
+    expect(rows[0].rolledBack).toBe(true)
+    expect(rows[0].why).toContain('откатывали')
+    expect(rows[1].rolledBack).toBe(false)
+    expect(notWantedRows(null)).toEqual([])
+  })
+
+  it('подтверждение внедрения показывает рейтинг до кнопки', () => {
+    const row = suggestionRows({
+      ...suggestions(),
+      suggestions: [
+        {
+          ...suggestions().suggestions[0],
+          rating: { votes: 3, average: 7.5, my_vote: 7 }
+        }
+      ]
+    })[0]
+    const text = adoptConfirmText(row)
+    expect(text).toContain('Рейтинг')
+    expect(text).toContain('7,5')
+    expect(text).toContain('голосов: 3')
+  })
+
+  it('подтверждение внедрения предупреждает про внешний вид', () => {
+    const row = suggestionRows({
+      ...suggestions(),
+      suggestions: [
+        {
+          ...suggestions().suggestions[0],
+          touches_appearance: true,
+          appearance_files: ['tools/minigen-gui/src/renderer/src/styles.css']
+        }
+      ]
+    })[0]
+    const text = adoptConfirmText(row)
+    expect(text).toContain('внешний вид')
+    expect(text).toContain('styles.css')
+    expect(text).toContain('явного решения')
+  })
+
+  it('откат — с подтверждением и словами «как было»', () => {
+    const text = rollbackConfirmText('g-9', 'Спорная наработка')
+    expect(text).toContain('Спорная наработка')
+    expect(text).toContain('до внедрения')
+    expect(text).toContain('«не ставить»')
+    expect(text).toContain('Продолжить?')
   })
 })

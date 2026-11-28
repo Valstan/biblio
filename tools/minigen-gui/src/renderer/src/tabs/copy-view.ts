@@ -17,17 +17,64 @@ import type {
   CopyMode,
   CopyModeOption,
   CopyOffer,
+  GeneRating,
   GeneSuggestions
 } from '@shared/types'
 import { formatDateTime } from '../time'
 
 export type Tone = 'ok' | 'warn' | 'bad'
 
+/** Шкала оценок: звёздочки от 1 до 10 (заказ владельца 28.11). */
+export const STAR_MAX = 10
+
 /** Строка состояния: тон, короткая подпись и подробности (почему так). */
 export interface StatusView {
   tone: Tone
   label: string
   detail: string
+}
+
+/**
+ * Рейтинг гена — то, что видит владелец **до** решения «ставить или нет».
+ *
+ * ⚠️ Показываем **и** среднюю оценку, **и** число голосов: у одного гена
+ * голосов может быть много, у другого — один, и решение без числа голосов
+ * было бы половиной правды (промт КАРМАНА #187).
+ */
+export interface RatingView {
+  /** средняя оценка с одним знаком: «8,3» (пусто — голосов нет) */
+  score: string
+  /** число голосов */
+  votes: number
+  /** «★★★★☆» — десять позиций, закрашено по средней */
+  stars: string
+  /** текст для окна: «8,3 ★★★★☆ — голосов: 5» */
+  text: string
+  /** моя оценка (0 — не голосовал) */
+  mine: number
+  /** есть ли голоса вообще */
+  has: boolean
+}
+
+/** Рейтинг гена для окна: пусто, ноль и «нет данных» — разные вещи. */
+export function ratingView(rating: GeneRating | null | undefined): RatingView {
+  const votes = Math.max(0, Math.trunc(Number(rating?.votes ?? 0)))
+  const average = Number(rating?.average ?? 0)
+  const mine = Math.trunc(Number(rating?.my_vote ?? 0))
+  if (!votes) {
+    return { score: DASH, votes: 0, stars: '', text: 'оценок нет', mine: 0, has: false }
+  }
+  const filled = Math.min(STAR_MAX, Math.max(0, Math.round(average)))
+  const stars = '★'.repeat(filled) + '☆'.repeat(STAR_MAX - filled)
+  const score = average.toFixed(1).replace('.', ',')
+  return {
+    score,
+    votes,
+    stars,
+    text: `${score} ${stars} — голосов: ${votes}`,
+    mine,
+    has: true
+  }
 }
 
 /** Чужая наработка — одна строка таблицы подсказок. */
@@ -38,6 +85,32 @@ export interface SuggestionRow {
   why: string
   fits: boolean
   files: string[]
+  created: string
+  /** рейтинг гена: голоса и средняя оценка */
+  rating: RatingView
+  /** трогает ли ген внешний вид программы */
+  touchesAppearance: boolean
+  /** какие файлы трогают внешний вид */
+  appearanceFiles: string[]
+  /** откатывали ли этот ген в другой копии */
+  rolledBackElsewhere: boolean
+}
+
+/**
+ * Ген, который эта копия не ставит (откатывала или пометила «не ставить»).
+ *
+ * ⚠️ Такие гены **не попадают** в список чужих наработок — они видны
+ * отдельной строкой с пометкой (промт КАРМАНА #187).
+ */
+export interface NotWantedRow {
+  gene: string
+  title: string
+  author: string
+  /** почему не ставим */
+  why: string
+  /** откатывали ли (а не просто пометили) */
+  rolledBack: boolean
+  rating: RatingView
   created: string
 }
 
@@ -245,25 +318,82 @@ export function suggestionRows(data: GeneSuggestions | null): SuggestionRow[] {
     why: (item.why || '').trim() || DASH,
     fits: item.fits === true,
     files: (item.files ?? []).filter(Boolean),
-    created: formatDateTime(item.created_at) || DASH
+    created: formatDateTime(item.created_at) || DASH,
+    rating: ratingView(item.rating),
+    touchesAppearance: item.touches_appearance === true,
+    appearanceFiles: (item.appearance_files ?? []).filter(Boolean),
+    rolledBackElsewhere: item.rolled_back_elsewhere === true
   }))
+}
+
+/**
+ * Строки «не ставим»: откатанные и помеченные «не ставить».
+ *
+ * ⚠️ Отдельным списком, а не внутри чужих наработок: хозяйка копии не
+ * должна снова предлагать то, что уже откатывали.
+ */
+export function notWantedRows(data: GeneSuggestions | null): NotWantedRow[] {
+  if (!data) return []
+  return (data.not_wanted ?? []).map((item) => {
+    const why = (item.why || '').trim() || DASH
+    return {
+      gene: (item.id || '').trim() || DASH,
+      title: (item.title || '').trim() || DASH,
+      author: (item.author || '').trim() || DASH,
+      why,
+      rolledBack: why.includes('откатывали'),
+      rating: ratingView(item.rating),
+      created: formatDateTime(item.created_at) || DASH
+    }
+  })
 }
 
 /**
  * Подтверждение внедрения чужой наработки.
  *
  * ⚠️ Чужое попадает в программу только через ветку и PR, а решение — за
- * владельцем: окно обязано сказать это до кнопки, а не после.
+ * владельцем: окно обязано сказать это до кнопки, а не после. И отдельно —
+ * **рейтинг** и **«меняет внешний вид»**: по решению владельца он должен
+ * видеть их **до** кнопки «Внедрить» (промт КАРМАНА #187).
  */
 export function adoptConfirmText(row: SuggestionRow): string {
   const files = row.files.length ? row.files.join(', ') : DASH
+  const rating = row.rating.has ? `Рейтинг: ${row.rating.text}\n` : 'Рейтинг: оценок нет\n'
+  const appearance = row.touchesAppearance
+    ? `\n⚠️ Ген меняет внешний вид программы (${row.appearanceFiles.join(', ') || DASH}).` +
+      ' Без вашего явного решения я его не внедрю.\n'
+    : ''
+  const elsewhere = row.rolledBackElsewhere
+    ? '\nЭтот ген в другой копии уже откатывали — посмотрите внимательно.\n'
+    : ''
   return (
     `Внедрить наработку «${row.title}» (ген ${row.gene}) от ${row.author}?\n\n` +
     `Файлы: ${files}\n` +
-    `Почему подходит: ${row.why}\n\n` +
-    'Внедрение идёт через ветку и PR в репозиторий программы: сначала ветка и ' +
+    `Почему подходит: ${row.why}\n` +
+    rating +
+    appearance +
+    elsewhere +
+    '\nВнедрение идёт через ветку и PR в репозиторий программы: сначала ветка и ' +
     'проверки, потом PR.\n' +
     'Решение за вами: без вашего решения в программу ничего не попадёт.\n\n' +
+    'Продолжить?'
+  )
+}
+
+/**
+ * Подтверждение отката гена.
+ *
+ * ⚠️ Откат меняет код программы ⇒ решение остаётся за владельцем, и окно
+ * говорит прямо, что произойдёт: состояние вернётся к тому, что было до
+ * внедрения, а ген будет помечен «не ставить».
+ */
+export function rollbackConfirmText(gene: string, title?: string): string {
+  const name = (title || '').trim() || (gene || '').trim() || DASH
+  return (
+    `Откатить ген «${name}»?\n\n` +
+    'Откат отменит коммит гена в ветке, где он стоит, и вернёт состояние ' +
+    'программы к тому, что было до внедрения.\n' +
+    'Ген будет помечен «не ставить» и больше не предложится.\n\n' +
     'Продолжить?'
   )
 }
