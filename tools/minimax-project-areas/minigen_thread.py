@@ -359,6 +359,28 @@ def extract_section(text: str, keywords: tuple[str, ...]) -> str:
     return "\n".join(out).strip()
 
 
+def work_fingerprint(passport: dict[str, Any]) -> str:
+    """Отпечаток **состояния работы** нитки — «продвинулась ли работа».
+
+    ⚠️ ПРОМТ КАРМАНА #184 (риск из живой проверки): перенос нитки не должен
+    крутиться вхолостую («сессия за сессией, а работы столько же»). Сравнивать
+    **прозу** сводки ненадёжно: новая сессия ответит «всё уже сделано», сводка
+    изменится — и кружение продолжится. Поэтому сравниваем **работу**: коммиты
+    ветки, число открытых PR и счётчик «впереди origin/master».
+
+    Пустой отпечаток — сравнивать нечего (репозитория нет) ⇒ кружение не
+    блокируем.
+    """
+    commits = [str(c or "") for c in (passport.get("commits") or [])][:8]
+    prs = sorted(str((p or {}).get("number") or "")
+                 for p in (passport.get("prs") or []) if isinstance(p, dict))
+    branch = str(passport.get("branch") or "")
+    if not branch and not commits and not prs:
+        return ""
+    return "|".join([branch, str(len(commits)), ",".join(commits),
+                     ",".join(prs), str(int(passport.get("ahead") or 0))])
+
+
 def build_passport(area: dict, sess: dict, context: dict[str, Any],
                    report: dict[str, Any] | None = None) -> dict[str, Any]:
     """Паспорт нитки: что делалось, что осталось, где работать, что принять.

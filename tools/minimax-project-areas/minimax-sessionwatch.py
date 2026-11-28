@@ -1323,7 +1323,11 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         arc = archive_session(area["dir"], sess["session_id"])
         report["steps"].append({"archived": arc})
         report["ok"] = bool(arc.get("ok"))
-        report["why"] = "завершено по решению «Управляющего»: %s" % arc.get("why")
+        # ⚠️ Промт #184, п. 2: правда в журнале — «завершено по решению
+        # «Управляющего»» писалось даже тогда, когда решение приняло правило-
+        # фолбэк. Источник решения — его настоящее имя.
+        report["why"] = ("завершено по решению «%s»: %s"
+                         % (decision.get("source") or ROLE_RULE, arc.get("why")))
         return report
     if action == thread.NEW_SESSION:
         # Перенос нитки: паспорт → завершение → архив → новая сессия.
@@ -1385,19 +1389,30 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         # новая сессия не поднимается: иначе нитка крутится вхолостую (сессия
         # за сессией, а работы столько же). Запись — в состоянии сторожа, по
         # нитке (thread_id).
+        #
+        # ⚠️ ПРОМТ КАРМАНА #184: сравнивать **прозу** сводки ненадёжно — новая
+        # сессия ответит «всё уже сделано», сводка изменится, и кружение
+        # продолжится. Поэтому сравниваем **состояние работы** (коммиты, PR,
+        # «впереди origin/master»): работа не продвинулась — новая сессия не
+        # поднимается.
         rot = state.setdefault("rotations", {})
         tid = str(passport.get("thread_id") or "")
         prev = rot.get(tid) or {}
         done_now = summary.strip()
-        if prev and done_now and done_now == str(prev.get("done") or "").strip():
-            rot[tid] = {"done": done_now, "at": core.now_ms()}
+        fingerprint = thread.work_fingerprint(passport)
+        prev_fp = str(prev.get("fp") or "")
+        same_prose = bool(done_now and done_now == str(prev.get("done") or "").strip())
+        same_work = bool(fingerprint and prev_fp and fingerprint == prev_fp)
+        if prev and (same_prose or same_work):
+            rot[tid] = {"done": done_now, "at": core.now_ms(), "fp": fingerprint}
             report["ok"] = True
-            report["why"] = ("нитка не продвинулась с прошлого переноса — "
-                             "новая сессия не поднимается")
+            report["why"] = ("нитка не продвинулась с прошлого переноса (%s) — "
+                             "новая сессия не поднимается"
+                             % ("работа та же" if same_work else "та же сводка"))
             core.log("СЕССИИ: %s — нитка не продвинулась с прошлого переноса: "
                      "новая сессия не поднимается" % sess["session_id"][:12])
             return report
-        rot[tid] = {"done": done_now, "at": core.now_ms()}
+        rot[tid] = {"done": done_now, "at": core.now_ms(), "fp": fingerprint}
         opened = new_session(area, text, folder=str(passport.get("worktree") or ""),
                              by_decision=by_decision)
         report["steps"].append({"new_session": opened})

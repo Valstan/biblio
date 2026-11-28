@@ -4,7 +4,7 @@
 Живой случай, который чинится (27–28.11): агент закончил сессию и напечатал
 итоговую сводку, а МиниГен продолжал слать ему «Продолжай» и «заверши сессию»
 — 27 команд подряд в одну и ту же сессию (журнал `minigen-carousel.log`:
-«команда закрытия сессии mvs_47c60cc5 — ход пошёл», раз в полторы минуты).
+«команда закрытия сессии … — ход пошёл», раз в полторы минуты).
 
 Что проверяем (критерии приёмки промта #184):
 
@@ -499,8 +499,46 @@ def main() -> int:
               "фолбэк потребовал завершения без отчёта")
         check(not rec.opened, "фолбэк перенёс нитку без решения управляющего")
 
-        # ── 8) Сторож падает (временная правка) ──
-        print("8) временная правка: без стражи приёмка обязана падать")
+        # ── 8) Правда в журнале: решение называется настоящим именем ──
+        print("8) в журнале правда: кто принял решение — так и написано")
+        watcher, rec, area, area_dir, repo = scenario("s8")
+        add_session(area_dir, repo, "sess-lie", "abandoned", title="нить")
+        add_compaction(area_dir, "sess-lie")
+        rec.answer = None                          # модель недоступна ⇒ правило
+        state = {}
+        verdicts = watcher.survey(area, state)
+        watcher.act(area, verdicts, state)
+        check(rec.journal_has("правило-фолбэк"),
+              "в журнале нет имени настоящего источника решения: %s" % rec.logs[-3:])
+        check(not rec.journal_has("решение принял «Управляющий»"),
+              "решение по правилу названо решением «Управляющего» (ложь): %s"
+              % rec.logs[-3:])
+
+        # ── 9) Перенос не крутится: работа не продвинулась — сессии нет ──
+        print("9) перенос нитки не крутится: работа не продвинулась")
+        watcher, rec, area, area_dir, repo = scenario("s9")
+        add_session(area_dir, repo, "sess-rot1", "finished", title="нить")
+        rec.answer = {"ok": True, "action": watcher.thread.CONTINUE,
+                      "instruction": "продолжи", "reason": "работа закончена"}
+        state = {}
+        verdicts = watcher.survey(area, state)
+        watcher.act(area, verdicts, state)
+        check(len(rec.opened) == 1,
+              "первый перенос не открыл новую сессию: %s" % len(rec.opened))
+        # Вторая завершённая сессия той же нитки: работа та же (git не двинулся)
+        # ⇒ новая сессия не поднимается.
+        add_session(area_dir, repo, "sess-rot2", "finished", title="нить")
+        rec.opened.clear()
+        verdicts = watcher.survey(area, state)
+        watcher.act(area, verdicts, state)
+        check(not rec.opened,
+              "нить крутится: работа не продвинулась, а сессия новая открыта: %s"
+              % rec.opened[:1])
+        check(rec.journal_has("нитка не продвинулась"),
+              "в журнале нет «нитка не продвинулась»: %s" % rec.logs[-3:])
+
+        # ── 10) Сторож падает (временная правка) ──
+        print("10) временная правка: без стражи приёмка обязана падать")
         watcher, rec, area, area_dir, repo = scenario("s8")
         broken = load_watcher(root / "s8" / "passports-broken.json",
                               root / "s8" / "sends-broken.json", broken="closed")
