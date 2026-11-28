@@ -70,6 +70,26 @@ def _log(step: str, text: str, status: str = "info") -> None:
         pass
 
 
+def _report(text: str, level: str = "info", kind: str = "log",
+            core: Any = None) -> None:
+    """Отчёт в «ящик отчётов» — чтобы «Управляющий» видел ход обновления.
+
+    ⚠️ Промт КАРМАНА #185: задача по ошибке программы доводится **до
+    обновления**, и в отчёте должно быть видно, что обновление вышло. Отчёт
+    идёт обычным видом `log` — это не сбой программы, а факт работы.
+
+    `core` — ядро для отчёта (по умолчанию — боевое на машине; приёмка
+    подставляет своё, чтобы не трогать живое состояние).
+    """
+    try:
+        if core is None:
+            import minigen_state as state
+            core = state.load_daemons()["core"]
+        core.report(level, kind, text)
+    except Exception:  # noqa: BLE001 — отчёт не должен ронять обновление
+        pass
+
+
 # ──────────────────────────────────────────────────────────────── git
 
 def _git(args: list[str], cwd: Path, timeout: int = 120) -> tuple[int, str, str]:
@@ -374,8 +394,14 @@ def _run() -> None:
              % version.get("commit"), "ok")
         with _lock:
             _last = {"ok": True, "installed": version, "at": int(time.time() * 1000)}
+        # ⚠️ Промт КАРМАНА #185: обновление вышло — это должно быть **видно**
+        # в «ящике отчётов»: по этому факту «Управляющий» понимает, что задача
+        # по ошибке программы доведена до конца.
+        _report("обновление вышло: программа обновлена до %s, демоны "
+                "перезапущены" % (version.get("commit") or "—"))
     except Exception as exc:  # noqa: BLE001
         _fail("done", "обновление прервалось: %s" % exc)
+        _report("обновление не вышло: %s" % exc, "warn")
     finally:
         with _lock:
             _running = False

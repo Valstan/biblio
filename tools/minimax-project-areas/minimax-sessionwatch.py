@@ -1834,6 +1834,27 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
             core.log("СЕССИИ: %s — сессия %s упала на нестабильности модели, вендор ожил: %s" % (
                 slug, v["session_id"][:12], res.get("why")))
             continue
+        if v["verdict"] == "ошибка":
+            # ⚠️ Промт КАРМАНА #185: ход агента упал, и это **не сеть и не
+            # вендор** (эти два случая разобраны выше). Значит, сообщение —
+            # **вывод сессии другого агента**: «Управляющий» должен ответить
+            # агенту или взять нитку под управление, а **не** чинить код
+            # программы. Поэтому источник — `agent`, а не `minigen`.
+            note = "ход сессии упал: %s" % (v.get("reason") or "без текста")
+            try:
+                core.report_crash(note, area=slug,
+                                  source=getattr(core, "SOURCE_AGENT", "agent"))
+            except Exception:  # noqa: BLE001 — отчёт не должен ронять демона
+                try:
+                    core.report("error", "crash", note, area=slug)
+                except Exception:  # noqa: BLE001
+                    pass
+            actions.append({"session": v["session_id"],
+                            "action": "ход упал (не сеть и не вендор) — "
+                                      "ждёт «Управляющего»"})
+            core.log("СЕССИИ: %s: %s — вывод сессии агента, ждёт «Управляющего»"
+                     % (slug, note))
+            continue
         if v["verdict"] in ("брошена", "есть оборванные субагенты"):
             # ⚠️ ПРОМТ #174: вторая сессия в проекте не поднимается, пока
             # живая сессия (своя или чужая). Здесь мы ничего не поднимаем —

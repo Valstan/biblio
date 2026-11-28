@@ -76,3 +76,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_agents_ecosystem.py
       - name: Приёмка «закрытая сессия — команда не отправляется» (промт #184)
         run: python3 tools/minimax-project-areas/test_session_finished_no_repeat.py
+      - name: Приёмка «свои критические ошибки — задача Управляющему» (промт #185)
+        run: python3 tools/minimax-project-areas/test_program_errors_185.py

@@ -65,6 +65,7 @@ import minigen_prompts as prompts_mod  # noqa: E402
 import minigen_council as council_mod  # noqa: E402
 import minigen_install as install_mod  # noqa: E402
 import minigen_repos as repos_mod      # noqa: E402
+import minigen_errors as errors_mod     # noqa: E402 — свои критические ошибки (#185)
 from minigen_agent import Agent, ModelUnavailable  # noqa: E402
 
 POINTS_TTL_MS = 60_000
@@ -327,10 +328,18 @@ class Bridge:
                         self._log_prompt_note(item)
             except Exception as exc:  # noqa: BLE001
                 # Автораздача не должна ронять программу: сбой — в журнал.
+                #
+                # ⚠️ Промт КАРМАНА #185: сбой фоновой функции программы —
+                # это сбой **самой программы** (вид `crash`), а не ошибка
+                # инструмента: автораздача промтов молча перестала работать.
+                # Повтор той же ошибки не полезет к «Управляющему» — окно
+                # полчаса.
                 try:
                     self.core.log("ПРОМТЫ: автораздача не прошла: %s" % exc)
                 except Exception:  # noqa: BLE001
                     pass
+                errors_mod.report_crash(self.core,
+                                        "автораздача промтов не прошла: %s" % exc)
 
     def _log_prompt_note(self, item: dict[str, Any]) -> None:
         """Причина отказа раздачи — в журнал, но **без повторов**.
@@ -514,6 +523,9 @@ class Bridge:
             "repos.list": self.cmd_repos_list,
             "repos.read": self.cmd_repos_read,
             "repos.profile": self.cmd_repos_profile,
+            # свои критические ошибки: что ушло Управляющему и когда окно
+            # откроется снова (промт КАРМАНА #185)
+            "errors.list": self.cmd_errors_list,
         }
 
     # Команды, чей вызов **не** отчитывается в «ящик отчётов»: иначе
@@ -538,7 +550,13 @@ class Bridge:
             # честно (`ok: false`), а не отдать «успешный» пустой ответ —
             # иначе окно показывает нули и молчит о поломке (живой случай
             # 24.11: `fmt_ms()` — TypeError, а в шапке «0 областей»).
-            result = {"error": "%s: %s" % (type(exc).__name__, exc), "__failed__": True}
+            #
+            # ⚠️ Промт КАРМАНА #185: **исключение моста** — это сбой самой
+            # программы (`__crash__`), а не «ошибка инструмента» (когда
+            # команда отработала и честно вернула отказ). По этому признаку
+            # сбой уходит «Управляющему» как задача на правку кода.
+            result = {"error": "%s: %s" % (type(exc).__name__, exc),
+                      "__failed__": True, "__crash__": True}
         self._report_call(cmd, result)
         return result
 
@@ -546,19 +564,31 @@ class Bridge:
         """Отчёт о работе инструмента — в «ящик отчётов» (заказ 24.11).
 
         Инструменты сами рассказывают нейросети, что сделали и где ошиблись.
+
+        ⚠️ Промт КАРМАНА #185: сбой **самой программы** (мост упал) и ошибка
+        **инструмента** (инструмент отработал и вернул отказ) — разные вещи.
+        Первый — вид `crash` (задача «починить код программы»), второй — вид
+        `tool` (обычный отчёт).
         """
         if cmd.startswith(self.NO_REPORT_CMDS):
             return
         try:
             error = str((result or {}).get("error") or "")
-            if error:
+            crash = bool((result or {}).get("__crash__"))
+            if crash:
                 text = "%s: %s" % (cmd, error)
                 level = "error"
+                kind = errors_mod.KIND_CRASH
+            elif error:
+                text = "%s: %s" % (cmd, error)
+                level = "error"
+                kind = "tool"
             else:
                 ok = (result or {}).get("ok")
                 text = "%s: %s" % (cmd, "ок" if ok is not False else "сделано")
                 level = "info"
-            self.core.report(level, "tool", text)
+                kind = "tool"
+            self.core.report(level, kind, text)
         except Exception:  # noqa: BLE001
             pass        # отчёт — дополнительный канал, его поломка не важна
 
@@ -1200,6 +1230,25 @@ class Bridge:
         path = str(getattr(self.core, "REPORTS", ""))
         return {"reports": items, "path": path}
 
+    def cmd_errors_list(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Свои критические ошибки: по отпечатку — когда уходила, в работе ли.
+
+        ⚠️ Промт КАРМАНА #185, п. 4: «по отпечатку ошибки видно, когда она
+        последний раз уходила и что она в работе; через полчаса окно открывается
+        снова». Здесь — ровно это.
+        """
+        try:
+            items = errors_mod.view()
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": str(exc)}
+        out = []
+        for item in items:
+            row = dict(item)
+            row["last_sent"] = self._fmt_ms(int(item.get("last_sent_ms") or 0))
+            row["unblock_at"] = self._fmt_ms(int(item.get("unblock_ms") or 0))
+            out.append(row)
+        return {"ok": True, "errors": out, "window_min": 30}
+
     def _reports(self, limit: int = 50, level: str = "",
                  since_ms: int = 0) -> list[dict[str, Any]]:
         """Прочитать отчёты (ядро на машине может быть старее программы)."""
@@ -1216,6 +1265,10 @@ class Bridge:
 
         Нейросеть «Управляющий» сама узнаёт, что сторож и инструменты
         сделали, пока её не спрашивали.
+
+        ⚠️ Промт КАРМАНА #185: сбои самой программы в эту ленту **не попадают**
+        — они уходят отдельной задачей (`_program_tasks`). Иначе ошибка была бы
+        «просто строчкой в ленте отчётов», а не задачей на правку кода.
         """
         seen = 0
         try:
@@ -1235,6 +1288,8 @@ class Bridge:
             pass
         lines = []
         for item in reversed(items):       # от старых к новым — как в журнале
+            if errors_mod.is_crash(item):
+                continue                   # сбой программы — это задача
             # Время — по Москве (заказ владельца 24.11): одна зона на всю
             # программу, а не зона машины.
             stamp = self.core.fmt_ms(int(item.get("ts") or 0))
@@ -1242,8 +1297,59 @@ class Bridge:
             level = str(item.get("level") or "info")
             lines.append("[%s] %s/%s: %s" % (stamp, kind, level,
                                              str(item.get("text") or "")))
+        if not lines:
+            return ""
         return ("Отчёты программы с прошлого раза (сторож и инструменты):\n"
                 + "\n".join(lines))
+
+    def _fmt_ms(self, ms: int) -> str:
+        """Время по Москве (у ядра `fmt_ms`) — для задач и состояния ошибок."""
+        try:
+            return self.core.fmt_ms(int(ms or 0))
+        except Exception:  # noqa: BLE001
+            return str(int(ms or 0))
+
+    def _program_tasks(self, limit: int = 200) -> str:
+        """Свои критические ошибки — **задача** в чат «Управляющего» (#185).
+
+        Что тут происходит:
+
+        - берём из «ящика отчётов» только сбои (вид `crash`, уровень `error`) —
+          сетевые сбои, отказ вендора и чужие машины сюда не попадают
+          (порог «критической» ошибки, п. 6 промта);
+        - по отпечатку решаем, уходит ли ошибка **сейчас**: та же ошибка в
+          полчасовом окне не уходит второй раз, другая — уходит сразу;
+        - задача называет **источник**: «ошибка программы МиниГен» (чинить код
+          и обновлять программу) либо «вывод сессии агента» (ответить агенту
+          или управлять им).
+
+        ⚠️ Смотрим **глубже**, чем лента отчётов (25 записей): сбой мог
+        оттеснить обычные отчёты, а задачу пропустить нельзя. Старые записи
+        отсекаются по отпечатку (уже уходили) — файл состояния при этом не
+        переписывается.
+        """
+        try:
+            records = [rec for rec in self._reports(limit=limit)
+                       if errors_mod.is_crash(rec)]
+        except Exception:  # noqa: BLE001
+            return ""
+        tasks: list[dict[str, Any]] = []
+        blocked: list[dict[str, Any]] = []
+        for rec in records:
+            try:
+                res = errors_mod.claim(rec)
+            except Exception:  # noqa: BLE001
+                continue
+            if res.get("allowed"):
+                tasks.append(res)
+            elif res.get("repeat"):
+                blocked.append(res)
+        if not tasks and not blocked:
+            return ""
+        try:
+            return errors_mod.render(tasks, blocked, self._fmt_ms)
+        except Exception:  # noqa: BLE001
+            return ""
 
     # ─────────────────────────────────────────────────────────── настройки
     def cmd_settings_get(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -1340,6 +1446,12 @@ class Bridge:
         # в контекст хода **блоками** — документ текстом, картинка картинкой
         # (промт #90).
         blocks, notes, council_note = self._read_attachments(attachments)
+        # ⚠️ Промт КАРМАНА #185: свои критические ошибки — это **задача**, а не
+        # строчка в ленте отчётов. Она видна в чате (реплика «system» перед
+        # репликой владельца) и уходит в ход отдельным блоком.
+        tasks = self._program_tasks()
+        if tasks:
+            chat_store.append({"role": "system", "text": tasks})
         # Реплика владельца — в историю сразу: даже если модель недоступна,
         # вопрос остаётся в переписке (промт #129).
         chat_store.append({"role": "user", "text": text, "attachments": notes})
@@ -1348,12 +1460,14 @@ class Bridge:
         # спрашивали. ⚠️ Это **подсказка хода**, а не реплика: отчёты сторожей
         # в историю переписки не попадают (промт #129).
         feed = self._unread_reports()
+        # Задача по сбою программы идёт **первой** — она важнее ленты отчётов.
+        note = "\n\n".join([part for part in (tasks, feed) if part]).strip()
         # Если оператор приложил файлы, но ничего не написал, модели надо
         # сказать, что делать: без текста задача пустая.
         task = text or self._attachment_task(notes)
         try:
             result = self.agent.ask(list(self.chat_history), task, area_slug,
-                                    model, note=feed, blocks=blocks,
+                                    model, note=note, blocks=blocks,
                                     council_note=council_note)
         except ModelUnavailable as exc:
             chat_store.append({"role": "system", "text": str(exc)})
