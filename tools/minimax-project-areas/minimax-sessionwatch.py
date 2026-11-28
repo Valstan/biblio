@@ -181,6 +181,8 @@ ROLE_RULE = "правило-фолбэк"
 CLOSED_SESSION_NOTE = "сессия уже закрыта — команда не отправлялась"
 #: Строка в журнале: та же команда уже уходила в эту сессию (промт #184, п. 3).
 REPEAT_NOTE = "та же команда уже отправлялась в эту сессию — не отправлялась"
+#: Сколько сессий держим в лекарке команд (файл на машине не должен расти вечно).
+LEDGER_MAX_SESSIONS = 2000
 
 
 # ────────────────────────────────────────────────────────── чтение рантайма
@@ -713,6 +715,16 @@ def remember_send(session_id: str, signature: str, text: str) -> None:
     ledger = sends_ledger()
     rec = ledger.setdefault(session_id, {})
     rec[signature] = {"at": core.now_ms(), "text": (text or "")[:200]}
+    # Файл не должен расти вечно: держим последние сессии (по времени последней
+    # команды). Старые сессии всё равно закрыты ⇒ их прикрывает стража
+    # «сессия уже закрыта».
+    if len(ledger) > LEDGER_MAX_SESSIONS:
+        def last_at(item) -> int:
+            stamps = [int(v.get("at") or 0) for v in (item or {}).values()
+                      if isinstance(v, dict)]
+            return max(stamps) if stamps else 0
+        for old in sorted(ledger, key=last_at)[:len(ledger) - LEDGER_MAX_SESSIONS]:
+            ledger.pop(old, None)
     core.write_state(core.SESSION_SENDS_STATE, ledger)
 
 
