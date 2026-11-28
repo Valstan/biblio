@@ -48,8 +48,14 @@ class MapTest(unittest.TestCase):
         self.local = self.root / "local"
         self._old_pool = map_mod.POOL_DIR
         self._old_local = map_mod.LOCAL
+        self._old_pool_dir = map_mod.pool_dir
         map_mod.POOL_DIR = self.pool
         map_mod.LOCAL = self.local
+        # ⚠️ Подменяем именно **резолвер** пула, а не POOL_DIR: в локальном
+        # режиме (сети нет) пул — папка `genepool-local`, и карта обязана
+        # читать тот же пул, что и модуль генов. Подмена POOL_DIR тут не
+        # сработала бы (машина владельца может быть в локальном режиме).
+        map_mod.pool_dir = lambda: self.pool
         # 1) пул: две копии, два гена, отзыв и замена
         _write_lines(self.pool / "lineage" / "mg-a.jsonl", [
             {"ts": 1000, "event": "born", "instance": "mg-a", "fork_commit": "aaa1111"},
@@ -86,6 +92,7 @@ class MapTest(unittest.TestCase):
     def tearDown(self) -> None:
         map_mod.POOL_DIR = self._old_pool
         map_mod.LOCAL = self._old_local
+        map_mod.pool_dir = self._old_pool_dir
         self.tmp.cleanup()
 
     # ── сборка карты ──────────────────────────────────────────────────────
@@ -127,7 +134,7 @@ class MapTest(unittest.TestCase):
         self.assertEqual(result["self"]["instance"], "mg-b")
 
     def test_map_without_pool_does_not_fail(self) -> None:
-        map_mod.POOL_DIR = self.root / "нет-пула"
+        map_mod.pool_dir = lambda: self.root / "нет-пула"
         result = map_mod.build()
         self.assertFalse(result["pool_ready"])
         self.assertEqual(result["stats"]["genes"], 0)
