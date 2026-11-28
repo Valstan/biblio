@@ -89,6 +89,23 @@ export interface CloneStatus {
   first_run?: CopyFirstRun
 }
 
+/**
+ * Рейтинг гена по всем копиям (промт КАРМАНА #187): сколько голосов и
+ * средняя оценка от 1 до 10 (звёздочки).
+ *
+ * ⚠️ Голос **одной копии** на ген: повторная оценка заменяет прежнюю, а
+ * среднее считается по всем копиям, что голосовали. Наружу уходят только
+ * идентификаторы копий (D-038) — ни имён машин, ни путей.
+ */
+export interface GeneRating {
+  votes: number
+  average: number
+  /** моя оценка (0 — я не голосовал) */
+  my_vote: number
+  /** копии, которые голосовали */
+  voters?: string[]
+}
+
 /** Ген пула наработок. */
 export interface GeneRecord {
   id: string
@@ -99,6 +116,12 @@ export interface GeneRecord {
   files: string[]
   base_commit?: string
   path?: string
+  /** рейтинг гена (число голосов и средняя оценка) */
+  rating?: GeneRating
+  /** трогает ли ген внешний вид программы (темы, стили, иконки, шрифты) */
+  touches_appearance?: boolean
+  /** какие именно файлы трогают внешний вид */
+  appearance_files?: string[]
 }
 
 /** Чужая наработка, которую стоит посмотреть (ответ моста `genes.suggest`). */
@@ -106,6 +129,45 @@ export interface GeneSuggestion extends GeneRecord {
   score: number
   why: string
   fits: boolean
+  /** откатывали ли этот ген в другой копии */
+  rolled_back_elsewhere?: boolean
+  /** копии, которые откатывали ген */
+  rolled_back_by?: string[]
+}
+
+/**
+ * Ген, который эта копия **не ставит**: откатывала или пометила «не ставить».
+ *
+ * ⚠️ Такие гены не попадают в список чужих наработок — они видны отдельной
+ * строкой с пометкой (промт КАРМАНА #187).
+ */
+export interface GeneNotWanted extends GeneRecord {
+  /** почему не ставим: «уже ставили и откатывали» / «помечен «не ставить»» */
+  why: string
+}
+
+/**
+ * Ген, который эта копия **внедрила**: с коммитом, куда он встал.
+ *
+ * ⚠️ Именно этот список — то, что можно **откатить**: откат отменяет
+ * конкретный коммит (промт КАРМАНА #187).
+ */
+export interface GeneInstalled {
+  id: string
+  gene: string
+  title: string
+  author: string
+  /** свой коммит этой копии, куда ген встал */
+  commit: string
+  /** база гена (на чём он сделан у автора) */
+  base_commit: string
+  /** ветка, где стоит ген */
+  branch: string
+  /** когда внедрили (мс) */
+  ts: number
+  /** откатан ли уже */
+  rolled_back: boolean
+  rating?: GeneRating
 }
 
 /** Подсказки наработок. */
@@ -116,6 +178,12 @@ export interface GeneSuggestions {
   transport: string
   available: boolean
   why: string
+  /** гены, которые эта копия откатывала или помечала «не ставить» */
+  not_wanted?: GeneNotWanted[]
+  /** сколько из них именно откатывали */
+  rolled_back?: number
+  /** гены, которые эта копия внедрила (их можно откатить) */
+  installed?: GeneInstalled[]
 }
 
 /**
@@ -149,11 +217,25 @@ export interface GeneActionResult {
   gene?: string
   pr?: string
   branch?: string
+  /** свой коммит, куда ген встал (по нему ген потом откатывается) */
+  commit?: string
   local_only?: boolean
   path?: string
-  files?: number
+  files?: number | string[]
   added?: string[]
   skipped?: string[]
+  /** оценка, которую поставили */
+  score?: number
+  /** число голосов за ген */
+  votes?: number
+  /** средняя оценка по всем копиям */
+  average?: number
+  /** помечен ли ген «не ставить» */
+  not_wanted?: boolean
+  /** ген трогает внешний вид: нужно решение владельца */
+  needs_appearance_decision?: boolean
+  /** какие файлы трогают внешний вид */
+  appearance_files?: string[]
   why?: string
   error?: string
 }

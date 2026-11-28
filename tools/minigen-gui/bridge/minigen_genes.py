@@ -24,8 +24,18 @@ genes/<идентификатор копии>/<идентификатор ген
 - **внедрение — только через ветку + PR + зелёные проверки**: решение
   остаётся за владельцем; автоматически чужой код в программу не попадает;
 - **родословная**: принятый ген записывается в летопись копии (от кого, какой
-  коммит), а в пуле — свой файл `lineage/<копия>.jsonl` (по файлу на копию:
-  общий журнал конфликтовал бы при слиянии);
+  коммит, **в какой коммит этой копии он встал**), а в пуле — свой файл
+  `lineage/<копия>.jsonl` (по файлу на копию: общий журнал конфликтовал бы
+  при слиянии);
+- **откат** (промт КАРМАНА #187): ген можно откатить — `git revert` коммита
+  гена в ветке, где он стоит; после отката состояние совпадает с состоянием
+  до внедрения, а ген помечается «не ставить» и в список чужих наработок
+  больше не попадает;
+- **оценки**: любой ген можно оценить от 1 до 10 (звёздочки); голоса лежат в
+  том же файле копии ⇒ одновременная запись не конфликтует, а рейтинг
+  считается по всем копиям;
+- **внешний вид**: ген, трогающий оформление, помечается заранее, а
+  внедрить его без явного решения владельца нельзя;
 - **наружу — только идентификатор копии и хеши коммитов**: ни имён машин, ни
   путей (D-038).
 """
@@ -46,6 +56,76 @@ import minigen_lineage as lineage
 GENES_DIR = "genes"
 LINEAGE_DIR = "lineage"
 MAX_NOTES = 8000
+
+#: Оценка гена — звёздочки от 1 до 10 (заказ владельца 28.11).
+RATING_MIN = 1
+RATING_MAX = 10
+
+
+# ─────────────────────────────────────── внешний вид программы (промт #187)
+
+#: Что считаем «внешним видом» программы.
+#:
+#: ⚠️ Границу выбрал исполнитель (в промте сказано «исполнителю решать»).
+#: Требование владельца одно: **по умолчанию установка гена вид не меняет,
+#: а если меняет — это видно заранее**. Поэтому ген, трогающий эти файлы,
+#: помечается в списке заранее, а внедрять его без явного решения владельца
+#: нельзя (`adopt(..., allow_appearance=False)` — отказ с объяснением).
+#:
+#: В список попадает: темы и стили, иконки, шрифты, раскладка и каркас окна.
+APPEARANCE_SUFFIXES = (".css", ".scss", ".sass", ".less",
+                        ".svg", ".ico",
+                        ".woff", ".woff2", ".ttf", ".otf", ".eot")
+#: Папки, где лежит оформление целиком.
+APPEARANCE_PARTS = ("theme", "themes", "icons", "fonts", "layout", "styles")
+#: Имена файлов оформления (без расширения).
+APPEARANCE_NAMES = ("theme", "themes", "style", "styles", "layout",
+                    "palette", "fonts", "icons")
+#: Расширения, в которых имя оформления что-то значит (`theme.json`,
+#: `theme.ts` — оформление; `theme.py` — нет, это код).
+APPEARANCE_EXTS = (".css", ".scss", ".sass", ".less", ".json", ".ts", ".tsx",
+                   ".js", ".jsx", ".html", ".svg", ".ico")
+#: Каркас окна: там раскладка панелей и шапки.
+APPEARANCE_FILES = ("src/renderer/src/app.tsx",)
+
+
+def _norm(path: str) -> str:
+    return str(path or "").replace("\\", "/").strip().lower()
+
+
+def appearance_files(files: list[str]) -> list[str]:
+    """Какие из файлов трогают внешний вид программы."""
+    out: list[str] = []
+    for name in files or []:
+        path = _norm(name)
+        if not path:
+            continue
+        parts = [part for part in path.split("/") if part]
+        base = parts[-1] if parts else ""
+        suffix = base[base.rfind("."):] if "." in base else ""
+        stem = base[:len(base) - len(suffix)] if suffix else base
+        if path.endswith(APPEARANCE_SUFFIXES):
+            out.append(name)
+            continue
+        if len(parts) > 1 and any(part in APPEARANCE_PARTS for part in parts[:-1]):
+            out.append(name)
+            continue
+        if stem in APPEARANCE_NAMES and suffix in APPEARANCE_EXTS:
+            out.append(name)
+            continue
+        if any(path.endswith(item) for item in APPEARANCE_FILES):
+            out.append(name)
+    return out
+
+
+def appearance_of(gene: dict[str, Any]) -> dict[str, Any]:
+    """Трогает ли ген внешний вид программы (по манифесту или по файлам)."""
+    data = gene.get("appearance")
+    if isinstance(data, dict) and "touches" in data:
+        return {"touches": bool(data.get("touches")),
+                "files": [str(item) for item in (data.get("files") or [])]}
+    files = appearance_files([str(item) for item in (gene.get("files") or [])])
+    return {"touches": bool(files), "files": files}
 
 
 def pool_dir() -> Path:
@@ -129,7 +209,7 @@ def _manifest(gene: str) -> Path:
 
 
 def list_genes() -> list[dict[str, Any]]:
-    """Все гены пула (новые — первыми)."""
+    """Все гены пула (новые — первыми): с рейтингом и пометкой «трогает вид»."""
     out: list[dict[str, Any]] = []
     base = pool_dir() / GENES_DIR
     if not base.is_dir():
@@ -143,7 +223,131 @@ def list_genes() -> list[dict[str, Any]]:
             data["path"] = str(manifest_path.parent.relative_to(pool_dir())).replace("\\", "/")
             out.append(data)
     out.sort(key=lambda item: int(item.get("created_at") or 0), reverse=True)
+    votes = ratings()
+    for item in out:
+        gene = str(item.get("id") or "")
+        item["rating"] = votes.get(gene) or _empty_rating()
+        look = appearance_of(item)
+        item["touches_appearance"] = look["touches"]
+        item["appearance_files"] = look["files"]
     return out
+
+
+# ─────────────────────────────────────────── оценки генов (звёздочки 1–10)
+
+def _empty_rating() -> dict[str, Any]:
+    return {"votes": 0, "average": 0.0, "my_vote": 0, "voters": []}
+
+
+def pool_events() -> list[dict[str, Any]]:
+    """Все события летописи пула — по всем копиям.
+
+    Файл на копию (`lineage/<копия>.jsonl`) ⇒ одновременная запись двух копий
+    не конфликтует: дописывают они **разные** файлы.
+    """
+    out: list[dict[str, Any]] = []
+    directory = pool_dir() / LINEAGE_DIR
+    if not directory.is_dir():
+        return out
+    for path in sorted(directory.glob("*.jsonl")):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(record, dict):
+                out.append(record)
+    return out
+
+
+def ratings() -> dict[str, dict[str, Any]]:
+    """Рейтинг генов по всем копиям: сколько голосов и средняя оценка.
+
+    ⚠️ **Один голос от копии на ген**: повторная оценка заменяет прежнюю
+    (последняя — актуальная). Иначе одна копия могла бы «разогнать» рейтинг
+    гена, а решение владельца о том, как считать при разном числе голосов,
+    в промте отдано исполнителю — мы показываем **и** среднее, **и** число
+    голосов, чтобы решение принималось по обоим.
+    """
+    votes: dict[str, dict[str, int]] = {}
+    for record in pool_events():
+        if str(record.get("event") or "") != "rated":
+            continue
+        gene = str(record.get("gene") or "")
+        score = record.get("score")
+        if not gene or not isinstance(score, (int, float)) or isinstance(score, bool):
+            continue
+        value = int(score)
+        if value < RATING_MIN or value > RATING_MAX:
+            continue
+        instance = str(record.get("instance") or "copy")
+        votes.setdefault(gene, {})[instance] = value
+    me = str(lineage.instance().get("instance_id") or "")
+    out: dict[str, dict[str, Any]] = {}
+    for gene, by_copy in votes.items():
+        values = list(by_copy.values())
+        out[gene] = {
+            "votes": len(values),
+            "average": round(sum(values) / len(values), 2) if values else 0.0,
+            "my_vote": int(by_copy.get(me, 0)),
+            "voters": sorted(by_copy),
+        }
+    return out
+
+
+def rate(gene: str, score: int) -> dict[str, Any]:
+    """Поставить оценку гену (1–10 звёздочек).
+
+    Оценку может поставить **любая** копия: голос уходит в летопись пула
+    (файл на копию) ⇒ одновременная запись не конфликтует.
+    """
+    gene = str(gene or "").strip()
+    if not gene:
+        return {"error": "не указан ген"}
+    try:
+        value = int(score)
+    except (TypeError, ValueError):
+        return {"error": "оценка — число от %d до %d" % (RATING_MIN, RATING_MAX)}
+    if value < RATING_MIN or value > RATING_MAX:
+        return {"error": "оценка — число от %d до %d (звёздочек)"
+                         % (RATING_MIN, RATING_MAX)}
+    if not append_pool_event("rated", gene=gene, score=value):
+        return {"error": "не записать оценку в летопись пула"}
+    pushed = _push_pool_lineage("rating: %s — %d из %d" % (gene, value, RATING_MAX))
+    data = ratings().get(gene) or _empty_rating()
+    return {"ok": True, "gene": gene, "score": value,
+            "votes": data.get("votes", 0), "average": data.get("average", 0.0),
+            "my_vote": value, "pushed": pushed,
+            "why": "оценка поставлена: %d из %d (голосов: %d)"
+                   % (value, RATING_MAX, data.get("votes", 0))}
+
+
+def _push_pool_lineage(message: str = "") -> bool:
+    """Отправить летопись пула (оценки, откаты) в общий репозиторий.
+
+    ⚠️ Наружу уходят только идентификатор копии и хеши коммитов (D-038):
+    оценка гена — число, путей и имён машин в ней нет.
+    """
+    if not is_pool_git():
+        return False
+    add = _git(["add", "-A", LINEAGE_DIR], pool_dir())
+    if not add.get("ok"):
+        return False
+    commit = _git(["commit", "-m", message or "lineage: оценки и откаты"],
+                  pool_dir(), timeout=180)
+    if not commit.get("ok"):
+        return False
+    if _local_mode():
+        return False
+    push = _git(["push", "origin", "HEAD:refs/heads/pool"], pool_dir(), timeout=300)
+    return bool(push.get("ok"))
 
 
 def _read_patch_bytes(gene: str) -> bytes:
@@ -237,6 +441,11 @@ def publish(title: str, summary: str = "", notes: str = "",
         "files": files,
         "version": str(data.get("fork_of", {}).get("commit") or ""),
     }
+    # ⚠️ Пометка «трогает внешний вид» — в манифесте, чтобы её увидели и
+    # те копии, у которых нет списка файлов под рукой (промт КАРМАНА #187):
+    # вид не должен меняться молча, а сюрприз после внедрения — неправило.
+    look = appearance_of({"files": files})
+    manifest["appearance"] = {"touches": look["touches"], "files": look["files"]}
     (directory / "manifest.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     # патч — байтами: текстовая запись срезает/ломает переводы строк, и git
@@ -375,25 +584,124 @@ def my_files() -> list[str]:
     return out
 
 
+def installed_genes() -> list[dict[str, Any]]:
+    """Гены, которые эта копия внедрила — с коммитом, куда они встали.
+
+    ⚠️ Именно этот список — то, что можно **откатить**: у гена есть свой
+    коммит в этой копии (`local_commit`), и revert отменяет конкретный
+    коммит, а не «что-то похожее».
+    """
+    data = lineage.instance()
+    manifests = {str(item.get("id") or ""): item for item in list_genes()}
+    rolled = {str(item.get("gene") or "") for item in lineage.rolled_back_genes()}
+    votes = ratings()
+    out: list[dict[str, Any]] = []
+    for item in (data.get("genes") or []):
+        gene = str(item.get("gene") or "")
+        if not gene:
+            continue
+        manifest = manifests.get(gene, {})
+        out.append({
+            "id": gene,
+            "gene": gene,
+            "title": str(manifest.get("title") or ""),
+            "author": str(item.get("from") or manifest.get("author") or ""),
+            "commit": str(item.get("local_commit") or ""),
+            "base_commit": str(item.get("commit") or ""),
+            "branch": str(item.get("branch") or ""),
+            "ts": int(item.get("ts") or 0),
+            "rolled_back": gene in rolled,
+            "rating": votes.get(gene) or _empty_rating(),
+        })
+    return out
+
+
+def _pool_rolled_back() -> dict[str, list[str]]:
+    """Какие гены откатывали копии: ген → список копий."""
+    out: dict[str, list[str]] = {}
+    for record in pool_events():
+        if str(record.get("event") or "") != "rolled_back":
+            continue
+        gene = str(record.get("gene") or "")
+        instance = str(record.get("instance") or "")
+        if not gene:
+            continue
+        copies = out.setdefault(gene, [])
+        if instance and instance not in copies:
+            copies.append(instance)
+    return out
+
+
 def suggestions() -> dict[str, Any]:
     """Чужие наработки, которые стоит посмотреть: с причиной совпадения.
 
     Кто прислал — видно, совпадает ли работа — тоже. Чужой ген никогда не
     попадает в программу молча: только через ветку и PR (решение — за
     владельцем).
+
+    ⚠️ **Промт КАРМАНА #187**: ген, который эта копия **внедряла и откатывала**
+    (или пометила «не ставить»), в список чужих наработок **не попадает** —
+    он виден отдельной строкой с пометкой «уже ставили и откатывали».
+    Ген, откатанный **другой** копией, остаётся в списке, но с пометкой:
+    соседу полезно знать, что его уже откатывали.
     """
     data = lineage.instance()
     me = str(data.get("instance_id") or "")
     taken = {str(item.get("gene") or "") for item in (data.get("genes") or [])}
+    not_wanted = lineage.not_wanted_genes()
+    rolled_back = {str(item.get("gene") or "")
+                   for item in lineage.rolled_back_genes()}
+    #: «не хотим» = и помеченные «не ставить», и откатанные нами.
+    #: ⚠️ Внедрённые, но **не** откатанные гены сюда не входят: они стоят в
+    #: программе, их видно в «Внедрённые гены» (и оттуда откатывают).
+    refused = not_wanted | rolled_back
+    rolled_elsewhere = _pool_rolled_back()
+    votes = ratings()
     files = my_files()
     areas = {_area(name) for name in files if _area(name)}
     items: list[dict[str, Any]] = []
+    refused_items: list[dict[str, Any]] = []
     for gene in list_genes():
         gene_id_ = str(gene.get("id") or "")
         author = str(gene.get("author") or "")
-        if not gene_id_ or gene_id_ in taken:
+        if not gene_id_:
             continue
+        rating = votes.get(gene_id_) or _empty_rating()
+        elsewhere = [name for name in rolled_elsewhere.get(gene_id_, [])
+                     if name != me]
+        base_item = {
+            "id": gene_id_,
+            "gene": gene_id_,
+            "title": str(gene.get("title") or ""),
+            "summary": str(gene.get("summary") or ""),
+            "author": author,
+            "created_at": int(gene.get("created_at") or 0),
+            "files": [str(name) for name in (gene.get("files") or [])],
+            "rating": rating,
+            "votes": rating.get("votes", 0),
+            "average": rating.get("average", 0.0),
+            "my_vote": rating.get("my_vote", 0),
+            "touches_appearance": bool(gene.get("touches_appearance")),
+            "appearance_files": [str(name)
+                                 for name in (gene.get("appearance_files") or [])],
+            "rolled_back_elsewhere": bool(elsewhere),
+            "rolled_back_by": elsewhere,
+        }
         if author and author == me:
+            continue
+        if gene_id_ in refused:
+            # виден отдельной строкой: «уже ставили и откатывали» / «не ставить»
+            if gene_id_ in rolled_back:
+                why = "уже ставили и откатывали — ставить не хотим"
+            elif gene_id_ in not_wanted:
+                why = "помечен «не ставить»"
+            else:
+                why = "уже внедрён"
+            refused_items.append(dict(base_item, why=why))
+            continue
+        if gene_id_ in taken:
+            # уже внедрён этой копией — в чужие наработки не попадает
+            # (он виден в «Внедрённые гены», оттуда его и откатывают)
             continue
         gene_files = [str(name) for name in (gene.get("files") or [])]
         same_files = sorted({name for name in gene_files if name in files})
@@ -407,20 +715,10 @@ def suggestions() -> dict[str, Any]:
         else:
             score = 0
             why = "новая наработка другой копии (с моей работой не пересекается)"
-        items.append({
-            "id": gene_id_,
-            "gene": gene_id_,
-            "title": str(gene.get("title") or ""),
-            "summary": str(gene.get("summary") or ""),
-            "author": author,
-            "created_at": int(gene.get("created_at") or 0),
-            "files": gene_files,
-            "score": score,
-            "why": why,
-            "fits": score > 0,
-        })
+        items.append(dict(base_item, score=score, why=why, fits=score > 0))
     items.sort(key=lambda item: (-int(item.get("score") or 0),
                                  -int(item.get("created_at") or 0)))
+    refused_items.sort(key=lambda item: (-int(item.get("created_at") or 0)))
     try:
         import minigen_copy
         exchange = minigen_copy.exchange_state()
@@ -433,6 +731,12 @@ def suggestions() -> dict[str, Any]:
         "transport": exchange.get("transport") or "нет",
         "available": bool(exchange.get("available")),
         "why": exchange.get("why") or "",
+        # откатанные и помеченные «не ставить» — отдельной строкой
+        "not_wanted": refused_items,
+        "rolled_back": sum(1 for item in refused_items
+                           if "откатывали" in str(item.get("why") or "")),
+        # гены, которые эта копия внедрила (их можно откатить)
+        "installed": installed_genes(),
     }
 
 
@@ -536,11 +840,16 @@ def import_pool(path: str) -> dict[str, Any]:
                    % (len(added), len(skipped))}
 
 
-def adopt(gene: str, title: str = "") -> dict[str, Any]:
+def adopt(gene: str, title: str = "", allow_appearance: bool = False) -> dict[str, Any]:
     """Внедрить чужой ген: ветка в своём клоне → проверки → PR.
 
     Опасное действие: меняет программу ⇒ только после подтверждения владельца.
     Решение о слиянии — всё равно за человеком.
+
+    ⚠️ **Ген, трогающий внешний вид, без явного решения владельца не
+    внедряется** (промт КАРМАНА #187): по умолчанию установка гена вид
+    программы не меняет, а если меняет — это видно заранее (пометка в
+    списке и в подтверждении), а не сюрприз после внедрения.
     """
     ready, why = _pool_ready()
     if not ready:
@@ -552,6 +861,15 @@ def adopt(gene: str, title: str = "") -> dict[str, Any]:
     if not patch.strip():
         return {"error": "ген без diff: %s" % gene}
     manifest = payload.get("manifest") or {}
+    look = appearance_of(manifest)
+    if look["touches"] and not allow_appearance:
+        return {"ok": False,
+                "error": "ген трогает внешний вид программы (%s) — без вашего "
+                         "явного решения его не внедряю"
+                         % ", ".join(look["files"][:5]),
+                "needs_appearance_decision": True,
+                "appearance_files": look["files"],
+                "why": "ген меняет оформление — посмотрите diff и решите"}
     branch_title = title or ("внедрение гена %s: %s" % (gene, manifest.get("title") or gene))
     created = code.create_worktree(branch_title)
     if created.get("error"):
@@ -575,20 +893,26 @@ def adopt(gene: str, title: str = "") -> dict[str, Any]:
                 "error": "проверки красные — ген не идёт (worktree оставлен, "
                          "правку можно посмотреть)",
                 "tests": tests}
-    message = "feat(minigen): %s" % (manifest.get("title") or gene)
+    # ⚠️ Идентификатор гена — в сообщении коммита: по нему коммит гена
+    # находится потом (в том числе для генов, взятых до появления отката).
+    message = "feat(minigen): %s (ген %s)" % (manifest.get("title") or gene, gene)
     committed = code.commit(message)
     if committed.get("error"):
         return {"ok": False, "error": committed["error"], "worktree": str(worktree)}
+    local_commit = str(committed.get("commit") or "")
+    branch = str(committed.get("branch") or "")
     if _local_mode():
         # ⚠️ Локальный режим: PR без GitHub не открывается. Правка остаётся в
         # ветке локального репозитория — решение за владельцем, и он видит
         # всю правку в diff'е.
         lineage.adopt(gene, from_instance=str(manifest.get("author") or ""),
                       from_commit=str(manifest.get("base_commit") or ""),
-                      note=str(manifest.get("title") or ""))
+                      note=str(manifest.get("title") or ""),
+                      local_commit=local_commit, branch=branch)
         _append_pool_lineage(gene, "adopted")
         return {"ok": True, "gene": gene, "local_only": True,
                 "branch": committed.get("branch") or "",
+                "commit": local_commit,
                 "worktree": str(worktree),
                 "why": "ген применён в ветке «%s» локального репозитория: "
                        "локальный режим, PR не открывается — посмотрите правку "
@@ -601,7 +925,73 @@ def adopt(gene: str, title: str = "") -> dict[str, Any]:
         return {"ok": False, "error": pr["error"], "worktree": str(worktree)}
     lineage.adopt(gene, from_instance=str(manifest.get("author") or ""),
                   from_commit=str(manifest.get("base_commit") or ""),
-                  note=str(manifest.get("title") or ""))
+                  note=str(manifest.get("title") or ""),
+                  local_commit=local_commit, branch=branch)
     _append_pool_lineage(gene, "adopted")
     return {"ok": True, "gene": gene, "pr": pr.get("pr"), "branch": pr.get("branch"),
+            "commit": local_commit,
             "why": "ген %s предложен PR'ом (решение за владельцем)" % gene}
+
+
+# ─────────────────────────────────────────────── откат и пометка «не ставить»
+
+def rollback(gene: str) -> dict[str, Any]:
+    """Откатить внедрённый ген: вернуть состояние «как было».
+
+    ⚠️ Откат — обычный `git revert` коммита гена в ветке, где ген стоит.
+    После отката состояние программы совпадает с состоянием до внедрения
+    (тот же список изменённых файлов и тот же diff) — критерий приёмки.
+
+    Откат — тоже решение владельца: ген приносит чужой код, и «уже стоял —
+    убрали» тоже должно быть его решением, а не тихой правкой.
+    """
+    gene = str(gene or "").strip()
+    if not gene:
+        return {"error": "не указан ген"}
+    entry = lineage.gene_record(gene)
+    if not entry:
+        return {"ok": False,
+                "error": "эта копия не внедряла ген %s — откатывать нечего" % gene}
+    commit = str(entry.get("local_commit") or "")
+    branch = str(entry.get("branch") or "")
+    if not commit:
+        # ген, взятый до появления отката: ищем коммит по слову в сообщении
+        commit = code.find_commit_by_gene(gene)
+    if not commit:
+        return {"ok": False,
+                "error": "не найден коммит гена %s в этой копии — откатывать нечем"
+                         % gene}
+    result = code.rollback_commit(commit, branch)
+    if result.get("error"):
+        return {"ok": False, "gene": gene, "error": result["error"]}
+    revert = str(result.get("commit") or "")
+    lineage.rolled_back(gene, commit=revert, branch=str(result.get("branch") or ""),
+                        reason="откат по решению владельца")
+    # ⚠️ Откатанный ген сразу помечается «не ставить» — чтобы он случайно
+    # не предложился снова.
+    lineage.dismiss(gene, reason="откатили — ставить не хотим")
+    append_pool_event("rolled_back", gene=gene, commit=revert,
+                      branch=str(result.get("branch") or ""))
+    _push_pool_lineage("lineage: откат гена %s" % gene)
+    return {"ok": True, "gene": gene, "commit": revert, "branch": result.get("branch"),
+            "files": result.get("files") or [], "diff": result.get("diff") or "",
+            "why": "ген %s откатан: состояние вернулось к тому, что было до "
+                   "внедрения, и ген помечен «не ставить»" % gene}
+
+
+def dismiss(gene: str, on: bool = True, reason: str = "") -> dict[str, Any]:
+    """Пометить ген «не ставить» (или снять пометку).
+
+    ⚠️ Это **личное** решение копии: в пул оно не уходит (в пул уходит
+    «откатывали» — это полезно соседям, а «не хочу ставить» — нет).
+    """
+    gene = str(gene or "").strip()
+    if not gene:
+        return {"error": "не указан ген"}
+    if on:
+        lineage.dismiss(gene, reason=reason or "не хочу ставить")
+    else:
+        lineage.undismiss(gene)
+    return {"ok": True, "gene": gene, "not_wanted": bool(on),
+            "why": ("ген помечен «не ставить»" if on
+                    else "пометка «не ставить» снята")}

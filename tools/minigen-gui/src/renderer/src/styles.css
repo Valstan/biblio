@@ -373,6 +373,32 @@ td.actions {
   color: var(--muted);
 }
 
+/* Оценка гена звёздочками (промт КАРМАНА #187): десять кнопок-позиций,
+   клик — «поставить оценку N из 10». */
+.stars {
+  display: inline-flex;
+  gap: 1px;
+}
+
+.star {
+  padding: 0 1px;
+  border: none;
+  background: transparent;
+  color: #e3b341;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.star:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.star:hover:not(:disabled) {
+  color: #f2cc60;
+}
+
 .toggle {
   padding: 3px 10px;
   font-size: 12px;

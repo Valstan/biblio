@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react'
-import type { UpdateState } from '@shared/types'
+import type { GeneSuggestions, UpdateState } from '@shared/types'
 import { api, desktop } from '../api'
 import { describeUpdate, formatInstalledAt } from './update-view'
+import { notWantedRows, suggestionRows } from './copy-view'
 import { formatTime } from '../time'
 
 /**
@@ -15,6 +16,8 @@ import { formatTime } from '../time'
  *   (метка сборки вшивается при сборке — по ней видно, что окно старше);
  * - что есть в репозитории;
  * - пошаговый журнал обновления (каждый шаг — одна строка);
+ * - **наработки других копий** с рейтингом и пометками — чтобы решение
+ *   «ставить ген или нет» принималось по фактам (промт КАРМАНА #187);
  * - кнопка перезапуска окна: раскатка меняет файлы, а старый код в памяти
  *   сам не сменится.
  */
@@ -23,6 +26,8 @@ export default function UpdateTab() {
   const [build, setBuild] = useState('')
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
+  const [works, setWorks] = useState<GeneSuggestions | null>(null)
+  const [worksError, setWorksError] = useState('')
 
   const load = useCallback(async () => {
     try {
@@ -32,16 +37,35 @@ export default function UpdateTab() {
     }
   }, [])
 
+  /** Наработки других копий — их же видно во вкладке «Гены». */
+  const loadWorks = useCallback(async () => {
+    try {
+      setWorks(await api.genesSuggest())
+      setWorksError('')
+    } catch (err) {
+      setWorksError(`наработки не принесли: ${String((err as Error).message || err)}`)
+    }
+  }, [])
+
   useEffect(() => {
     void load()
+    void loadWorks()
     void desktop.buildInfo().then((info) => setBuild(info.commit || '')).catch(() => undefined)
     const timer = window.setInterval(() => void load(), 1500)
-    return () => window.clearInterval(timer)
-  }, [load])
+    const worksTimer = window.setInterval(() => void loadWorks(), 5000)
+    return () => {
+      window.clearInterval(timer)
+      window.clearInterval(worksTimer)
+    }
+  }, [load, loadWorks])
 
   const installed = state?.installed ?? null
   const verdict = describeUpdate(installed, build, state)
   const steps = state?.steps ?? []
+  // Наработки других копий: рейтинг, число голосов и пометки — видны **до**
+  // того, как владелец решит, ставить ген или нет (промт КАРМАНА #187).
+  const workRows = suggestionRows(works)
+  const refusedRows = notWantedRows(works)
 
   const check = async () => {
     setBusy(true)
@@ -180,6 +204,93 @@ export default function UpdateTab() {
           </table>
         )}
         {state?.running && <p className="muted small">Обновление идёт — не закрывай окно.</p>}
+      </div>
+
+      <div className="card">
+        <h3>Наработки других копий</h3>
+        {worksError && <p className="muted small">{worksError}</p>}
+        {!worksError && workRows.length === 0 && refusedRows.length === 0 && (
+          <p className="muted small">
+            {works?.available
+              ? 'Чужих наработок сейчас нет.'
+              : 'Наработки сейчас недоступны: обмен с копиями не работает.'}
+          </p>
+        )}
+        {workRows.length > 0 && (
+          <table className="grid compact">
+            <thead>
+              <tr>
+                <th>Ген</th>
+                <th>Что сделано</th>
+                <th>Автор</th>
+                <th>Рейтинг</th>
+                <th>Пометки</th>
+              </tr>
+            </thead>
+            <tbody>
+              {workRows.map((row) => (
+                <tr key={row.gene}>
+                  <td className="muted">{row.gene}</td>
+                  <td>{row.title}</td>
+                  <td className="muted">{row.author}</td>
+                  <td className="muted small">
+                    {row.rating.has
+                      ? `${row.rating.score} ${row.rating.stars} · голосов: ${row.rating.votes}`
+                      : 'оценок нет'}
+                  </td>
+                  <td>
+                    {row.touchesAppearance && (
+                      <span className="chip warn">меняет внешний вид</span>
+                    )}
+                    {row.rolledBackElsewhere && (
+                      <span className="chip bad">откатывали в другой копии</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        {refusedRows.length > 0 && (
+          <>
+            <p className="muted small" style={{ marginTop: 8 }}>
+              Эти гены уже откатывали (или пометили «не ставить») — в список
+              наработок они не попадают.
+            </p>
+            <table className="grid compact">
+              <thead>
+                <tr>
+                  <th>Ген</th>
+                  <th>Что сделано</th>
+                  <th>Пометка</th>
+                  <th>Рейтинг</th>
+                </tr>
+              </thead>
+              <tbody>
+                {refusedRows.map((row) => (
+                  <tr key={row.gene}>
+                    <td className="muted">{row.gene}</td>
+                    <td>{row.title}</td>
+                    <td>
+                      <span className={row.rolledBack ? 'chip warn' : 'chip muted'}>
+                        {row.why}
+                      </span>
+                    </td>
+                    <td className="muted small">
+                      {row.rating.has
+                        ? `${row.rating.score} · голосов: ${row.rating.votes}`
+                        : 'оценок нет'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        )}
+        <p className="muted small">
+          Рейтинг и пометки видны до решения о внедрении: внедряют гены во
+          вкладке «Гены».
+        </p>
       </div>
     </section>
   )

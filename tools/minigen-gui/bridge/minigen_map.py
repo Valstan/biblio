@@ -47,10 +47,29 @@ def _read_json(path: Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def pool_dir() -> Path:
+    """Каталог пула наработок.
+
+    ⚠️ Тот же путь, что и у `minigen_genes.pool_dir()`: в локальном режиме
+    (сети нет) пул — обычная папка `genepool-local`, и карта обязана видеть
+    **те же** события, которые пишет модуль генов, иначе откаты и оценки
+    не попадут в карту.
+    """
+    try:
+        import minigen_copy
+        if minigen_copy.is_local():
+            local = minigen_copy.LOCAL / "genepool-local"
+            if not (local / ".git").is_dir():
+                return local
+    except Exception:  # noqa: BLE001
+        pass
+    return POOL_DIR
+
+
 def pool_events() -> list[dict[str, Any]]:
     """Все события пула (из летописи всех копий), новые — первыми."""
     out: list[dict[str, Any]] = []
-    directory = POOL_DIR / LINEAGE_DIR
+    directory = pool_dir() / LINEAGE_DIR
     if not directory.is_dir():
         return out
     for path in sorted(directory.glob("*.jsonl")):
@@ -76,7 +95,7 @@ def pool_events() -> list[dict[str, Any]]:
 def pool_manifests() -> dict[str, dict[str, Any]]:
     """Манифесты генов пула: ген → манифест."""
     out: dict[str, dict[str, Any]] = {}
-    base = POOL_DIR / GENES_DIR
+    base = pool_dir() / GENES_DIR
     if not base.is_dir():
         return out
     for path in base.glob("*/*/manifest.json"):
@@ -138,6 +157,7 @@ def build() -> dict[str, Any]:
                 "parent": {},
                 "genes_made": [],
                 "genes_taken": [],
+                "genes_rolled_back": [],
                 "taken_by": [],
                 "repo": "",
                 "upstream": "",
@@ -164,6 +184,11 @@ def build() -> dict[str, Any]:
                 author_entry = copy_of(author)
                 if instance not in author_entry["taken_by"]:
                     author_entry["taken_by"].append(instance)
+        elif event == "rolled_back" and gene:
+            # ⚠️ Откат гена (промт КАРМАНА #187): копия внедрила ген и
+            # откатила его — ген в карте виден как откатанный.
+            if gene not in entry["genes_rolled_back"]:
+                entry["genes_rolled_back"].append(gene)
         elif event == "born":
             entry["born_at"] = int(record.get("ts") or entry["born_at"])
             entry["fork_commit"] = str(record.get("fork_commit") or entry["fork_commit"])
@@ -242,6 +267,10 @@ def build() -> dict[str, Any]:
             instance = str(record.get("instance") or "")
             if instance and instance not in entry["taken_by"]:
                 entry["taken_by"].append(instance)
+        elif event == "rolled_back":
+            # откат: ген стоял и его убрали — состояние «откатан»
+            entry["state"] = "rolled_back"
+            entry["why_retracted"] = str(record.get("reason") or "откат по решению владельца")
 
     # ── связи ────────────────────────────────────────────────────────────────
     edges: list[dict[str, Any]] = []
@@ -296,8 +325,8 @@ def build() -> dict[str, Any]:
             "made": sum(len(item["genes_made"]) for item in copies_list),
             "took": sum(len(item["genes_taken"]) for item in copies_list),
         },
-        "pool": str(POOL_DIR),
-        "pool_ready": (POOL_DIR / ".git").is_dir(),
+        "pool": str(pool_dir()),
+        "pool_ready": (pool_dir() / ".git").is_dir(),
         "note": ("карта собрана из пула наработок: каждая копия дописывает в пул свои "
-                 "связи (рождение, публикация гена, внедрение чужого гена)"),
+                 "связи (рождение, публикация гена, внедрение чужого гена, откат гена)"),
     }
