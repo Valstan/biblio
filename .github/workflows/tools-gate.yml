@@ -74,3 +74,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_always_auto_182.py
       - name: Приёмка экосистемы агентов (заявка из зачитки и раздел КАРМАНА)
         run: python3 tools/minimax-project-areas/test_agents_ecosystem.py
+      - name: Приёмка «закрытая сессия — команда не отправляется» (промт #184)
+        run: python3 tools/minimax-project-areas/test_session_finished_no_repeat.py
