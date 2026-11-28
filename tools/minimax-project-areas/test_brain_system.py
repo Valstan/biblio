@@ -561,9 +561,6 @@ def check_walkthrough(failures: list[str]) -> None:
             print("   FAIL: в обкатке нет задания характера «%s»" % kind)
     # Разбор лежит в передаче смены — не в отдельном хранилище.
     handoff_raw = read(REPO / "docs" / "SESSION_HANDOFF.md")
-    if "199" not in norm(handoff_raw):
-        failures.append("в SESSION_HANDOFF.md нет разбора промта #199")
-        print("   FAIL: в SESSION_HANDOFF.md нет разбора промта #199")
     # Разбор задачи — **последний** в передаче смены (смена новая сверху).
     blocks = handoff_raw.split("Разбор задачи:")
     if len(blocks) < 2:
@@ -584,6 +581,30 @@ def check_walkthrough(failures: list[str]) -> None:
     if not re.search(r"PR[^\n]{0,24}#\s*\d{2,4}", section):
         failures.append("в разборе в SESSION_HANDOFF.md не назван PR")
         print("   FAIL: в разборе в SESSION_HANDOFF.md не назван PR")
+    # Разбор называет промт, который он закрывает: правило — на любую
+    # задачу, а не на номер конкретного промта.
+    if not re.search(r"промт\s*#\s*\d+", section_norm):
+        failures.append("в разборе не назван промт, который он закрывает")
+        print("   FAIL: в разборе не назван промт, который он закрывает")
+    # Запись о смене оформлена по канону закрытия смены: «Статус»,
+    # «Что сделано», «Проверено», «Следующий шаг», «Открытые вопросы».
+    entry_lines: list[str] = []
+    inside = False
+    for line in handoff_raw.splitlines():
+        if line.startswith("## "):
+            if inside:
+                break
+            inside = True
+            continue
+        if inside:
+            entry_lines.append(line)
+    entry = "\n".join(entry_lines)
+    entry_headings = [line for line in entry_lines if line.startswith("###")]
+    for heading in ("Статус", "Что сделано", "Проверено", "Следующий шаг",
+                    "Открытые вопросы"):
+        if not any(heading in line for line in entry_headings):
+            failures.append("в записи о смене нет раздела «%s»" % heading)
+            print("   FAIL: в записи о смене нет раздела «%s»" % heading)
     if not failures:
         print("   ок: разбор прогона есть, обкатка трёх характеров на месте")
 
