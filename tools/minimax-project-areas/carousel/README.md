@@ -33,17 +33,21 @@
 
 ## Машинная раскатка
 
-Машинный каталог `C:\Users\valstan\bin\` держит **запускалки**:
+Направление — **из репозитория** (как у всех демонов «МиниГена»): эталон версии
+живёт в `biblio` (`master`), боевое место — его копия. Раскатку делает владелец
+одной командой:
 
-```python
-# C:\Users\valstan\bin\matrica-night-carousel.py
-import runpy, sys
-P = r"D:\valstan\REPO\biblio\tools\minimax-project-areas\carousel\matrica-night-carousel.py"
-sys.argv[0] = P
-runpy.run_path(P, run_name="__main__")
+```
+python D:\valstan\REPO\biblio\tools\minimax-project-areas\minigen_rollout.py
 ```
 
-Логика в двух местах не живёт ⇒ разъезд невозможен по построению.
+Каркас и обёртки лежат в списке файлов раскатки ⇒ на машине они появляются в
+`C:\Users\valstan\bin\carousel\`. Обёртки импортируют каркас **рядомом файлом**,
+каркас берёт сторожа и `minigen_core` из каталога уровнем выше (`bin/`) ⇒ на
+машине это развёрнутые копии репозиторных.
+
+Правка каркаса идёт **сюда** (ветка → PR → гейт → merge), раскатка — **после**
+мерджа. Обратное (боевое место → репозиторий) не делается никогда.
 
 ## Что проверяет гейт
 
