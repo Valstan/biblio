@@ -283,6 +283,21 @@ def read_manifest(slug: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def area_slug(manifest: dict[str, Any]) -> str:
+    """Имя области агента по манифесту — **без** префикса `p-`.
+
+    ⚠️ Каталог области всегда называется `p-<имя>`, а в манифесте поле
+    `area` — это **имя** области (не каталога). Их путали: манифест агента
+    «Идеи» лежал с `area: p-ideas`, и скиллы агента ставились в
+    `p-p-ideas` — область, которой нет (живой случай 28.11). Поэтому
+    префикс `p-` срезается, а имя области кладётся в манифест как есть.
+    """
+    raw = str((manifest or {}).get("area") or "").strip()
+    if raw.startswith("p-"):
+        raw = raw[2:]
+    return raw.strip()
+
+
 def write_manifest(slug: str, manifest: dict[str, Any]) -> dict[str, Any]:
     """Записать манифест агента в реестр (файл — в репозитории реестра)."""
     if yaml is None:
@@ -298,7 +313,14 @@ def write_manifest(slug: str, manifest: dict[str, Any]) -> dict[str, Any]:
 
 
 def list_agents() -> list[dict[str, Any]]:
-    """Все агенты реестра — с их манифестами."""
+    """Все агенты реестра — с их манифестами.
+
+    ⚠️ Поле `area` отдаётся **именем области** (без `p-`): манифест мог
+    остаться со старой записью `p-<имя>` (живой случай 28.11 — манифест
+    агента «Идеи»), и окно со встроенной нейросетью видели бы разные
+    области для одного агента. Имя области — ключ списка, а каталог
+    данных всегда `p-<имя>`.
+    """
     root = registry_dir() / "agents"
     out: list[dict[str, Any]] = []
     try:
@@ -309,6 +331,7 @@ def list_agents() -> list[dict[str, Any]]:
         manifest = read_manifest(slug)
         if manifest:
             manifest.setdefault("slug", slug)
+            manifest["area"] = area_slug(manifest) or manifest.get("area") or ""
             out.append(manifest)
     return out
 
@@ -418,20 +441,24 @@ def skills_of(repo_path: Path) -> list[str]:
     return out
 
 
-def area_skills_dir(area_slug: str) -> Path:
-    """Каталог скиллов области — рантайм видит их оттуда."""
+def area_skills_dir(area_name: str) -> Path:
+    """Каталог скиллов области — рантайм видит их оттуда.
+
+    ⚠️ `area_name` — **имя** области (без `p-`): каталог данных области
+    называется `p-<имя>`, и префикс добавляется здесь.
+    """
     import minigen_state as state
-    return state.AREAS_ROOT / ("p-" + area_slug) / "skills"
+    return state.AREAS_ROOT / ("p-" + area_name) / "skills"
 
 
-def install_skills(area_slug: str, repo_path: Path) -> dict[str, Any]:
+def install_skills(area_name: str, repo_path: Path) -> dict[str, Any]:
     """Установить скиллы агента в его область (чтобы рантайм их видел).
 
     Рантайм берёт общие скиллы области из `<область>/skills/<имя>/SKILL.md`
     (и свои — из `<область>/agents/<имя>/skills/`). Копия в репозитории агента
     остаётся источником правды: восстановление агента переустановит её.
     """
-    slug = (area_slug or "").strip()
+    slug = (area_name or "").strip()
     if not slug:
         return {"ok": False, "error": "не указана область"}
     names = skills_of(repo_path)
@@ -631,7 +658,12 @@ def create_agent(slug: str, title: str, role: str, repo_slug: str = "",
     title = (title or slug).strip()
     role = (role or "").strip()
     repo_slug = (repo_slug or ("Valstan/%s" % slug)).strip()
-    area = (area or ("p-" + slug)).strip()
+    # ⚠️ Имя области (без `p-`): каталог области всегда `p-<имя>`, а в
+    # манифест кладётся именно имя — иначе скиллы встают в `p-p-<имя>`
+    # (живой случай 28.11 — манифест агента «Идеи» был с `area: p-ideas`).
+    area = (area or slug).strip()
+    if area.startswith("p-"):
+        area = area[2:]
 
     registry = ensure_registry(create=True)
     if not registry.get("ok"):
@@ -739,10 +771,12 @@ def apply_agent(slug: str, area: str = "") -> dict[str, Any]:
             shutil.copyfile(item, target)
             copied.append(str(rel).replace("\\", "/"))
 
-    area_slug = (area or str(manifest.get("area") or ("p-" + slug))).strip()
-    installed = install_skills(area_slug, repo_path)
+    # ⚠️ Имя области — без `p-`: иначе скиллы встают в `p-p-<имя>`
+    # (живой случай 28.11 — манифест агента «Идеи» был с `area: p-ideas`).
+    area_name = (area or area_slug(manifest) or slug).strip()
+    installed = install_skills(area_name, repo_path)
     return {"ok": True, "slug": slug, "repo": repo_slug,
-            "repo_path": str(repo_path), "area": area_slug,
+            "repo_path": str(repo_path), "area": area_name,
             "files": copied, "skills": skills_of(repo_path),
             "skills_installed": installed.get("installed") or [],
             "manifest": manifest}

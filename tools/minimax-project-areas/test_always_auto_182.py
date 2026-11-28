@@ -73,7 +73,9 @@ def main() -> int:
     # где боевой папки нет вовсе).
     os.environ["MINIGEN_DAEMON_DIR"] = str(HERE)
 
-    tab_src = read(TABS / "AreasTab.tsx")
+    # ⚠️ Заказ владельца 28.11: «Области» и «Агенты» — одна вкладка,
+    # файл `AreasTab.tsx` удалён ⇒ смотрим объединённую «Агенты».
+    tab_src = read(TABS / "AgentsTab.tsx")
     sort_src = read(TABS / "areas-sort.ts")
     styles_src = read(GUI / "src" / "renderer" / "src" / "styles.css")
     api_ts = read(GUI / "src" / "renderer" / "src" / "api.ts")
@@ -211,11 +213,59 @@ def main() -> int:
     # ── 6) новая область стартует в автомате ──────────────────────────────
     print("6) новая область заводится сразу в автомате")
     bridge_src = read(BRIDGE / "minigen_bridge.py")
-    m = re.search(r"projects\.append\(\{(.*?)\n\s*\}\)", bridge_src, re.S)
+    # ⚠️ 28.11: запись области в мосте больше не пишется прямо в
+    # `projects.append({…})` — она собирается отдельно (область может быть
+    # уже известна — её каталог на диске, — и тогда запись **дополняется**,
+    # а не добавляется). Проверка ищет **запись области**, а не форму append.
+    m = re.search(r"(?:entry\s*=\s*\{|projects\.append\(\{)(.*?)\n\s*\}",
+                  bridge_src, re.S)
     check(bool(m), "не нашли, где мост заводит область")
     if m:
         check('"autoheal": True' in m.group(1),
               "новая область заводится не в автомате: %s" % m.group(1)[:200])
+
+    # …и **по-настоящему**: новая область попадает в конфиг **в автомате**
+    # (живой случай 28.11: из-за дефекта записи область не попадала в
+    # конфиг вовсе — и не появлялась в списке).
+    with tempfile.TemporaryDirectory() as tmp:
+        root = pathlib.Path(tmp)
+        config = root / "mcode-project-areas.json"
+        config.write_text(json.dumps({"projects": []}, ensure_ascii=False),
+                          encoding="utf-8")
+        old_config = core.CONFIG
+        old_root = state.AREAS_ROOT
+        old_journal = core.JOURNAL
+        old_reports = core.REPORTS
+        old_bin = core.BIN
+        core.CONFIG = config
+        core.JOURNAL = root / "journal.log"
+        core.REPORTS = root / "reports.jsonl"
+        core.BIN = root / "bin"          # ярлыки владельцу не трогаем
+        state.AREAS_ROOT = root / "areas"
+        try:
+            class FakeBridge:
+                pass
+
+            fake = FakeBridge()
+            fake.core = core
+            created = bridge.Bridge.cmd_create(
+                fake, {"slug": "novaya", "title": "Новая", "folder": "",
+                       "karman": "novaya"})
+            check(created.get("ok"), "область не завелась: %s" % created)
+            after = json.loads(config.read_text(encoding="utf-8"))
+            fresh = next((p for p in after.get("projects", [])
+                          if p.get("slug") == "novaya"), None)
+            check(fresh is not None,
+                  "новая область не попала в конфиг: %s" % after)
+            if fresh:
+                check(fresh.get("autoheal") is True,
+                      "новая область заведена не в автомате: %s" % fresh)
+        finally:
+            core.CONFIG = old_config
+            core.JOURNAL = old_journal
+            core.REPORTS = old_reports
+            core.BIN = old_bin
+            state.AREAS_ROOT = old_root
 
     # ── 7) в коде нет ни одного места, пишущего выключенный автомат ───────
     print("7) в мосте и в состоянии нет пути, пишущего autoheal = false")

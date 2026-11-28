@@ -88,6 +88,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "agentsRegistry": "Valstan/minigen-agents",
     # где живут рабочие репозитории агентов
     "agentsWorkspace": r"D:\valstan\REPO",
+    # область-шаблон авторизации: из неё новые области копируют вход.
+    # ⚠️ Держим его и здесь, а не только в конфиге областей: конфиг —
+    # локальная вещь машины, и при его потере (живой случай 28.11) новая
+    # область вышла бы без входа. Пусто — ищем сами (см. `auth_template`).
+    "authTemplate": "",
     # где лежат промты: в базе «МиниГена» или на внешнем ресурсе (Карман)
     "promptStore": "local",
     # раздавать ли промты рабочим областям без живого оператора
@@ -244,24 +249,241 @@ def msk_stamp(ms: int) -> str:
 
 # ──────────────────────────────────────────────────────────────── области
 
+def config_path() -> Path:
+    """Файл конфигурации областей (чисто локальная вещь машины)."""
+    return load_daemons()["core"].CONFIG
+
+
+def backup_path() -> Path:
+    """Локальная копия конфигурации областей — единственная страховка."""
+    return Path(str(config_path()) + ".bak")
+
+
+def _read_json(path: Path) -> tuple[dict[str, Any] | None, str]:
+    """Прочитать JSON-словарь из файла.
+
+    Возвращает (словарь, "") либо (None, причина). Разбор с ошибкой и
+    нечитаемый файл — **разные** причины: битый файл можно переписать,
+    отсутствующий — сначала надо найти.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return None, str(exc)
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return None, str(exc)
+    if not isinstance(data, dict):
+        return None, "не словарь"
+    return data, ""
+
+
 def read_projects() -> dict[str, Any]:
-    """Конфиг областей. Читаем с повтором: файл пишется на лету (гонка)."""
+    """Конфиг областей. Читаем с повтором: файл пишется на лету (гонка).
+
+    ⚠️ **Живой случай 28.11: файл пропал — и области исчезли из окна.**
+    Конфиг областей — **чисто локальная вещь машины** (канон владельца
+    27.11): его нет в git, и единственная страховка — копия рядом
+    (`…json.bak`). Поэтому, если основной файл не читается (пропал или
+    битый), читаем **копию** и честно говорим, что восстановились из неё.
+    """
     core = load_daemons()["core"]
     last_err = ""
     for _ in range(5):
         try:
             text = (core.CONFIG).read_text(encoding="utf-8")
-            return json.loads(text)
-        except ValueError as exc:
-            last_err = str(exc)
-            time.sleep(0.2)
         except OSError as exc:
             last_err = str(exc)
             break
-    return {"projects": [], "_error": last_err}
+        try:
+            data = json.loads(text)
+        except ValueError as exc:
+            last_err = str(exc)
+            time.sleep(0.2)
+            continue
+        if isinstance(data, dict):
+            return data
+        last_err = "не словарь"
+        break
+    # Основной файл не читается — берём локальную копию (страховка).
+    backup, backup_err = _read_json(backup_path())
+    if backup is not None:
+        out = dict(backup)
+        out["_restored"] = True
+        out["_restore_note"] = ("конфиг областей восстановлен из локальной копии (%s)"
+                                % (last_err or "файл пропал"))
+        return out
+    return {"projects": [], "_error": last_err or backup_err}
 
 
-def write_projects(cfg: dict[str, Any]) -> tuple[bool, str]:
+def known_area_slugs() -> set[str]:
+    """Области, которые машина уже знает: конфиг и его локальная копия."""
+    out: set[str] = set()
+    for path in (config_path(), backup_path()):
+        data, _err = _read_json(path)
+        if not data:
+            continue
+        for project in (data.get("projects") or []):
+            slug = str((project or {}).get("slug") or "").strip()
+            if slug:
+                out.add(slug)
+    return out
+
+
+def local_area_slugs() -> list[str]:
+    """Области по локальным каталогам данных (`p-<slug>`).
+
+    Каталог области — это и есть область на этой машине: он переживает
+    потерю конфига (живой случай 28.11 — конфиг пропал, а каталоги
+    остались).
+    """
+    out: list[str] = []
+    try:
+        for item in sorted(AREAS_ROOT.iterdir()):
+            if not item.is_dir():
+                continue
+            slug = item.name[2:] if item.name.startswith("p-") else ""
+            if slug and slug not in out:
+                out.append(slug)
+    except OSError:
+        pass
+    return out
+
+
+def registry_areas() -> list[dict[str, Any]]:
+    """Области агентов из реестра (репозиторий на GitHub — источник правды).
+
+    У агента есть и область, и рабочее место (репозиторий). Если конфиг
+    потерян, реестр остаётся верным источником: по нему область
+    восстанавливается вместе с рабочей папкой.
+    """
+    try:
+        import minigen_agents as agents_mod
+        out: list[dict[str, Any]] = []
+        for manifest in agents_mod.list_agents():
+            slug = agents_mod.area_slug(manifest)
+            if not slug:
+                continue
+            folder = ""
+            repo = str(manifest.get("repo") or "")
+            if repo:
+                path = agents_mod.work_repo_path(repo)
+                folder = str(path) if path.is_dir() else ""
+            out.append({
+                "slug": slug,
+                "title": str(manifest.get("title") or slug),
+                "folder": folder,
+                "karman": slug,
+                "autoheal": True,
+            })
+        return out
+    except Exception:  # noqa: BLE001 — реестр не должен ломать список областей
+        return []
+
+
+def merged_projects() -> list[dict[str, Any]]:
+    """Все области, которые машина знает: конфиг, его копия и локальные
+    каталоги данных.
+
+    ⚠️ Это **объединение**, а не замена: ни одна известная область не
+    теряется. Именно этим список и восстанавливается после потери
+    конфига (живой случай 28.11: конфиг пропал, окно показало «0 областей»,
+    и создание агента область не заводило — дефект `or []` в `cmd_create`).
+
+    ⚠️ **Реестр агентов сюда не входит**: агент, заведённый на другой
+    машине, не превращается в область этой машины (у него тут нет ни
+    каталога, ни входа). Агенты окно показывает из реестра — и завести
+    область такого агента можно одной кнопкой.
+    """
+    cfg = read_projects()
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(project: dict[str, Any]) -> None:
+        slug = str((project or {}).get("slug") or "").strip()
+        if not slug or slug in seen:
+            return
+        seen.add(slug)
+        item = dict(project)
+        item["slug"] = slug
+        item.setdefault("title", slug)
+        item.setdefault("folder", "")
+        item.setdefault("karman", slug)
+        item.setdefault("autoheal", True)
+        out.append(item)
+
+    for project in (cfg.get("projects") or []):
+        add(project)
+    backup, _err = _read_json(backup_path())
+    if backup:
+        for project in (backup.get("projects") or []):
+            add(project)
+    for slug in local_area_slugs():
+        add({"slug": slug})
+    # У области без рабочей папки берём папку из реестра (у агента она есть).
+    by_slug = {str(p.get("slug") or ""): p for p in registry_areas()}
+    for item in out:
+        if not item.get("folder"):
+            hint = by_slug.get(str(item.get("slug") or "")) or {}
+            if hint.get("folder"):
+                item["folder"] = hint["folder"]
+    return out
+
+
+def areas_selfheal(force: bool = False) -> dict[str, Any]:
+    """Починить список областей, если он пуст или конфиг пропал.
+
+    Вызывается один раз при старте программы. Обычный путь (конфиг на месте
+    и области есть) — дешёвый: одна проверка без записи. `force=True` —
+    пересобрать список насильно (кнопка «Починить список» в окне).
+    """
+    cfg = read_projects()
+    projects = cfg.get("projects") or []
+    restored = bool(cfg.get("_restored"))
+    if projects and not restored and not force:
+        return {"ok": True, "healed": False, "areas": len(projects), "added": []}
+    merged = merged_projects()
+    if not merged:
+        return {"ok": True, "healed": False, "areas": len(projects), "added": []}
+    known = {str((p or {}).get("slug") or "") for p in projects}
+    cfg["projects"] = merged
+    ok, err = write_projects(cfg)
+    if not ok:
+        return {"ok": False, "error": err, "areas": len(projects), "added": []}
+    added = [str(p.get("slug") or "") for p in merged if str(p.get("slug") or "") not in known]
+    return {"ok": True, "healed": True, "areas": len(merged), "added": added}
+
+
+def auth_template() -> str:
+    """Путь к области-шаблону авторизации (пусто — шаблона нет).
+
+    ⚠️ Шаблон — **тоже локальная вещь машины**, и раньше он жил только в
+    конфиге областей: потеря конфига ⇒ новая область без входа (живой
+    случай 28.11 — агент создан, а область пустая и без авторизации).
+    Поэтому ищем его тремя путями: конфиг → настройки программы → любая
+    местная область с готовым входом.
+    """
+    cfg = read_projects()
+    raw = str(cfg.get("authTemplate") or "").strip()
+    if raw and Path(raw).is_dir():
+        return raw
+    from_settings = str(read_settings().get("authTemplate") or "").strip()
+    if from_settings and Path(from_settings).is_dir():
+        return from_settings
+    try:
+        for item in sorted(AREAS_ROOT.iterdir()):
+            if not item.is_dir():
+                continue
+            if (item / "auth" / "prod" / "en" / "mcode-public" / "auth.json").is_file():
+                return str(item)
+    except OSError:
+        pass
+    return raw
+
+
+def write_projects(cfg: dict[str, Any],
+                   allow_shrink: bool = False) -> tuple[bool, str]:
     """Записать конфиг областей АТОМАРНО (иначе читатель поймает половину).
 
     Атомарность на Windows не бесплатна: `os.replace` поверх файла, который
@@ -285,11 +507,26 @@ def write_projects(cfg: dict[str, Any]) -> tuple[bool, str]:
       годится);
     - копии **не было** ⇒ после записи она появляется (иначе после первой
       записи страховки нет вовсе).
+
+    ⚠️ **Страховка от потери.** Программа **нигде не удаляет** области:
+    завести — да, переключить — да, удалить — нет. Значит запись, которая
+    уменьшает список областей, — это **потеря**, а не замысел, и такой
+    файл не пишется (живой случай 28.11: пустой список записался поверх
+    списка, и области исчезли из окна навсегда). Отключается только явно:
+    `allow_shrink=True`.
     """
     core = load_daemons()["core"]
     try:
-        cfg = dict(cfg)
-        cfg.pop("_error", None)
+        cfg = {key: value for key, value in dict(cfg).items()
+               if not str(key).startswith("_")}
+        if not allow_shrink:
+            known = known_area_slugs()
+            fresh = {str((p or {}).get("slug") or "").strip()
+                     for p in (cfg.get("projects") or [])}
+            lost = sorted(slug for slug in known - fresh if slug)
+            if lost:
+                return False, ("список областей уменьшился (%s) — не пишу: "
+                               "это потеря, а не замысел" % ", ".join(lost))
         core.CONFIG.parent.mkdir(parents=True, exist_ok=True)
         backup = Path(str(core.CONFIG) + ".bak")
         prev_valid = _copy_if_valid(core.CONFIG, backup)

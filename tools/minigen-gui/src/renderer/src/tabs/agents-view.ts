@@ -7,7 +7,7 @@
  * не «на глаз».
  */
 
-import type { AgentRecord, AgentsSnapshot, KarmanChannel } from '@shared/types'
+import type { AgentRecord, AgentsSnapshot, Area, KarmanChannel } from '@shared/types'
 
 /** Строка агента для таблицы. */
 export interface AgentRow {
@@ -20,6 +20,31 @@ export interface AgentRow {
   requests: number
   /** Чего не хватает в манифесте (пусто — манифест полный). */
   missing: string[]
+}
+
+/**
+ * Строка объединённого списка: **агент и его область — одно и то же**
+ * (заказ владельца 28.11: «Области» и «Агенты» — одно целое, это «Агенты»).
+ *
+ * ⚠️ Ключ строки — **имя области**. Агент без области — тоже строка (видно,
+ * что область не заведена), и область без агента — тоже строка (обычная
+ * рабочая область).
+ */
+export interface MergedRow {
+  /** Имя области — ключ строки. */
+  area: string
+  /** Агент из реестра (если есть). */
+  agent: AgentRow | null
+  /** Живая область из снимка состояния (если есть). */
+  live: Area | null
+  title: string
+  role: string
+  repo: string
+  skills: string[]
+  requests: number
+  missing: string[]
+  /** Агент есть, а области в списке — нет: область не заведена. */
+  areaMissing: boolean
 }
 
 export type Tone = 'ok' | 'warn' | 'bad'
@@ -41,6 +66,20 @@ export interface AgentDraft {
 
 const DASH = '—'
 
+/**
+ * Имя области агента: **без** префикса `p-`.
+ *
+ * ⚠️ Каталог данных области называется `p-<имя>`, а в списке — имя. Мост
+ * уже отдаёт имя (живой случай 28.11 — манифест агента «Идеи» лежал с
+ * `area: p-ideas`, и окно искало область `p-ideas`, которой нет), но
+ * старый манифест может ещё встретиться — поэтому префикс срезается и
+ * здесь.
+ */
+export function areaNameOf(agent: AgentRecord): string {
+  const raw = String(agent?.area ?? '').trim()
+  return raw.startsWith('p-') ? raw.slice(2) : raw
+}
+
 /** Строки агентов: манифест + число заявок. */
 export function agentRows(snapshot: AgentsSnapshot | null): AgentRow[] {
   if (!snapshot) return []
@@ -51,18 +90,77 @@ export function agentRows(snapshot: AgentsSnapshot | null): AgentRow[] {
     const missing: string[] = []
     if (!agent.title) missing.push('название')
     if (!agent.role) missing.push('роль')
-    if (!agent.area) missing.push('область')
+    if (!areaNameOf(agent)) missing.push('область')
     return {
       slug,
       title: (agent.title || '').trim() || slug || DASH,
       role: (agent.role || '').trim() || DASH,
       repo: (agent.repo || '').trim() || DASH,
-      area: (agent.area || '').trim() || `p-${slug}`,
+      area: areaNameOf(agent) || slug,
       skills: agent.skills ?? [],
       requests,
       missing
     }
   })
+}
+
+/**
+ * Объединённый список: агенты реестра и живые области — **одна таблица**.
+ *
+ * ⚠️ Живой случай 28.11: в окне было две вкладки — «Области» и «Агенты» —
+ * и они показывали разное. Агент, созданный в «Агентах», не появлялся в
+ * «Рабочих областях» (дефект записи конфига), и владелец решал, что
+ * программа не работает. Теперь список один: строка — это область, а
+ * агент (если он есть) — её содержание.
+ *
+ * Порядок: сначала живые области (в том порядке, который дал вызывающий —
+ * он сортирует), потом агенты без области (их области не заведены).
+ */
+export function mergedRows(areas: Area[], snapshot: AgentsSnapshot | null): MergedRow[] {
+  const agents = agentRows(snapshot)
+  const byArea = new Map<string, AgentRow>()
+  for (const agent of agents) {
+    const key = (agent.area || '').trim()
+    if (key && !byArea.has(key)) byArea.set(key, agent)
+  }
+  const rows: MergedRow[] = []
+  const seen = new Set<string>()
+  for (const area of areas ?? []) {
+    const slug = (area.slug || '').trim()
+    if (!slug) continue
+    seen.add(slug)
+    const agent = byArea.get(slug) ?? null
+    rows.push({
+      area: slug,
+      agent,
+      live: area,
+      title: agent?.title || area.title || slug,
+      role: agent?.role ?? '',
+      repo: agent?.repo ?? '',
+      skills: agent?.skills ?? [],
+      requests: agent?.requests ?? 0,
+      missing: agent?.missing ?? [],
+      areaMissing: false
+    })
+  }
+  for (const agent of agents) {
+    const key = (agent.area || '').trim()
+    if (!key || seen.has(key)) continue
+    seen.add(key)
+    rows.push({
+      area: key,
+      agent,
+      live: null,
+      title: agent.title,
+      role: agent.role,
+      repo: agent.repo,
+      skills: agent.skills,
+      requests: agent.requests,
+      missing: agent.missing,
+      areaMissing: true
+    })
+  }
+  return rows
 }
 
 /**
@@ -153,16 +251,24 @@ export function createConfirmText(draft: AgentDraft): string {
   return (
     `Создать агента «${title}» (${slug})?\n\n` +
     `Это создаст на GitHub репозиторий Valstan/${slug}, заведёт область ` +
-    `p-${slug}, поставит конституцию и скиллы и запишет агента в реестр.\n\n` +
+    `${slug} (каталог p-${slug}), поставит конституцию и скиллы и запишет ` +
+    `агента в реестр.\n\n` +
     'Продолжить?'
   )
 }
 
-/** Текст подтверждения восстановления агента. */
+/**
+ * Текст подтверждения восстановления агента.
+ *
+ * ⚠️ Называем **имя** области и её каталог: имя — ключ списка, а каталог
+ * данных всегда `p-<имя>` (живой случай 28.11 — манифест агента «Идеи»
+ * лежал с `area: p-ideas`, и области `p-ideas` не существовало).
+ */
 export function applyConfirmText(row: AgentRow): string {
   return (
     `Восстановить агента «${row.title}» на этой машине?\n\n` +
     `Программа склонирует репозиторий ${row.repo}, поставит конституцию и ` +
-    `скиллы и заведёт область ${row.area} (если её нет).\n\nПродолжить?`
+    `скиллы и заведёт область ${row.area} (каталог p-${row.area}), если её нет.\n\n` +
+    'Продолжить?'
   )
 }

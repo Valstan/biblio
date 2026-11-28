@@ -9,7 +9,6 @@ import { api, desktop } from './api'
 import { buildStatsCsv } from './format'
 import { headerStatus } from './tabs/header-status'
 import { TABS, type TabId } from './tabs/tabs'
-import AreasTab from './tabs/AreasTab'
 import StatsTab from './tabs/StatsTab'
 import NetworkTab from './tabs/NetworkTab'
 import ChatTab from './tabs/ChatTab'
@@ -30,7 +29,7 @@ const WORKS_CHECK_SECONDS = 30
 const POOL_SYNC_MINUTES = 10
 
 export default function App() {
-  const [tab, setTab] = useState<TabId>('areas')
+  const [tab, setTab] = useState<TabId>('agents')
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
   const [version, setVersion] = useState<ProgramVersion | null>(null)
@@ -341,8 +340,10 @@ export default function App() {
       )}
 
       <main className="content">
-        {tab === 'areas' && (
-          <AreasTab areas={areas} snapshot={snapshot} run={run} busy={busy} />
+        {/* ⚠️ «Области» и «Агенты» — одна вкладка (заказ владельца 28.11):
+            список один, и в нём видно и агента, и его область. */}
+        {tab === 'agents' && (
+          <AgentsTab areas={areas} snapshot={snapshot} run={run} busy={busy} />
         )}
         {tab === 'stats' && <StatsTab run={run} busy={busy} />}
         {tab === 'network' && <NetworkTab snapshot={snapshot} run={run} busy={busy} />}
@@ -352,7 +353,6 @@ export default function App() {
           <GenesTab openWorks={openWorks} onWorksClosed={() => setOpenWorks(false)} />
         )}
         {tab === 'cuttings' && <CuttingsTab onOpenGenes={() => setTab('genes')} />}
-        {tab === 'agents' && <AgentsTab />}
         {tab === 'prompts' && <PromptsTab />}
         {tab === 'update' && <UpdateTab />}
         {tab === 'settings' && (

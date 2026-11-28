@@ -170,7 +170,9 @@ def main() -> int:
         # ── 2) «Режима» больше нет (промт КАРМАНА #182) ───────────────────
         print("2) «Режима» нет: ручного режима не осталось")
         mode_src = read(TABS / "areas-mode.ts") if (TABS / "areas-mode.ts").is_file() else ""
-        tab_src = read(TABS / "AreasTab.tsx")
+        # ⚠️ Заказ владельца 28.11: «Области» и «Агенты» — одна вкладка,
+        # файл `AreasTab.tsx` удалён ⇒ смотрим объединённую «Агенты».
+        tab_src = read(TABS / "AgentsTab.tsx")
         check(not mode_src, "модуль кнопок «Режима» снова в коде")
         check("MODE_BUTTONS" not in tab_src,
               "ячейка «Режима» снова рисуется из списка кнопок")

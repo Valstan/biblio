@@ -67,7 +67,9 @@ core.HOT_FILES = {
     92: ["tools/minigen-gui/bridge/minigen_state.py",
          "tools/minigen-gui/src/main/index.ts", "tools/minigen-gui/src/main/bridge.ts"],
     94: ["tools/minigen-gui/src/shared/types.ts",
-         "tools/minigen-gui/src/renderer/src/tabs/AreasTab.tsx"],
+         # ⚠️ 28.11: «Области» и «Агенты» сведены в одну вкладку — файла
+         # `AreasTab.tsx` больше нет.
+         "tools/minigen-gui/src/renderer/src/tabs/AgentsTab.tsx"],
     96: ["tools/minimax-project-areas/minimax-sessionwatch.py",
          "tools/minimax-project-areas/minigen_core.py",
          "tools/minimax-project-areas/minigen_rollout.py"],

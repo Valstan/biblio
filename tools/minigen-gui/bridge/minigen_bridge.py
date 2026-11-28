@@ -265,8 +265,40 @@ class Bridge:
         self.handlers = self._build_handlers()
         self.migrate_legacy_prompts()
         enforce_autoheal()
+        self.heal_areas()
         self.start_daemon_supervision()
         self.start_prompt_dispatch()
+
+    def heal_areas(self) -> None:
+        """Починить список областей, если он потерян (живой случай 28.11).
+
+        ⚠️ Конфиг областей — **локальная вещь машины**: его нет в git, и
+        единственная страховка — копия рядом. На живой машине конфиг
+        пропал (файл удалили), и программа полдня показывала «0 областей»,
+        а создание агента область не заводило (дефект `or []` в
+        `cmd_create`). Теперь список собирается заново из того, что
+        машина знает: копии конфига, локальных каталогов и реестра агентов.
+
+        Обычный путь (список на месте) — ничего не пишет.
+        """
+        try:
+            res = state.areas_selfheal()
+        except Exception as exc:  # noqa: BLE001 — починка не роняет программу
+            try:
+                self.core.log("Панель «МиниГен»: не удалось починить список областей: %s"
+                              % exc)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        if not res.get("healed"):
+            return
+        try:
+            self.core.log(
+                "Панель «МиниГен»: список областей восстановлен — всего %d, "
+                "добавлено: %s" % (int(res.get("areas") or 0),
+                                   ", ".join(res.get("added") or []) or "нет"))
+        except Exception:  # noqa: BLE001
+            pass
 
     def migrate_legacy_prompts(self) -> None:
         """Перенести старую базу хранилища промтов в универсальную базу.
@@ -401,6 +433,7 @@ class Bridge:
             "areas.restart": self.cmd_restart,
             "areas.relogin": self.cmd_relogin,
             "areas.create": self.cmd_create,
+            "areas.rebuild": self.cmd_areas_rebuild,
             "sessions.list": self.cmd_sessions_list,
             "sessions.read": self.cmd_sessions_read,
             "sessions.send": self.cmd_sessions_send,
@@ -847,6 +880,21 @@ class Bridge:
         заведён (область недоделана: копирование шаблона упало на занятом
         файле). Тогда шаблон **доносится** в существующий каталог, а проект
         регистрируется.
+
+        ⚠️ **Живой случай 28.11: область не появлялась в списке.**
+        Здесь было `projects = cfg.get("projects") or []` — при **пустом**
+        списке `or` даёт **новый** список, и `projects.append(...)` уходил
+        в этот временный список, а в конфиг писался пустой. Список от
+        этого оставался пустым, и **ни одна** область не заводилась
+        (живой случай: агент создан, а в «Рабочих областях» пусто).
+
+        Теперь:
+        - список берётся **объединением** известного (`merged_projects`):
+          конфиг, его копия, локальные каталоги и реестр агентов ⇒ потеря
+          конфига больше не стирает области;
+        - `cfg["projects"]` пересобирается перед записью — append не теряется;
+        - каталог области есть, а в списке её нет ⇒ область **доделывается**
+          (дожимаем шаблон и регистрируем), а не отвергаемся.
         """
         slug = str(args.get("slug") or "").strip().lower()
         title = str(args.get("title") or slug).strip()
@@ -855,14 +903,19 @@ class Bridge:
         if not slug or not all(ch.isalnum() or ch in "-_" for ch in slug):
             return {"error": "slug: только латиница, цифры, дефис и подчёркивание"}
         cfg = state.read_projects()
-        projects = cfg.get("projects") or []
-        if any(p.get("slug") == slug for p in projects):
+        if any(str((p or {}).get("slug") or "") == slug
+               for p in (cfg.get("projects") or [])):
             return {"error": "область %s уже есть" % slug}
+        # Всё, что машина знает об областях, — плюс новая. Ничего не теряем.
+        projects = state.merged_projects()
         area_dir = state.AREAS_ROOT / ("p-" + slug)
         resume = bool(args.get("resume"))
         if area_dir.exists() and not resume:
-            return {"error": "каталог %s уже есть" % area_dir}
-        template = str(cfg.get("authTemplate") or "")
+            # Каталог есть, а области в списке нет ⇒ область недоделана
+            # (список потерялся, а каталог остался). Доделываем её, а не
+            # отказываем: иначе потерянная область не вернётся никогда.
+            resume = True
+        template = state.auth_template()
         copied = ""
         skipped: list[str] = []
         if template and Path(template).is_dir():
@@ -870,13 +923,22 @@ class Bridge:
             copied = template
         else:
             area_dir.mkdir(parents=True, exist_ok=True)
-        projects.append({
+        entry = {
             "slug": slug, "title": title, "folder": folder,
             "karman": karman,
             # ⚠️ Промт КАРМАНА #182: новая область стартует **в автомате** —
             # автомат аккаунтов всегда включён, ручного режима нет.
             "autoheal": True,
-        })
+        }
+        known = next((p for p in projects
+                      if str(p.get("slug") or "") == slug), None)
+        if known is None:
+            projects.append(entry)
+        else:
+            # область уже известна (каталог на диске или реестр агентов) —
+            # дополняем её сведениями, а не заводим вторую
+            known.update({key: value for key, value in entry.items() if value})
+        cfg["projects"] = projects
         ok, err = state.write_projects(cfg)
         if not ok:
             return {"error": "конфиг не записан: %s" % err}
@@ -901,6 +963,26 @@ class Bridge:
                 "auth_from": copied, "folder": folder,
                 "shortcut": shortcut_note, "folder_note": folder_note,
                 "skipped": skipped}
+
+    def cmd_areas_rebuild(self, args: dict[str, Any]) -> dict[str, Any]:
+        """Пересобрать список областей по машине (кнопка «Починить список»).
+
+        ⚠️ После потери конфига области возвращаются из того, что машина
+        знает: локальной копии конфига, каталогов данных (`p-<имя>`) и
+        реестра агентов (живой случай 28.11 — конфиг пропал, окно показало
+        «0 областей», и агент создан, а область не появилась).
+        """
+        res = state.areas_selfheal(force=True)
+        if not res.get("ok"):
+            return {"error": res.get("error") or "список областей не собран"}
+        added = res.get("added") or []
+        try:
+            self.core.log("Панель «МиниГен»: список областей пересобран — всего %d, "
+                          "добавлено: %s" % (int(res.get("areas") or 0),
+                                             ", ".join(added) or "нет"))
+        except Exception:  # noqa: BLE001
+            pass
+        return res
 
     # ────────────────────────────────────────────────────────────── сессии
     def _area(self, slug: str) -> dict[str, Any]:
@@ -1804,9 +1886,14 @@ class Bridge:
             return created
         result = dict(created)
         if make_area:
-            area_dir = state.AREAS_ROOT / ("p-" + area_slug)
-            if area_dir.exists():
-                result["area_note"] = "область %s уже была" % area_slug
+            # ⚠️ Область заводим **по списку**, а не по каталогу: каталог
+            # мог остаться, а область из списка выпасть (живой случай 28.11 —
+            # потерялся конфиг, и агент создан, а в «Рабочих областях» пусто).
+            cfg = state.read_projects()
+            registered = any(str((p or {}).get("slug") or "") == area_slug
+                             for p in (cfg.get("projects") or []))
+            if registered:
+                result["area_note"] = "область %s уже есть" % area_slug
             else:
                 area = self.cmd_create({
                     "slug": area_slug,
@@ -1835,11 +1922,16 @@ class Bridge:
         if applied.get("error"):
             return applied
         result = dict(applied)
-        area_slug = str(result.get("area") or "")
-        area_dir = state.AREAS_ROOT / ("p-" + area_slug)
-        if area_slug and not area_dir.exists():
+        area_name = str(result.get("area") or "")
+        # ⚠️ Как и при создании: область заводим **по списку**, а не по
+        # каталогу — «Восстановить» должно возвращать агента вместе с его
+        # областью, а не только файлы (живой случай 28.11).
+        cfg = state.read_projects()
+        registered = any(str((p or {}).get("slug") or "") == area_name
+                         for p in (cfg.get("projects") or []))
+        if area_name and not registered:
             created = self.cmd_create({
-                "slug": area_slug,
+                "slug": area_name,
                 "title": slug,
                 "folder": str(result.get("repo_path") or ""),
                 "karman": slug,
@@ -1848,7 +1940,7 @@ class Bridge:
                 result["area_note"] = "область не заведена: %s" % created.get("error")
             else:
                 result["area_dir"] = created.get("dir")
-                again = agents_mod.install_skills(area_slug, Path(result["repo_path"]))
+                again = agents_mod.install_skills(area_name, Path(result["repo_path"]))
                 result["skills_installed"] = again.get("installed") or []
         return result
 
