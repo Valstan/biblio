@@ -924,9 +924,17 @@ def handle_lane(lane: dict, ls: dict, snap: dict, now: float) -> str:
     if phase == "closing":
         new_turn = (turn.get("turn_id") or "") and turn.get("turn_id") != cur.get("turn_at_close")
         finished = turn.get("status") in ("completed", "failed")
+        # ⚠️ Ход ещё идёт ⇒ сессия жива ⇒ архивировать её нельзя: команда
+        #    закрытия могла прийти посреди работы (28.11: смена аккаунта
+        #    лечащим ⇒ провайдер отказал ⇒ команда ушла в живой код). Агент
+        #    после неё продолжает работу и сам допишет сводку — тогда и
+        #    архивируем.
+        if busy:
+            return "busy"
         if (new_turn and finished) or now - (cur.get("since") or now) > CLOSE_WAIT_SEC:
             archive_session(lane, cur["sid"])
             ls["cur"] = None
+            ls["dead_turn"] = ""
             return "free"
         return "busy"
 
