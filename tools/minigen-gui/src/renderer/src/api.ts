@@ -1,4 +1,6 @@
 import type {
+  AgentDeletePlan,
+  AgentDeleteResult,
   Area,
   AgentsSnapshot,
   ChatAttachment,
@@ -87,6 +89,15 @@ export const api = {
   relogin: (slug: string) => call<{ ok: boolean; error?: string }>('areas.relogin', { slug }),
   createArea: (payload: Record<string, unknown>) =>
     call<{ ok: boolean; error?: string; slug?: string }>('areas.create', payload),
+  /**
+   * Удалить агента целиком (промт КАРМАНА #208).
+   *
+   * Два шага: без `confirm` мост отдаёт **план** (что исчезнет и что с
+   * синхронизацией с GitHub), с `confirm: true` — удаляет.
+   */
+  deleteAgentPlan: (slug: string) => call<AgentDeletePlan>('areas.delete_agent', { slug }),
+  deleteAgent: (slug: string) =>
+    call<AgentDeleteResult>('areas.delete_agent', { slug, confirm: true }),
   sessions: (slug: string) => call<{ sessions: unknown[] }>('sessions.list', { slug }),
   networkCheck: () => call<NetworkState>('network.check'),
   journal: (params: { limit?: number; contains?: string; tag?: string }) =>

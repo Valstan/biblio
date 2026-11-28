@@ -329,6 +329,22 @@ export interface SessionVerdict {
   last_text?: string
 }
 
+/**
+ * Счётчик активности области (промт КАРМАНА #208).
+ *
+ * ⚠️ Считает **автомат аккаунтов** (по журналу), а не человек на глаз:
+ * - `granted` — сколько раз Карман отдал области аккаунт;
+ * - `updated` — сколько раз автомат обновил вход области этим аккаунтом;
+ * - `total` — сумма (её и показывает окно и по ней строит порядок);
+ * - `last` — когда было последнее такое событие.
+ */
+export interface AreaActivity {
+  granted: number
+  updated: number
+  total: number
+  last?: string
+}
+
 export interface Area {
   slug: string
   title: string
@@ -347,6 +363,12 @@ export interface Area {
   account: AccountState
   sessions: SessionVerdict[]
   points?: AccountState & { points_today?: number; next_points?: number; state?: string }
+  /**
+   * Счётчик активности области (промт КАРМАНА #208): сколько раз она
+   * получала аккаунты и обновления аккаунтов из Кармана. Считает автомат
+   * аккаунтов по журналу — значение приходит из моста, а не считается в окне.
+   */
+  activity?: AreaActivity
   /**
    * Переключатель «водитель проекта» (промт КАРМАНА #174, слова владельца —
    * #177; **два** положения — заказ владельца 27.11): «Миниген» (`automaton`)
@@ -373,6 +395,64 @@ export interface DriverState {
   title: string
   why: string
   source: string
+}
+
+/**
+ * Что удалится вместе с агентом (промт КАРМАНА #208). Показывается
+ * владельцу **до** удаления — решение должно быть видно, а не молчаливым.
+ */
+export interface DeleteTarget {
+  /** что это: «рабочая папка проекта», «паспорта ниток области», … */
+  what: string
+  path: string
+  exists: boolean
+}
+
+/**
+ * Состояние синхронизации агента с GitHub: всё ли отправлено.
+ * Если нет — удаление не проходит, и видно, что именно осталось.
+ */
+export interface AgentGitSync {
+  is_repo: boolean
+  branch: string
+  remote: string
+  upstream: string
+  /** незакоммиченные правки (файлы) */
+  dirty: string[]
+  /** неотправленные коммиты (строки `git log`) */
+  unpushed: string[]
+  ok: boolean
+  why: string
+}
+
+/** План удаления агента (ответ моста `areas.delete_agent` без `confirm`). */
+export interface AgentDeletePlan {
+  ok?: boolean
+  planned?: boolean
+  slug: string
+  title: string
+  folder: string
+  targets: DeleteTarget[]
+  git: AgentGitSync
+  can_delete: boolean
+  why: string
+  note?: string
+  error?: string
+}
+
+/** Результат удаления агента (ответ моста `areas.delete_agent` с `confirm`). */
+export interface AgentDeleteResult {
+  ok: boolean
+  slug?: string
+  /** что удалено (список строк) */
+  removed?: string[]
+  /** что НЕ удалось и почему */
+  failed?: { what: string; path?: string; why?: string }[]
+  /** процессы остановлены? */
+  stopped?: { stopped?: boolean; killed?: number; why?: string }
+  git?: AgentGitSync
+  note?: string
+  error?: string
 }
 
 export interface NetworkPath {

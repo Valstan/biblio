@@ -724,3 +724,89 @@ table.grid td.col-driver {
   font-size: 12px;
   color: var(--warn);
 }
+
+/* ── работающий агент: цвет ВСЕЙ строки (промт КАРМАНА #208) ───────────────
+   Колонки «Работает» больше нет: признак «область запущена» виден по фону
+   строки. Фон — тёплый фиолетово-серый: он заметно отличается от обычных
+   тёмно-синих строк (#1b232b), но не спорит с зелёными кнопками и не
+   сливается с синим акцентом. Текст (#e6edf3) на нём читается: контраст
+   ~11:1. */
+table.grid tbody tr.row-running > td {
+  background: #2b2740;
+  border-bottom-color: #3b3560;
+}
+
+/* Полоска слева — дополнительный, не единственный признак «работает». */
+table.grid tbody tr.row-running > td:first-child {
+  box-shadow: inset 3px 0 0 #8f86d8;
+}
+
+/* Счётчик активности области — под именем агента (промт КАРМАНА #208). */
+table.grid td .activity {
+  margin-top: 2px;
+  font-size: 11px;
+}
+
+/* ── удаление агента (промт КАРМАНА #208) ───────────────────────────────
+   Кнопка удаления — в ряду действий; подтверждение — карточкой снизу, где
+   видно, что именно исчезнет. */
+button.danger {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #1b0b0b;
+  font-weight: 600;
+}
+
+button.danger:hover:not(:disabled) {
+  border-color: #ff7b72;
+}
+
+button.danger-ghost {
+  color: var(--bad);
+  border-color: #6b3230;
+}
+
+button.danger-ghost:hover:not(:disabled) {
+  border-color: var(--bad);
+  color: #ff9a94;
+}
+
+.delete-card {
+  border-color: #6b3230;
+}
+
+.delete-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 8px 0;
+  max-height: 220px;
+  overflow: auto;
+}
+
+.delete-target {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg-soft);
+}
+
+.delete-what {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.delete-card ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
+.banner.bad ul {
+  margin: 4px 0 0;
+  padding-left: 18px;
+}
+
