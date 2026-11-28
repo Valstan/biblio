@@ -366,7 +366,7 @@ def work_fingerprint(passport: dict[str, Any]) -> str:
     крутиться вхолостую («сессия за сессией, а работы столько же»). Сравнивать
     **прозу** сводки ненадёжно: новая сессия ответит «всё уже сделано», сводка
     изменится — и кружение продолжится. Поэтому сравниваем **работу**: коммиты
-    ветки, число открытых PR и счётчик «впереди origin/master».
+    ветки, изменённые файлы, открытые PR и счётчик «впереди origin/master».
 
     Пустой отпечаток — сравнивать нечего (репозитория нет) ⇒ кружение не
     блокируем.
@@ -374,11 +374,43 @@ def work_fingerprint(passport: dict[str, Any]) -> str:
     commits = [str(c or "") for c in (passport.get("commits") or [])][:8]
     prs = sorted(str((p or {}).get("number") or "")
                  for p in (passport.get("prs") or []) if isinstance(p, dict))
+    files = sorted(str(f or "") for f in (passport.get("files") or []))[:40]
     branch = str(passport.get("branch") or "")
-    if not branch and not commits and not prs:
+    if not branch and not commits and not prs and not files:
         return ""
     return "|".join([branch, str(len(commits)), ",".join(commits),
+                     str(len(files)), ",".join(files),
                      ",".join(prs), str(int(passport.get("ahead") or 0))])
+
+
+def thread_advanced(prev: dict[str, Any], fingerprint: str,
+                    done_now: str = "") -> tuple[bool, str]:
+    """Продвинулась ли нитка с прошлого переноса? (промт КАРМАНА #186)
+
+    ⚠️ Решает **состояние работы** (git), а не проза сводки:
+      * состояние работы сравнить **нечем** (нет репозитория, отпечаток пуст)
+        ⇒ сравниваем прозу сводки (последнее средство);
+      * состояние работы **не изменилось** ⇒ нитка не продвинулась ⇒ новая
+        сессия не поднимается (иначе круг: сессия за сессией, а работы столько
+        же). Проза сводки тут не аргумент: новая сессия ответит «всё уже
+        сделано» — и сводка изменится, а работа — нет;
+      * состояние работы изменилось ⇒ нитка продвинулась (даже если сводка
+        выглядит так же) ⇒ перенос разрешён.
+
+    Возвращает `(продвинулась, почему)`.
+    """
+    prev_fp = str((prev or {}).get("fp") or "")
+    prev_done = str((prev or {}).get("done") or "").strip()
+    if not prev:
+        return True, "первый перенос нитки — сравнивать не с чем"
+    if fingerprint and prev_fp:
+        if fingerprint == prev_fp:
+            return False, "работа та же (состояние git не изменилось)"
+        return True, "работа продвинулась (состояние git изменилось)"
+    same_prose = bool(done_now and done_now.strip() == prev_done)
+    if same_prose:
+        return False, "та же сводка (состояние работы сравнить нечем)"
+    return True, "сводка изменилась"
 
 
 def build_passport(area: dict, sess: dict, context: dict[str, Any],

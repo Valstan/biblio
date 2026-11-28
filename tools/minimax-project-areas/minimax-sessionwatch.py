@@ -181,8 +181,20 @@ ROLE_RULE = "правило-фолбэк"
 CLOSED_SESSION_NOTE = "сессия уже закрыта — команда не отправлялась"
 #: Строка в журнале: та же команда уже уходила в эту сессию (промт #184, п. 3).
 REPEAT_NOTE = "та же команда уже отправлялась в эту сессию — не отправлялась"
+#: Строка в журнале: команду закрытия в эту сессию уже слали (промт #186).
+#:
+#: ⚠️ Команда закрытия — **особый случай**: её в одну сессию шлют **один раз**,
+#: и неважно, кто её послал — сторож сессий или ночная карусель полос. Живой
+#: случай 27–28.11: 36 команд закрытия в одну сессию (35 в цикле, раз в
+#: ~1,5 минуты) — притом что работа сессии была закончена.
+CLOSE_ONCE_NOTE = "команда закрытия в эту сессию уже уходила — не отправлялась"
+#: Ключ в лекарке команд: «команду закрытия в эту сессию уже слали».
+CLOSE_MARK = "__close__"
 #: Сколько сессий держим в лекарке команд (файл на машине не должен расти вечно).
 LEDGER_MAX_SESSIONS = 2000
+#: Сколько записей держим на одну сессию (смена аккаунта — новая запись каждый
+#: раз, а сессия живёт долго ⇒ без предела файл на машине рос бы вечно).
+LEDGER_MAX_PER_SESSION = 60
 
 
 # ────────────────────────────────────────────────────────── чтение рантайма
@@ -706,15 +718,37 @@ def command_signature(text: str, tag: str = "") -> str:
 
 
 def sends_ledger() -> dict:
-    """Лекарка команд: сессия → отпечаток команды → когда уходила."""
+    """Лекарка команд: сессия → отпечаток команды → когда уходила.
+
+    ⚠️ ПРОМТ КАРМАНА #186: это **общее состояние**, а не внутреннее дело
+    сторожа. Его читают и сторож сессий, и ночная карусель полос (она тоже
+    пишет в сессии) ⇒ правило «не командуй закрытую сессию» и «не повторяй
+    команду» живут в одном месте и читаются всеми.
+    """
     return core.read_state(core.SESSION_SENDS_STATE)
 
 
-def remember_send(session_id: str, signature: str, text: str) -> None:
-    """Записать в лекарку: эта команда в эту сессию уже уходила."""
+def close_requested(session_id: str) -> bool:
+    """Команду закрытия в эту сессию уже слали? (кто угодно: сторож или карусель)"""
+    if not session_id:
+        return False
+    return bool((sends_ledger().get(session_id) or {}).get(CLOSE_MARK))
+
+
+def remember_send(session_id: str, signature: str, text: str,
+                  is_close: bool = False) -> None:
+    """Записать в лекарку: эта команда в эту сессию уже уходила.
+
+    `is_close` — это **команда закрытия** сессии: она попадает в лекарку ещё и
+    отдельной отметкой (`CLOSE_MARK`) ⇒ вторую такую команду в ту же сессию не
+    пошлёт ни сторож, ни карусель (промт #186, живой случай 27–28.11).
+    """
     ledger = sends_ledger()
     rec = ledger.setdefault(session_id, {})
-    rec[signature] = {"at": core.now_ms(), "text": (text or "")[:200]}
+    stamp = core.now_ms()
+    rec[signature] = {"at": stamp, "text": (text or "")[:200]}
+    if is_close:
+        rec[CLOSE_MARK] = {"at": stamp, "text": (text or "")[:200]}
     # Файл не должен расти вечно: держим последние сессии (по времени последней
     # команды). Старые сессии всё равно закрыты ⇒ их прикрывает стража
     # «сессия уже закрыта».
@@ -725,11 +759,22 @@ def remember_send(session_id: str, signature: str, text: str) -> None:
             return max(stamps) if stamps else 0
         for old in sorted(ledger, key=last_at)[:len(ledger) - LEDGER_MAX_SESSIONS]:
             ledger.pop(old, None)
+    # …и записи внутри сессии тоже ограничены (смена аккаунта добавляет запись
+    # каждый раз, а сессия живёт неделями).
+    if len(rec) > LEDGER_MAX_PER_SESSION:
+        def rec_at(item) -> int:
+            value = (item or {}).get("at") if isinstance(item, dict) else 0
+            return int(value or 0)
+        for old in sorted([k for k in rec if k != CLOSE_MARK], key=rec_at)[
+                :len(rec) - LEDGER_MAX_PER_SESSION]:
+            rec.pop(old, None)
     core.write_state(core.SESSION_SENDS_STATE, ledger)
 
 
 def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
-                     force: bool = False, tag: str = "", why: str = "") -> dict:
+                     force: bool = False, tag: str = "", why: str = "",
+                     is_close: bool = False, finished: dict = None,
+                     force_closed: bool = False, check_closed: bool = True) -> dict:
     """Отправить сообщение в СУЩЕСТВУЮЩУЮ сессию области.
 
     `mcode exec --session <id>` работает в контексте области (через
@@ -747,7 +792,26 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
       2. **та же команда уже уходила** в эту сессию при той же ситуации ⇒
          повтор невозможен (лекарка команд — общая для всех, кто пишет в
          сессию: и сторож, и карусель полос, и панель).
-    Обе стражи пишут в журнал словами — видно, что команда **не** ушла.
+
+    ⚠️ ПРОМТ КАРМАНА #186 — **третья стража**: команда закрытия в одну сессию
+    уходит **один раз**, кто бы её ни послал (сторож или карусель). Живой
+    случай 27–28.11: 36 команд закрытия в одну сессию, 35 из них — в цикле
+    раз в ~1,5 минуты.
+
+    Обе (все три) стражи стоят здесь — **одном месте для всех**, кто пишет в
+    сессию, и читают они **одно** состояние (`core.SESSION_SENDS_STATE`).
+
+    Параметры:
+      * `force` — снять запрет «это сессия Управляющего / проба» (команда
+        водителя своей полосы; карусель — водитель своих полос);
+      * `force_closed` — снять и стражи «сессия закрыта» / «повтор» (ручная
+        команда владельца; автомат это право не имеет);
+      * `check_closed` — проверять ли «сессия уже закрыта» по рантайму
+        (карусель — нет: у неё своё понимание «работа закончена», см.
+        `finished`);
+      * `finished` — «работа этой сессии уже закончена?» (словарь
+        `{"done": bool, "why": str}`) — вызывающий знает лучше: карусель
+        знает свои сданные промты, сторож — состояние рантайма.
     """
     core.refresh_env()
     if not force and probe_of(area, sess):
@@ -760,24 +824,42 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
         # право имеет.
         return {"ok": False, "why": "сессия Управляющего — автомат её не трогает"}
     signature = command_signature(text, tag)
-    if not force:
+    sid = sess.get("session_id") or ""
+    if not force_closed:
         # 1) Сессия уже закрыта? — состояние перечитываем **прямо сейчас**.
-        st = session_state(area, sess.get("session_id") or "")
-        if st.get("closed"):
+        st = session_state(area, sid)
+        if check_closed and st.get("closed"):
             note = "%s (%s)" % (CLOSED_SESSION_NOTE, st.get("why") or "")
-            core.log("СЕССИИ: %s — %s" % (str(sess.get("session_id") or "")[:12], note))
+            core.log("СЕССИИ: %s — %s" % (sid[:12], note))
             core.report("info", "session", "%s: %s — %s"
-                        % (area.get("slug") or "", str(sess.get("session_id") or "")[:12],
-                           note), area=str(area.get("slug") or ""))
+                        % (area.get("slug") or "", sid[:12], note),
+                        area=str(area.get("slug") or ""))
+            return {"ok": False, "why": note, "closed": True}
+        # 1b) Работа закончена по словам вызывающего (карусель: промт сдан и
+        #     выполнен ⇒ работать больше нечего).
+        if finished and finished.get("done"):
+            note = "%s (%s)" % (CLOSED_SESSION_NOTE, finished.get("why") or "")
+            core.log("СЕССИИ: %s — %s" % (sid[:12], note))
+            core.report("info", "session", "%s: %s — %s"
+                        % (area.get("slug") or "", sid[:12], note),
+                        area=str(area.get("slug") or ""))
             return {"ok": False, "why": note, "closed": True}
         # 2) Та же команда уже была в этой сессии при той же ситуации?
-        prev = (sends_ledger().get(sess.get("session_id") or "") or {}).get(signature)
+        prev = (sends_ledger().get(sid) or {}).get(signature)
         if prev:
             note = "%s (%s)" % (REPEAT_NOTE, why or "ситуация не изменилась")
-            core.log("СЕССИИ: %s — %s" % (str(sess.get("session_id") or "")[:12], note))
+            core.log("СЕССИИ: %s — %s" % (sid[:12], note))
             core.report("info", "session", "%s: %s — %s"
-                        % (area.get("slug") or "", str(sess.get("session_id") or "")[:12],
-                           note), area=str(area.get("slug") or ""))
+                        % (area.get("slug") or "", sid[:12], note),
+                        area=str(area.get("slug") or ""))
+            return {"ok": False, "why": note, "repeat": True}
+        # 3) Команду закрытия в эту сессию уже слали? (сторож или карусель)
+        if is_close and close_requested(sid):
+            note = "%s (сессия %s)" % (CLOSE_ONCE_NOTE, sid[:12])
+            core.log("СЕССИИ: %s — %s" % (sid[:12], note))
+            core.report("info", "session", "%s: %s — %s"
+                        % (area.get("slug") or "", sid[:12], note),
+                        area=str(area.get("slug") or ""))
             return {"ok": False, "why": note, "repeat": True}
     folder = sess.get("workspace_dir") or area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
@@ -796,7 +878,7 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
     if background:
         time.sleep(3)
         if proc.poll() is None:
-            remember_send(sess["session_id"], signature, text)
+            remember_send(sid, signature, text, is_close=is_close)
             return {"ok": True, "why": "ход пошёл (pid %s)" % proc.pid}
         return {"ok": False, "why": "процесс умер сразу (rc=%s)" % proc.returncode}
     out = ""
@@ -804,7 +886,7 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
         out = ((proc.stdout or "") + (proc.stderr or "")).strip()
     ok = bool(proc and proc.returncode == 0)
     if ok:
-        remember_send(sess["session_id"], signature, text)
+        remember_send(sid, signature, text, is_close=is_close)
     return {"ok": ok, "why": out[-400:]}
 
 
@@ -994,9 +1076,13 @@ def reset_session(area: dict, sess: dict, brief: str = "") -> dict:
     trig = area_compaction_trigger(area)
     report["steps"].append({"compaction_trigger": trig})
     # 1) правильно завершить: сводка + handoff (нить не теряется)
+    # ⚠️ Это **ручной** инструмент владельца (кнопка в окне, ключ `--reset`) ⇒
+    # стражи «сессия уже закрыта» и «повтор» его не ограничивают: владелец
+    # сам решил, что этой сессии нужен сброс (промт #186).
     res = send_to_session(area, sess, RESET_COMMAND, background=True, force=True,
                           tag="сброс на месте:%s" % sess["session_id"][:12],
-                          why="команда завершения перед сбросом на месте")
+                          why="команда завершения перед сбросом на месте",
+                          force_closed=True)
     report["steps"].append({"close_command": res})
     if not res.get("ok"):
         report["ok"] = False
@@ -1013,7 +1099,8 @@ def reset_session(area: dict, sess: dict, brief: str = "") -> dict:
     text = brief or continuation_brief(area, sess)
     again = send_to_session(area, sess, text, background=True, force=True,
                             tag="сброс на месте:%s" % sess["session_id"][:12],
-                            why="продолжение после сброса на месте")
+                            why="продолжение после сброса на месте",
+                            force_closed=True)
     report["steps"].append({"continued": again})
     report["ok"] = bool(again.get("ok"))
     report["why"] = again.get("why")
@@ -1038,7 +1125,8 @@ def rotate_session(area: dict, sess: dict, brief: str = "") -> dict:
                 % (sess["session_id"][:12], sess["title"][:50]))
     res = send_to_session(area, sess, CLOSE_COMMAND, background=True, force=True,
                           tag="ротация:%s" % sess["session_id"][:12],
-                          why="команда закрытия перед ротацией")
+                          why="команда закрытия перед ротацией",
+                          is_close=True)
     report["steps"].append({"close_command": res})
     if not res.get("ok"):
         report["ok"] = False
@@ -1310,7 +1398,8 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
             res = send_to_session(area, sess, CLOSE_COMMAND, background=True,
                                   tag="закрытие:%s" % situation_token(verdict),
                                   why="команда закрытия по решению «%s»"
-                                      % (decision.get("source") or "правило"))
+                                      % (decision.get("source") or "правило"),
+                                  is_close=True)
             report["steps"].append({"close_command": res})
             if not res.get("ok"):
                 report["why"] = "команду закрытия не приняли: %s" % res.get("why")
@@ -1325,9 +1414,11 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         report["ok"] = bool(arc.get("ok"))
         # ⚠️ Промт #184, п. 2: правда в журнале — «завершено по решению
         # «Управляющего»» писалось даже тогда, когда решение приняло правило-
-        # фолбэк. Источник решения — его настоящее имя.
+        # фолбэк. Источник решения — его настоящее имя (те же слова, что и в
+        # строке лечения: «решение принял …»).
+        decided = ROLE_MANAGER if str(decision.get("source") or "") == ROLE_MANAGER else ROLE_RULE
         report["why"] = ("завершено по решению «%s»: %s"
-                         % (decision.get("source") or ROLE_RULE, arc.get("why")))
+                         % (decided, arc.get("why")))
         return report
     if action == thread.NEW_SESSION:
         # Перенос нитки: паспорт → завершение → архив → новая сессия.
@@ -1338,7 +1429,8 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         else:
             res = send_to_session(area, sess, CLOSE_COMMAND, background=True,
                                   tag="закрытие:%s" % situation_token(verdict),
-                                  why="команда закрытия перед переносом нитки")
+                                  why="команда закрытия перед переносом нитки",
+                                  is_close=True)
             report["steps"].append({"close_command": res})
             if not res.get("ok"):
                 report["why"] = "команду закрытия не приняли: %s" % res.get("why")
@@ -1390,25 +1482,22 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         # за сессией, а работы столько же). Запись — в состоянии сторожа, по
         # нитке (thread_id).
         #
-        # ⚠️ ПРОМТ КАРМАНА #184: сравнивать **прозу** сводки ненадёжно — новая
+        # ⚠️ ПРОМТ КАРМАНА #186: сравнивать **прозу** сводки ненадёжно — новая
         # сессия ответит «всё уже сделано», сводка изменится, и кружение
-        # продолжится. Поэтому сравниваем **состояние работы** (коммиты, PR,
-        # «впереди origin/master»): работа не продвинулась — новая сессия не
-        # поднимается.
+        # продолжится. Поэтому решает **состояние работы** (git: коммиты,
+        # файлы, PR, «впереди origin/master»), а проза — только запасной
+        # вариант, когда состояние работы сравнить нечем.
         rot = state.setdefault("rotations", {})
         tid = str(passport.get("thread_id") or "")
         prev = rot.get(tid) or {}
         done_now = summary.strip()
         fingerprint = thread.work_fingerprint(passport)
-        prev_fp = str(prev.get("fp") or "")
-        same_prose = bool(done_now and done_now == str(prev.get("done") or "").strip())
-        same_work = bool(fingerprint and prev_fp and fingerprint == prev_fp)
-        if prev and (same_prose or same_work):
+        advanced, why_advanced = thread.thread_advanced(prev, fingerprint, done_now)
+        if not advanced:
             rot[tid] = {"done": done_now, "at": core.now_ms(), "fp": fingerprint}
             report["ok"] = True
             report["why"] = ("нитка не продвинулась с прошлого переноса (%s) — "
-                             "новая сессия не поднимается"
-                             % ("работа та же" if same_work else "та же сводка"))
+                             "новая сессия не поднимается" % why_advanced)
             core.log("СЕССИИ: %s — нитка не продвинулась с прошлого переноса: "
                      "новая сессия не поднимается" % sess["session_id"][:12])
             return report
@@ -1478,6 +1567,22 @@ def treat_session(area: dict, sess: dict, verdict: dict, state: dict,
                    report["decided_by"], report["done_by"], drv["title"],
                    report.get("why")),
                 area=str(area.get("slug") or ""))
+    # ⚠️ ПРОМТ КАРМАНА #186: в «ящике отчётов» должно быть видно, что это
+    # говорит **встроенная нейросеть программы**. Решение «Управляющего» —
+    # это работа нейросети ⇒ отдельный вид отчёта (`model`), а решение
+    # правила-фолбэка остаётся видом `session` (это говорит программа).
+    if report["decided_by"] == ROLE_MANAGER:
+        core.report("info", core.KIND_MODEL,
+                    "решение встроенной нейросети «Управляющий» по сессии %s: %s — %s"
+                    % (sess["session_id"][:12], decision.get("action"),
+                       report.get("why")),
+                    area=str(area.get("slug") or ""))
+    else:
+        core.report("info", core.KIND_SESSION,
+                    "решение по правилу-фолбэку по сессии %s: %s — %s"
+                    % (sess["session_id"][:12], decision.get("action"),
+                       report.get("why")),
+                    area=str(area.get("slug") or ""))
     return report
 
 
@@ -1992,7 +2097,8 @@ def cli_send(args) -> int:
     if not sess:
         print("сессии нет")
         return 1
-    res = send_to_session(area, sess, text, background=False, force=bool(args.force))
+    res = send_to_session(area, sess, text, background=False, force=bool(args.force),
+                           force_closed=bool(args.force))
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("ok") else 1
 
@@ -2010,6 +2116,8 @@ def cli_close(args) -> int:
         return 1
     res = send_to_session(area, sess, CLOSE_COMMAND, background=True,
                           force=bool(args.force),
+                          force_closed=bool(args.force),
+                          is_close=True,
                           tag="закрытие:вручную:%s" % sess["session_id"][:12],
                           why="команда закрытия вручную")
     print(json.dumps(res, ensure_ascii=False))
