@@ -10,10 +10,11 @@ Updated: 2026-11-28 (двадцать четвёртая смена — **про
 
 | где что | состояние |
 |---|---|
-| репозиторий | PR (ветка `feat/project-brain-system`) — `docs/brain/` (`README.md`, `CONSTITUTION.md`, `LENS.md`, `INTAKE.md`, `COUNCIL.md`, `registry.json`, `WALKTHROUGH-2026-11-28.md`), `AGENTS.md`, `.claude/commands/council.md`, `.opencode/commands/council.md`, приёмка `tools/minimax-project-areas/test_brain_system.py` |
+| репозиторий | PR **#270** (ветка `feat/project-brain-system`) слит squash'ом (`ccf2a69`) — `docs/brain/` (`README.md`, `CONSTITUTION.md`, `LENS.md`, `INTAKE.md`, `COUNCIL.md`, `registry.json`, `WALKTHROUGH-2026-11-28.md`), `AGENTS.md`, `.claude/commands/council.md`, `.opencode/commands/council.md`, `.claude/commands/start.md`, `.opencode/commands/start.md`, гейт `.github/workflows/tools-gate.yml`, приёмка `tools/minimax-project-areas/test_brain_system.py`, письмо Мозгу |
 | живая машина | **программа не менялась** ⇒ раскатка не нужна и не делалась (раскатка — за владельцем) |
 | параллельные полосы | правки в **других** файлах: другие полосы трогают `bridge/`, окно и `SESSION_HANDOFF.md`; наш набор — новые файлы в `docs/brain/` + раздел в `AGENTS.md` + две памятки + новая приёмка. Если чужой PR сольётся раньше — ветку перебазировать |
-| границы | файлы промта: `docs/brain/`, `AGENTS.md` (раздел «Система мозга проекта»), `.claude/commands/council.md`, `.opencode/commands/council.md`, `tools/minimax-project-areas/test_brain_system.py`; программа (`tools/minigen-gui/bridge/`, окно) **не трогалась** |
+| границы | файлы промта: `docs/brain/`, `AGENTS.md` (раздел «Система мозга проекта»), `.claude/commands/council.md`, `.opencode/commands/start.md`, `.opencode/commands/start.md`, `.github/workflows/tools-gate.yml` (строка приёмки), `tools/minimax-project-areas/test_brain_system.py`; программа (`tools/minigen-gui/bridge/`, окно) **не трогалась** |
+| архив промта | **проставлен**: `archive 199 --done` → `archived=True` (канал раздела открылся) |
 
 ### Разбор задачи: промт #199 (система мозга проекта)
 
