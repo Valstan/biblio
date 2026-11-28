@@ -186,6 +186,9 @@ class Recorder:
         self.opened_in: list[str] = []
         self.reports: list[tuple] = []
         self.ask_calls: list[dict] = []
+        #: «Ситуация» каждой отправки (тег) — по ному видно, что повтор той же
+        #: команды в той же ситуации не повторяется (промт КАРМАНА #184).
+        self.tags: list[str] = []
         #: Порядок действий над сессией — «закрыть», «архив», «новая»:
         #: по нему видно, что перенос нитки идёт «сначала архив старой, потом
         #: новая» (промт КАРМАНА #174, п. 3).
@@ -197,9 +200,10 @@ class Recorder:
     def install(self, watcher, answer: dict | None) -> None:
         rec = self
 
-        def fake_send(area, sess, text, background=True, force=False):
+        def fake_send(area, sess, text, background=True, force=False, tag="", why=""):
             rec.sent.append(text)
             rec.order.append("send")
+            rec.tags.append(tag)
             return {"ok": True, "why": "ход пошёл"}
 
         def fake_archive(area_dir, session_id):

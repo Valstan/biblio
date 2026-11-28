@@ -303,7 +303,15 @@ def main() -> int:
         check("archive" in json.dumps(report, ensure_ascii=False, default=str),
               "в отчёте нет архива: %s" % report.get("steps"))
 
-        # незавершённая работа — сессия продолжается, а не закрывается
+        # ⚠️ ПРОМТ КАРМАНА #184 (28.11) — канон обновлён: в **завершённой**
+        # сессии «продолжать» на месте неисполнимо (сессия закрыта), поэтому
+        # решение приводится к переносу нитки: паспорт → архив → новая сессия
+        # с паспортом и «продолжи нитку». Раньше (промт #177) здесь ожидался
+        # мягкий «Продолжай» в уже завершённую сессию — ровно то, из-за чего
+        # МиниГен 27–28.11 слал «Продолжай» в сессию, которая уже сказала
+        # «работа закончена» (живой случай промта #184). Незавершённая работа
+        # продолжается, а не закрывается, — это проверяется ниже на зависшей
+        # сессии и в приёмке #184.
         asked.clear()
         watcher.thread.decide = lambda facts, *a, **k: (
             asked.append(facts) or
@@ -315,15 +323,12 @@ def main() -> int:
         actions_busy = watcher.act(area_auto, verdicts_ok, {})
         act_busy = next((a for a in actions_busy if a.get("session") == "sess-done"), {})
         check(bool(act_busy.get("report")), "решение по сессии не попало в отчёт: %s" % act_busy)
-        check(not rec3.archived, "незавершённая сессия архивирована: %s" % rec3.archived)
-        check(not [s for s in rec3.archived if s == "sess-done"],
-              "сессия архивирована, хотя работа не закончена: %s" % rec3.archived)
-        check(bool(asked), "по незавершённой сессии нейросеть не спросили")
-        # сессия продолжена: в неё ушло «Продолжай» (а не закрытие)
-        nudges = [text for sid, text in rec3.sent if sid == "sess-done"]
-        check(bool(nudges), "незавершённую сессию не продолжили: %s" % rec3.sent)
-        check(not any(watcher.CLOSE_COMMAND in text for text in nudges),
-              "незавершённую сессию закрыли вместо продолжения: %s" % nudges)
+        check(bool(asked), "по завершённой сессии нейросеть не спросили")
+        check(rec3.archived == ["sess-done"],
+              "завершённую сессию не архивировали: %s" % rec3.archived)
+        nudges_done = [text for sid, text in rec3.sent if sid == "sess-done"]
+        check(not nudges_done,
+              "в завершённую сессию ушла команда: %s" % nudges_done)
 
         # ── 7) зависшая сессия: попытка продолжения и журнал ─────────────────
         print("7) зависшая сессия — попытка продолжения, решение в журнале")
@@ -353,6 +358,15 @@ def main() -> int:
               "в отчёте нет слов о зависшей сессии: %s" % logs)
         check(any("не выполнялось" not in text and "зависшая сессия" in text
                   for text in logs), "в отчёте нет решения по зависшей сессии: %s" % logs)
+        # ⚠️ Промт #184: незавершённая работа — сессия **продолжается**, а не
+        # закрывается (и канон из блока 6 перенесён сюда: завершённая сессия
+        # переносится, незавершённая — продолжается).
+        check(not [s for s in rec4.archived if s == "sess-stuck"],
+              "зависшую сессию архивировали вместо продолжения: %s" % rec4.archived)
+        nudges_stuck = [text for sid, text in rec4.sent if sid == "sess-stuck"]
+        check(bool(nudges_stuck), "зависшую сессию не продолжили: %s" % rec4.sent)
+        check(not any(watcher.CLOSE_COMMAND in text for text in nudges_stuck),
+              "зависшую сессию закрыли вместо продолжения: %s" % nudges_stuck)
         # попытка продолжения — не бесконечная: у попыток есть предел
         attempts = int((state.get("stuck") or {}).get("sess-stuck", {}).get("attempt") or 0)
         check(attempts >= 1, "попытка продолжения не записана: %s" % state.get("stuck"))

@@ -968,13 +968,24 @@ class Bridge:
         ⚠️ Модель недоступна ⇒ честный отказ (`ok: false`): решение тогда
         принимает **правило-фолбэк** на стороне демона, и оно не требует
         завершать сессию без отчёта о выполнении.
+
+        ⚠️ ПРОМТ КАРМАНА #184 (живая проверка 28.11): решателя зовут в двух
+        формах — конверт `{"facts": …, "area": …}` (так шлёт демон и так ждёт
+        локальный API) и сами факты. Раньше форма не совпадала с той, что
+        ждал мост, и решение молча уходило в «нужны факты о ситуации» ⇒
+        сторож всегда работал по правилу-фолбэку. Принимаем **обе** формы.
         """
-        facts = args.get("facts")
+        payload = args if isinstance(args, dict) else {}
+        facts = payload.get("facts")
         if not isinstance(facts, dict) or not facts:
-            return {"ok": False, "why": "нужны факты о ситуации"}
+            # Форма «факты напрямую»: узнаём её по содержимому.
+            if payload.get("verdict") or payload.get("has_report") is not None:
+                facts = payload
+            else:
+                return {"ok": False, "why": "нужны факты о ситуации"}
         settings = state.read_settings()
-        area_slug = str(args.get("area") or settings.get("modelArea") or "minigen")
-        model = str(args.get("model") or settings.get("model") or "")
+        area_slug = str(payload.get("area") or settings.get("modelArea") or "minigen")
+        model = str(payload.get("model") or settings.get("model") or "")
         self.core.refresh_env()
         try:
             result = self.agent.decide_treatment(facts, area_slug, model)

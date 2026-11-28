@@ -148,7 +148,7 @@ class Recorder:
     def install(self, watcher) -> None:
         rec = self
 
-        def fake_send(area, sess, text, background=True, force=False):
+        def fake_send(area, sess, text, background=True, force=False, tag="", why=""):
             rec.sent.append(((sess or {}).get("session_id") or "", text))
             return {"ok": True, "why": "ход пошёл"}
 

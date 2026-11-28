@@ -70,6 +70,7 @@
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -159,6 +160,27 @@ COMPACTION_AREA = "minigen"  # решение владельца касаетс�
                           # — дефолт рантайма ~95 %). В чужих областях сброс
                           # конфиг НЕ трогает: «очистку» делает сам рантайм —
                           # сессия уже перешла порог, сжатие случится само.
+
+# ───────────────────────────────────────────── кто есть кто (промт #184)
+# ⚠️ ПРОМТ КАРМАНА #184, п. 2: «надзиратель» — слово двусмысленное, и его
+# путают. В программе **три** разных механизма, и у каждого своё имя — эти
+# имена и стоят в коде, в журнале и в отчёте:
+#   * автомат аккаунтов — берёт новый аккаунт из Кармана, перелогинивает
+#     агента; в сессию НЕ пишет ни одного сообщения;
+#   * сторож сессий — обходит сессии, ставит диагноз, оживляет и **исполняет**
+#     решение;
+#   * «Управляющий» — встроенная нейросеть программы: **принимает** решение.
+# Отдельная роль — «смотритель демонов» (он поднимает и следит за демонами);
+# он к сессиям отношения не имеет (слово «надзиратель» для него больше не
+# употребляется — путаница снимается).
+ROLE_ACCOUNTS = "автомат аккаунтов"
+ROLE_WATCHDOG = "сторож сессий"
+ROLE_MANAGER = "Управляющий"
+ROLE_RULE = "правило-фолбэк"
+#: Строка в журнале: команду в закрытую сессию не отправляли (промт #184, п. 3).
+CLOSED_SESSION_NOTE = "сессия уже закрыта — команда не отправлялась"
+#: Строка в журнале: та же команда уже уходила в эту сессию (промт #184, п. 3).
+REPEAT_NOTE = "та же команда уже отправлялась в эту сессию — не отправлялась"
 
 
 # ────────────────────────────────────────────────────────── чтение рантайма
@@ -297,6 +319,86 @@ def asks_owner(text: str) -> bool:
                            r"как вам|выберите|нужно подтверждение|подтвердите)", low))
 
 
+# ──────────────────────────────────────── состояние сессии «прямо сейчас»
+
+def session_state(area: dict, session_id: str) -> dict:
+    """Состояние сессии **прямо сейчас** — читаем базу рантайма заново.
+
+    ⚠️ ПРОМТ КАРМАНА #184, п. 3: «в закрытую (завершённую) сессию команда не
+    отправляется». Значит, перед отправкой состояние надо **перечитать**: вердикт,
+    посчитанный минуту назад на проходе сторожа, мог устареть — агент как раз
+    мог закончить работу между вердиктом и отправкой.
+
+    Сессия считается **закрытой**, если:
+      - она архивирована (работа закрыта по существу), либо
+      - её последний ход завершён, и на этот ход у агента есть **финальный
+        ответ** (`msg_type=1`) — агент высказался последним словом.
+
+    Не закрыта: ход ещё идёт (`accepted`), либо ход завершён **без** финального
+    ответа (обрыв — нить брошена, её можно оживлять).
+    """
+    out = {"session_id": session_id, "found": False, "archived": False,
+           "status": "", "turn_status": "", "turn_id": "", "running": False,
+           "has_final": False, "closed": False, "why": ""}
+    if not session_id:
+        out["why"] = "нет id сессии"
+        return out
+    con = core.connect(core.area_db(area["dir"]))
+    if not con:
+        out["why"] = "база рантайма недоступна"
+        return out
+    try:
+        row = core.rows(con, "select status, archived from local_runtime_sessions "
+                              "where session_id=?", (session_id,))
+        if not row:
+            out["why"] = "сессии нет в базе рантайма"
+            return out
+        out["found"] = True
+        out["status"] = row[0][0] or ""
+        out["archived"] = bool(row[0][1])
+        turn = last_turn(con, session_id)
+        out["turn_status"] = turn.get("status") or ""
+        out["turn_id"] = turn.get("turn_id") or ""
+        out["running"] = bool(turn.get("status") == "accepted"
+                              and not turn.get("completed_at_ms"))
+        # Финальный ответ — **текущего** хода (как в `classify`): ответ из
+        # прошлого хода сводкой этого хода не считается.
+        legacy_final = last_message(con, session_id, final_only=True)
+        turn_id = turn.get("turn_id") or ""
+        final_msg = legacy_final if (not legacy_final.get("turn_id")
+                                     or legacy_final.get("turn_id") == turn_id) else {}
+        out["has_final"] = bool(final_msg)
+        if out["archived"]:
+            out["closed"] = True
+            out["why"] = "сессия архивирована"
+        elif out["running"]:
+            out["why"] = "ход идёт"
+        elif out["has_final"]:
+            out["closed"] = True
+            out["why"] = "ход завершён, на него есть финальный ответ"
+        else:
+            out["why"] = "ход завершён, финального ответа нет (нить брошена)"
+    finally:
+        con.close()
+    return out
+
+
+def situation_token(verdict: dict) -> str:
+    """Отпечаток ситуации сессии — «изменилось ли что-то».
+
+    ⚠️ ПРОМТ КАРМАНА #184, п. 7: решение лечения не переспрашивается на
+    каждом проходе (оно тратит очки аккаунта), но если ситуация изменилась —
+    принимается новое. «Изменилась» значит: другой вердикт, другой ход,
+    другая закрытость сессии.
+    """
+    lt = verdict.get("last_turn") or {}
+    return "|".join(str(x) for x in (
+        verdict.get("verdict"), lt.get("status"), lt.get("completed_at_ms"),
+        verdict.get("turn_id"), bool(verdict.get("has_report")),
+        bool(verdict.get("closed")),
+    ))
+
+
 # ────────────────────────────────────────────────────────── вердикт
 
 def compacted_sessions(area_dir: Path, window_ms: int = COMPACT_WINDOW_MS) -> dict:
@@ -397,6 +499,19 @@ def classify(area: dict, sess: dict, con, compacted: dict = None) -> dict:
         "reason": "", "fill": fill.get("fill"), "turn_status": turn.get("status"),
         "updated_at_ms": sess["updated_at_ms"], "broken_kids": len(kids),
         "last_text": (last_msg.get("text") or "")[:400],
+        # ⚠️ ПРОМТ КАРМАНА #184, п. 4: управляющий должен видеть **текст
+        # последнего сообщения сессии** целиком, а не первые 400 знаков:
+        # решение принимается по выводу агента («работа закончена» и т. п.).
+        "last_output": (last_msg.get("text") or "")[:4000],
+        "last_msg_id": last_msg.get("id") or 0,
+        "turn_id": turn.get("turn_id") or "",
+        # закрыта ли сессия (работа закончена) — по состоянию на момент
+        # вердикта; перед отправкой состояние перечитывается заново.
+        # Правило то же, что в `session_state()`: ход не идёт, и на него есть
+        # финальный ответ ⇒ агент высказался последним словом.
+        "closed": bool(sess["archived"]
+                       or (turn.get("status") != "accepted"
+                           and bool(final_msg))),
         # рабочая папка **этой** сессии: у параллельных ниток одного
         # репозитория она своя (свой worktree) — её и надо продолжать
         "workspace_dir": sess.get("workspace_dir") or "",
@@ -576,8 +691,33 @@ def live_manager_session(area: dict) -> str:
     return core.live_manager_session(area)
 
 
+def command_signature(text: str, tag: str = "") -> str:
+    """Отпечаток команды: текст + «ситуация» (тег вызывающего).
+
+    ⚠️ Промт #184, п. 3: «повтор одной и той же команды в одной сессии
+    невозможен». Отпечаток включает тег ситуации, поэтому честная повторная
+    отправка (другая попытка, другая смена аккаунта, другая причина) —
+    это **другой** отпечаток и проходит, а слепой повтор — нет.
+    """
+    digest = hashlib.sha1((text or "").encode("utf-8")).hexdigest()[:16]
+    return "%s|%s" % (tag or "", digest)
+
+
+def sends_ledger() -> dict:
+    """Лекарка команд: сессия → отпечаток команды → когда уходила."""
+    return core.read_state(core.SESSION_SENDS_STATE)
+
+
+def remember_send(session_id: str, signature: str, text: str) -> None:
+    """Записать в лекарку: эта команда в эту сессию уже уходила."""
+    ledger = sends_ledger()
+    rec = ledger.setdefault(session_id, {})
+    rec[signature] = {"at": core.now_ms(), "text": (text or "")[:200]}
+    core.write_state(core.SESSION_SENDS_STATE, ledger)
+
+
 def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
-                     force: bool = False) -> dict:
+                     force: bool = False, tag: str = "", why: str = "") -> dict:
     """Отправить сообщение в СУЩЕСТВУЮЩУЮ сессию области.
 
     `mcode exec --session <id>` работает в контексте области (через
@@ -586,6 +726,16 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
     Перед отправкой перечитываем прокси-переменные из реестра: если сетевой
     сторож починил мёртвый прокси, демон держит старые значения, и ход снова
     упал бы с «Connection error» ([G]: `fetch failed` = мёртвый прокси).
+
+    ⚠️ ПРОМТ КАРМАНА #184, п. 3 — **две стражи перед отправкой**:
+      1. **сессия уже закрыта** (работа закончена / архивирована) ⇒ команда
+         не отправляется: в закрытую сессию команда бессмысленна, и именно
+         этим «МиниГен слал „Продолжай“ и „заверши сессию“ десятки раз подряд»
+         (живой случай 27–28.11: 27 команд закрытия подряд в одну сессию);
+      2. **та же команда уже уходила** в эту сессию при той же ситуации ⇒
+         повтор невозможен (лекарка команд — общая для всех, кто пишет в
+         сессию: и сторож, и карусель полос, и панель).
+    Обе стражи пишут в журнал словами — видно, что команда **не** ушла.
     """
     core.refresh_env()
     if not force and probe_of(area, sess):
@@ -597,6 +747,26 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
         # `force=True` — это ручная команда владельца/«Управляющего», она
         # право имеет.
         return {"ok": False, "why": "сессия Управляющего — автомат её не трогает"}
+    signature = command_signature(text, tag)
+    if not force:
+        # 1) Сессия уже закрыта? — состояние перечитываем **прямо сейчас**.
+        st = session_state(area, sess.get("session_id") or "")
+        if st.get("closed"):
+            note = "%s (%s)" % (CLOSED_SESSION_NOTE, st.get("why") or "")
+            core.log("СЕССИИ: %s — %s" % (str(sess.get("session_id") or "")[:12], note))
+            core.report("info", "session", "%s: %s — %s"
+                        % (area.get("slug") or "", str(sess.get("session_id") or "")[:12],
+                           note), area=str(area.get("slug") or ""))
+            return {"ok": False, "why": note, "closed": True}
+        # 2) Та же команда уже была в этой сессии при той же ситуации?
+        prev = (sends_ledger().get(sess.get("session_id") or "") or {}).get(signature)
+        if prev:
+            note = "%s (%s)" % (REPEAT_NOTE, why or "ситуация не изменилась")
+            core.log("СЕССИИ: %s — %s" % (str(sess.get("session_id") or "")[:12], note))
+            core.report("info", "session", "%s: %s — %s"
+                        % (area.get("slug") or "", str(sess.get("session_id") or "")[:12],
+                           note), area=str(area.get("slug") or ""))
+            return {"ok": False, "why": note, "repeat": True}
     folder = sess.get("workspace_dir") or area.get("folder") or ""
     if not folder or not Path(folder).is_dir():
         return {"ok": False, "why": "папка проекта недоступна: %s" % folder}
@@ -614,12 +784,16 @@ def send_to_session(area: dict, sess: dict, text: str, background: bool = True,
     if background:
         time.sleep(3)
         if proc.poll() is None:
+            remember_send(sess["session_id"], signature, text)
             return {"ok": True, "why": "ход пошёл (pid %s)" % proc.pid}
         return {"ok": False, "why": "процесс умер сразу (rc=%s)" % proc.returncode}
     out = ""
     if proc is not None:
         out = ((proc.stdout or "") + (proc.stderr or "")).strip()
-    return {"ok": bool(proc and proc.returncode == 0), "why": out[-400:]}
+    ok = bool(proc and proc.returncode == 0)
+    if ok:
+        remember_send(sess["session_id"], signature, text)
+    return {"ok": ok, "why": out[-400:]}
 
 
 def new_session(area: dict, prompt: str, force: bool = False,
@@ -808,7 +982,9 @@ def reset_session(area: dict, sess: dict, brief: str = "") -> dict:
     trig = area_compaction_trigger(area)
     report["steps"].append({"compaction_trigger": trig})
     # 1) правильно завершить: сводка + handoff (нить не теряется)
-    res = send_to_session(area, sess, RESET_COMMAND, background=True)
+    res = send_to_session(area, sess, RESET_COMMAND, background=True, force=True,
+                          tag="сброс на месте:%s" % sess["session_id"][:12],
+                          why="команда завершения перед сбросом на месте")
     report["steps"].append({"close_command": res})
     if not res.get("ok"):
         report["ok"] = False
@@ -823,7 +999,9 @@ def reset_session(area: dict, sess: dict, brief: str = "") -> dict:
     # 2) продолжить ТУ ЖЕ сессию: контекст при этом сожмётся (это и есть
     #    «очистка» — рантайм делает это сам, своими родными средствами)
     text = brief or continuation_brief(area, sess)
-    again = send_to_session(area, sess, text, background=True)
+    again = send_to_session(area, sess, text, background=True, force=True,
+                            tag="сброс на месте:%s" % sess["session_id"][:12],
+                            why="продолжение после сброса на месте")
     report["steps"].append({"continued": again})
     report["ok"] = bool(again.get("ok"))
     report["why"] = again.get("why")
@@ -846,7 +1024,9 @@ def rotate_session(area: dict, sess: dict, brief: str = "") -> dict:
     core.log("СЕССИИ: ротация %s (%s)" % (sess["session_id"][:12], sess["title"][:50]))
     core.report("warn", "session", "ротация сессии %s: %s"
                 % (sess["session_id"][:12], sess["title"][:50]))
-    res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
+    res = send_to_session(area, sess, CLOSE_COMMAND, background=True, force=True,
+                          tag="ротация:%s" % sess["session_id"][:12],
+                          why="команда закрытия перед ротацией")
     report["steps"].append({"close_command": res})
     if not res.get("ok"):
         report["ok"] = False
@@ -1014,6 +1194,13 @@ def treatment_facts(area: dict, sess: dict, verdict: dict, passport: dict,
         "report_kind": verdict.get("report_kind") or "",
         # вывод сессии — чтобы решение принималось по словам агента
         "last_text": (verdict.get("last_text") or "")[:1500],
+        # ⚠️ ПРОМТ КАРМАНА #184, п. 4: **текст последнего сообщения сессии
+        # целиком** — решение обязано опираться на него («работа закончена»,
+        # «жду владельца», «что осталось»). Раньше в фактах было только первые
+        # 400 знаков, а модель их почти не видела ⇒ решение принималось «на
+        # фактах», а не по выводу сессии.
+        "last_output": (verdict.get("last_output") or "")[:4000],
+        "session_closed": bool(verdict.get("closed")),
         "compaction": verdict.get("compaction") or {},
         "context": verdict.get("context") or {"fill": verdict.get("fill"),
                                               "peak_fill": verdict.get("peak_fill")},
@@ -1045,6 +1232,13 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
       «Управляющий»);
     - **новая_сессия** — перенос: паспорт → корректно завершить старую →
       архивировать → открыть новую и отдать ей паспорт + «продолжи нитку».
+
+    ⚠️ ПРОМТ КАРМАНА #184, п. 5: **завершённая сессия закрывается правильно**:
+    она уже отработала, поэтому на месте её нельзя ни «продолжать» (сессия
+    закрыта — команда бессмысленна), ни просто «завершать» (тогда нитка
+    умирает вместе с сессией). Значит, решение приводится к **переносу нитки**:
+    паспорт → архив → новая сессия с паспортом и «продолжи нитку». Само
+    решение (чьё оно) остаётся видно в отчёте.
     """
     action = str(decision.get("action") or "")
     instruction = str(decision.get("instruction") or "")
@@ -1057,6 +1251,23 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
     # команды закрытия: она и так закрыта. Лишняя команда — лишний ход и лишние
     # очки. Проверка «сессия закрылась корректно» при этом остаётся.
     already_done = str((verdict or {}).get("verdict") or "") == "готова"
+    # ⚠️ ПРОМТ КАРМАНА #184, п. 5: решение для **завершённой** сессии
+    # приводится к переносу нитки. «Продолжать» на месте неисполнимо (сессия
+    # закрыта), а «завершать» без переноса убило бы нитку ⇒ перенос.
+    if already_done and action in (thread.CONTINUE, thread.FINISH):
+        report["action_was"] = action
+        report["action"] = thread.NEW_SESSION
+        report["escalated"] = (
+            "работа уже закончена: решение «%s» на месте неисполнимо — нитка "
+            "переносится в новую сессию с паспортом" % action)
+        # ⚠️ Промт #184, п. 3: в журнале видно, что в закрытую сессию команда
+        # **не отправлялась** (и почему).
+        core.log("СЕССИИ: %s — %s (%s)" % (sess["session_id"][:12],
+                                           CLOSED_SESSION_NOTE, report["escalated"]))
+        core.report("info", "session", "%s: %s — %s"
+                    % (area.get("slug") or "", sess["session_id"][:12],
+                       CLOSED_SESSION_NOTE), area=str(area.get("slug") or ""))
+        action = thread.NEW_SESSION
     if action == thread.CONTINUE:
         # Ничего разрушающего: ни «заверши работу», ни архивирования.
         report["ok"] = True
@@ -1066,7 +1277,10 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
             report["steps"].append({"nudge": "недавно уже подталкивали — ждём"})
             return report
         text = thread.continue_text(passport, instruction)
-        res = send_to_session(area, sess, text, background=True)
+        res = send_to_session(area, sess, text, background=True,
+                              tag="продолжение:%s" % situation_token(verdict),
+                              why="мягкое «Продолжай» по решению «%s»"
+                                  % (decision.get("source") or "правило"))
         state.setdefault("revived", {})[sess["session_id"]] = int(time.time())
         report["steps"].append({"nudge": res})
         report["ok"] = bool(res.get("ok"))
@@ -1081,7 +1295,10 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         if already_done:
             report["steps"].append({"close_command": "не нужна: работа уже завершена"})
         else:
-            res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
+            res = send_to_session(area, sess, CLOSE_COMMAND, background=True,
+                                  tag="закрытие:%s" % situation_token(verdict),
+                                  why="команда закрытия по решению «%s»"
+                                      % (decision.get("source") or "правило"))
             report["steps"].append({"close_command": res})
             if not res.get("ok"):
                 report["why"] = "команду закрытия не приняли: %s" % res.get("why")
@@ -1103,7 +1320,9 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
         if already_done:
             report["steps"].append({"close_command": "не нужна: работа уже завершена"})
         else:
-            res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
+            res = send_to_session(area, sess, CLOSE_COMMAND, background=True,
+                                  tag="закрытие:%s" % situation_token(verdict),
+                                  why="команда закрытия перед переносом нитки")
             report["steps"].append({"close_command": res})
             if not res.get("ok"):
                 report["why"] = "команду закрытия не приняли: %s" % res.get("why")
@@ -1178,7 +1397,8 @@ def apply_decision(area: dict, sess: dict, verdict: dict, decision: dict,
     return report
 
 
-def treat_session(area: dict, sess: dict, verdict: dict, state: dict) -> dict:
+def treat_session(area: dict, sess: dict, verdict: dict, state: dict,
+                  decision: dict = None) -> dict:
     """Лечение сессии по решению **встроенной нейросети «Управляющего»** (#172).
 
     ⚠️ Отсутствие отчёта о выполнении — **не повод требовать завершения**.
@@ -1187,13 +1407,22 @@ def treat_session(area: dict, sess: dict, verdict: dict, state: dict) -> dict:
 
     Решение видно в отчёте: кто (Управляющий / правило-фолбэк), когда, по каким
     фактам, какое действие и что сделано.
+
+    ⚠️ ПРОМТ КАРМАНА #184, п. 2: в отчёте и в журнале видно **кто принял
+    решение и кто его исполнил** — эти две роли путают чаще всего:
+      * принял: «Управляющий» (встроенная нейросеть) либо «правило-фолбэк»
+        (модель недоступна или ответила не по схеме);
+      * исполнил: «сторож сессий» (он же — тот, кто ходит в сессию).
     """
     passport = thread_passport(area, sess)
     neighbors = parallel_sessions(area, sess)
     facts = treatment_facts(area, sess, verdict, passport, neighbors)
     # ⚠️ Область модели не задаём: решение принимает **тот же** встроенный
     # агент, что отвечает в чате (у него своя область из настроек программы).
-    decision = thread.decide(facts)
+    # ⚠️ Промт #184, п. 7: `decision` можно передать **готовое** — тогда модель
+    # не спрашивается (очки аккаунта) и повторяется уже принятое решение.
+    if decision is None:
+        decision = thread.decide(facts)
     report = apply_decision(area, sess, verdict, decision, passport, state)
     report["facts"] = facts
     report["decision"] = {"action": decision.get("action"),
@@ -1201,18 +1430,26 @@ def treat_session(area: dict, sess: dict, verdict: dict, state: dict) -> dict:
                            "reason": decision.get("reason"),
                            "instruction": decision.get("instruction"),
                            "model_why": decision.get("model_why", "")}
+    # ⚠️ Промт #184, п. 2: кто принял решение и кто исполнил — словами.
+    source = str(decision.get("source") or "")
+    report["decided_by"] = ROLE_MANAGER if source == ROLE_MANAGER else ROLE_RULE
+    report["done_by"] = ROLE_WATCHDOG
     report["passport_id"] = passport.get("thread_id")
     # ⚠️ Промт #174 (п. 5): в отчёте видно, **кто водит** проект сейчас и
     # какое действие по чьему решению.
     drv = core.driver_of(area)
     report["driver"] = drv
-    core.log("СЕССИИ: лечение %s — %s (%s), водитель — %s: %s"
+    core.log("СЕССИИ: лечение %s — %s: решение принял «%s», исполнил «%s», "
+             "водитель — %s: %s"
              % (sess["session_id"][:12], decision.get("action"),
-                decision.get("source") or "правило", drv["title"], report.get("why")))
+                report["decided_by"], report["done_by"], drv["title"],
+                report.get("why")))
     core.report("warn" if decision.get("action") != thread.CONTINUE else "info",
-                "session", "лечение сессии %s: %s (%s), водитель — %s — %s"
+                "session", "лечение сессии %s: %s — решение принял «%s», исполнил "
+                "«%s», водитель — %s — %s"
                 % (sess["session_id"][:12], decision.get("action"),
-                   decision.get("source") or "правило", drv["title"], report.get("why")),
+                   report["decided_by"], report["done_by"], drv["title"],
+                   report.get("why")),
                 area=str(area.get("slug") or ""))
     return report
 
@@ -1321,17 +1558,31 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
             core.report("info", "session", "%s: зависшая сессия — %s" % (slug, reaction),
                         area=slug)
         if v["verdict"] == "готова" and not v.get("archived"):
-            # ⚠️ ПРОМТ КАРМАНА #177 (п. 6): завершение работы определяется **по
+            # ⚠️ Промт КАРМАНА #177 (п. 6): завершение работы определяется **по
             # выводу сессии** (последнее слово, выводы «выполнила такую-то
             # работу»). Решение принимает встроенная нейросеть: работа
             # закончена — закрыть, архивировать и поднять новую сессию с
             # продолжением нитки разработки; не закончена — продолжить.
+            #
+            # ⚠️ Промт КАРМАНА #184, п. 7: решение **не переспрашивается на
+            # каждом проходе** (оно тратит очки аккаунта). Спрашиваем, если
+            # прошло два часа ИЛИ ситуация изменилась (стала другой вердикт,
+            # другой ход, сессия закрылась).
             #
             # Под водителем «Внешнее управление» или «Оператор» автомат в
             # сессии **не вмешивается**: жить сессией водит внешний агент
             # (слова о невыполненном действии пишутся там, где действие
             # действительно было бы, — см. ветки ниже).
             if drv["driver"] != core.DRIVER_AUTOMATON:
+                continue
+            sig = situation_token(v)
+            last = state.setdefault("decision", {}).get(v["session_id"]) or {}
+            last_at = int(last.get("at") or 0) if isinstance(last, dict) else int(last or 0)
+            last_sig = last.get("sig") or "" if isinstance(last, dict) else ""
+            if last_at and int(time.time()) - last_at < DECISION_COOLDOWN and last_sig == sig:
+                actions.append({"session": v["session_id"],
+                                "action": "решение спрашивали недавно, ситуация не "
+                                          "изменилась — не трогаем"})
                 continue
             if dry_run:
                 actions.append({"session": v["session_id"],
@@ -1340,6 +1591,7 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
             sess = {"session_id": v["session_id"], "title": v["title"],
                     "workspace_dir": v.get("workspace_dir") or area.get("folder", "")}
             rep = treat_session(area, sess, v, state)
+            state["decision"][v["session_id"]] = {"at": int(time.time()), "sig": sig}
             actions.append({"session": v["session_id"],
                             "action": "работа завершена: %s" % (rep.get("action") or "—"),
                             "report": rep})
@@ -1388,10 +1640,26 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                 actions.append({"session": v["session_id"],
                                 "action": "зависшая сессия — решение «Управляющего» (сухой прогон)"})
                 continue
+            # ⚠️ Промт #184, п. 7: решение лечения не переспрашивается на
+            # каждом проходе. Для зависшей сессии «продолжать» — это **попытка
+            # продолжения**, и её считает счётчик попыток (предел 3), а не
+            # модель: значит, модель повторно не спрашиваем, а **повторяем
+            # прежнее решение** (оно уже принято и с situations не изменилось).
+            last = (state.get("decision") or {}).get(v["session_id"]) or {}
+            prev = last.get("decision") if isinstance(last, dict) else None
             sess = {"session_id": v["session_id"], "title": v["title"],
                     "workspace_dir": v.get("workspace_dir") or area.get("folder", "")}
-            rep = treat_session(area, sess, v, state)
+            if prev and prev.get("action") == thread.CONTINUE:
+                rep = treat_session(area, sess, v, state, decision=prev)
+                core.log("СЕССИИ: %s — зависшая сессия: решение «продолжать» "
+                         "повторяем (модель не спрашиваем)" % slug)
+            else:
+                rep = treat_session(area, sess, v, state)
             decision = (rep.get("decision") or {}).get("action")
+            state.setdefault("decision", {})[v["session_id"]] = {
+                "at": int(time.time()), "sig": situation_token(v),
+                "action": decision or "",
+                "decision": (rep.get("decision") or {})}
             if decision == thread.CONTINUE:
                 # Попытка продолжения сделана — ждём реакцию агента.
                 attempt += 1
@@ -1435,7 +1703,10 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                     continue
                 res = send_to_session(area, {"session_id": v["session_id"],
                                       "workspace_dir": area.get("folder", "")},
-                                      REVIVE_PROMPT, background=True)
+                                      REVIVE_PROMPT, background=True,
+                                      tag="смена аккаунта:%d" % healed_at,
+                                      why="«Продолжай» после смены аккаунта "
+                                          "(автомат аккаунтов)")
                 seen_map[v["session_id"]] = healed_at
                 state.setdefault("revived", {})[v["session_id"]] = int(time.time())
                 actions.append({"session": v["session_id"],
@@ -1458,15 +1729,22 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                 actions.append({"session": v["session_id"],
                                 "action": "решение «Управляющего» (сухой прогон)"})
                 continue
-            last_decision = int((state.get("decision") or {}).get(v["session_id"]) or 0)
-            if last_decision and int(time.time()) - last_decision < DECISION_COOLDOWN:
+            # ⚠️ Промт #184, п. 7: решение не переспрашивается на каждом
+            # проходе, но при **изменившейся ситуации** принимается новое.
+            sig = situation_token(v)
+            last = (state.get("decision") or {}).get(v["session_id"]) or {}
+            last_at = int(last.get("at") or 0) if isinstance(last, dict) else int(last or 0)
+            last_sig = (last.get("sig") or "") if isinstance(last, dict) else ""
+            if last_at and int(time.time()) - last_at < DECISION_COOLDOWN and last_sig == sig:
                 actions.append({"session": v["session_id"],
-                                "action": "решение спрашивали недавно — не трогаем"})
+                                "action": "решение спрашивали недавно, ситуация не "
+                                          "изменилась — не трогаем"})
                 continue
             sess = {"session_id": v["session_id"], "title": v["title"],
                     "workspace_dir": v.get("workspace_dir") or area.get("folder", "")}
             rep = treat_session(area, sess, v, state)
-            state.setdefault("decision", {})[v["session_id"]] = int(time.time())
+            state.setdefault("decision", {})[v["session_id"]] = {"at": int(time.time()),
+                                                                "sig": situation_token(v)}
             actions.append({"session": v["session_id"],
                             "action": "лечение: %s" % (rep.get("action") or "—"),
                             "report": rep})
@@ -1492,7 +1770,9 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                 continue
             res = send_to_session(area, {"session_id": v["session_id"],
                                   "workspace_dir": area.get("folder", "")},
-                                  REVIVE_PROMPT, background=True)
+                                  REVIVE_PROMPT, background=True,
+                                  tag="сеть:%d" % failed_at,
+                                  why="«Продолжай» после восстановления сети")
             state.setdefault("revived", {})[v["session_id"]] = int(time.time())
             actions.append({"session": v["session_id"], "action": "«Продолжай» после сети", "result": res})
             core.log("СЕССИИ: %s — сессия %s упала по сети, связь вернулась: %s" % (
@@ -1519,7 +1799,9 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                 continue
             res = send_to_session(area, {"session_id": v["session_id"],
                                   "workspace_dir": area.get("folder", "")},
-                                  REVIVE_PROMPT, background=True)
+                                  REVIVE_PROMPT, background=True,
+                                  tag="вендор:%d" % failed_at,
+                                  why="«Продолжай» после восстановления вендора")
             state.setdefault("revived", {})[v["session_id"]] = int(time.time())
             actions.append({"session": v["session_id"], "action": "«Продолжай» после вендора", "result": res})
             core.log("СЕССИИ: %s — сессия %s упала на нестабильности модели, вендор ожил: %s" % (
@@ -1540,7 +1822,10 @@ def act(area: dict, verdicts: list, state: dict, dry_run: bool = False) -> list:
                 continue
             res = send_to_session(area, {"session_id": v["session_id"],
                                   "workspace_dir": area.get("folder", "")},
-                                  REVIVE_PROMPT, background=True)
+                                  REVIVE_PROMPT, background=True,
+                                  tag="оживление:%s" % (v.get("turn_id")
+                                                        or v.get("verdict") or ""),
+                                  why="«Продолжай» брошенной нитке")
             state.setdefault("revived", {})[v["session_id"]] = int(time.time())
             actions.append({"session": v["session_id"], "action": "«Продолжай»", "result": res})
             core.log("СЕССИИ: %s — сессия %s: %s → «Продолжай»: %s" % (
@@ -1659,7 +1944,7 @@ def cli_send(args) -> int:
     if not sess:
         print("сессии нет")
         return 1
-    res = send_to_session(area, sess, text, background=False)
+    res = send_to_session(area, sess, text, background=False, force=bool(args.force))
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("ok") else 1
 
@@ -1675,7 +1960,10 @@ def cli_close(args) -> int:
     if not sess:
         print("сессии нет")
         return 1
-    res = send_to_session(area, sess, CLOSE_COMMAND, background=True)
+    res = send_to_session(area, sess, CLOSE_COMMAND, background=True,
+                          force=bool(args.force),
+                          tag="закрытие:вручную:%s" % sess["session_id"][:12],
+                          why="команда закрытия вручную")
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("ok") else 1
 
@@ -1820,7 +2108,8 @@ def main() -> int:
                     help="показать паспорт нитки: что делалось, что осталось, "
                          "репозиторий, ветка/worktree, PR, критерии приёмки")
     ap.add_argument("--force", action="store_true",
-                    help="действовать с пробой лечащего (обычно нельзя)")
+                    help="действовать с пробой лечащего и обойти стражи "
+                         "«сессия уже закрыта» / «повтор команды» (обычно нельзя)")
     args = ap.parse_args()
 
     if args.list:
