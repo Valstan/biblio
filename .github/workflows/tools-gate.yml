@@ -80,5 +80,7 @@ jobs:
         run: python3 tools/minimax-project-areas/test_program_errors_185.py
       - name: Приёмка «карусель не командует закрытую сессию» (промт #186)
         run: python3 tools/minimax-project-areas/test_carousel_no_double_close_186.py
+      - name: Приёмка «доработка не берётся заново» (живой случай 28.11)
+        run: python3 tools/minimax-project-areas/test_carousel_rework_done.py
       - name: Приёмка системы мозга проекта (промт #199)
         run: python3 tools/minimax-project-areas/test_brain_system.py
