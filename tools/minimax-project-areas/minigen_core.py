@@ -301,7 +301,8 @@ def git_out(args: list[str], cwd: Path, timeout: int = 60) -> str:
     try:
         proc = subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True,
                               text=True, encoding="utf-8", errors="replace",
-                              timeout=timeout)
+                              timeout=timeout,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         return ""
     if proc.returncode != 0:
