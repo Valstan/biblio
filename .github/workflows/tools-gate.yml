@@ -82,3 +82,5 @@ jobs:
         run: python3 tools/minimax-project-areas/test_carousel_no_double_close_186.py
       - name: Приёмка системы мозга проекта (промт #199)
         run: python3 tools/minimax-project-areas/test_brain_system.py
+      - name: Приёмка «копия берёт код из своего репозитория» (живой случай 28.11)
+        run: python3 tools/minimax-project-areas/test_copy_own_ref.py

@@ -288,6 +288,65 @@ def write_state(path: Path, data: dict) -> None:
         pass
 
 
+# ──────────────────────────────────────── откуда машина берёт свой код
+
+def git_out(args: list[str], cwd: Path, timeout: int = 60) -> str:
+    """Вывод git-команды.
+
+    ⚠️ **Только при успешном выходе** (код 0): иначе пусто. Иначе
+    `rev-parse --verify` на несуществующей ветке печатает её **имя** в stdout
+    (и падает) — и «ветка есть» получалось бы у несуществующей (живой случай
+    28.11: раскатка брала `origin/master`, которого у копии нет).
+    """
+    try:
+        proc = subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout,
+                              creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def own_ref(repo: Path) -> str:
+    """Ветка-источник, из которой берёт код **эта** машина.
+
+    ⚠️ **Живой случай 28.11: раскатка на копии падала.** Копия программы —
+    отдельный репозиторий (`Valstan/minigen-<идентификатор>`), и ветки
+    `master` в нём **не заводится**: прямой пуш в `master` запрещён
+    глобальным хуком, поэтому код копии лежит в ветке `base`. Раскатка
+    читала эталон из `origin/master` ⇒ на копии: «не знаю, какой коммит
+    раскатываю» ⇒ **раскатка останавливалась**, и копия не обновлялась
+    вовсе (в журнале обновления 28.11 — так и было).
+
+    ⚠️ Правило **одно на всю программу**: и раскатка, и кнопка «Обновить
+    программу» зовут эту функцию. Вторая правда тут же разошлась бы
+    (как с «Режимом» и «Автоматом»).
+
+    Порядок:
+    1. `origin/master` есть ⇒ это репозиторий **программы** (оригинал);
+    2. иначе `origin/base` есть ⇒ это репозиторий **копии** ⇒ своя ветка;
+    3. иначе — ветка, за которой следит текущая (`@{upstream}`);
+    4. иначе — `origin/master` (как раньше: пусть скажет git, что не вышло).
+    """
+    try:
+        repo = Path(repo)
+    except TypeError:
+        repo = Path(str(repo))
+    if not repo.is_dir():
+        return "origin/master"
+    for ref in ("origin/master", "origin/base"):
+        if git_out(["rev-parse", "--verify", "--quiet", ref], repo):
+            return ref
+    tracked = git_out(["rev-parse", "--abbrev-ref", "--symbolic-full-name",
+                        "@{upstream}"], repo)
+    if tracked and "/" in tracked:
+        return tracked
+    return "origin/master"
+
+
 # ────────────────────────────────────────────────────────── конфиги
 
 def net_config() -> dict:

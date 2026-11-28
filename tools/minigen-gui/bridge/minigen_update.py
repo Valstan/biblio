@@ -176,6 +176,32 @@ def _remote(repo: Path) -> str:
     return remotes[0] if remotes else ""
 
 
+def own_ref(repo: Path) -> str:
+    """Ветка, из которой берёт код **эта** машина (программа или копия).
+
+    ⚠️ **Правило одно на программу** — его же зовёт раскатка
+    (`minigen_rollout.py` → `core.own_ref`). Вторая реализация разошлась бы
+    (как «Режим» с «Автоматом»).
+
+    ⚠️ Живой случай 28.11: обновление тянуло `upstream/master` — **общий**
+    репозиторий программы, — и копия сливалась с ним 1-в-1. Владелец хотел
+    наоборот: каждая копия живёт своей жизнью, а чужие наработки приходят
+    **генами** (предложение + решение за человеком). Теперь обновление берёт
+    код **своей** машины: у копии — её собственную ветку `base`.
+
+    Старое ядро (без `own_ref`) — работает как раньше.
+    """
+    try:
+        import minigen_state as state
+        core = state.load_daemons()["core"]
+        fn = getattr(core, "own_ref", None)
+        if fn is not None:
+            return str(fn(repo) or "origin/master")
+    except Exception:  # noqa: BLE001 — правило из ядра, а не из моста
+        pass
+    return "origin/master"
+
+
 def installed() -> dict[str, Any]:
     """Установленная копия: коммит, время установки, откуда запущена."""
     try:
@@ -186,20 +212,26 @@ def installed() -> dict[str, Any]:
 
 
 def available() -> dict[str, Any]:
-    """Что лежит в репозитории (по последнему fetch)."""
+    """Что лежит в репозитории (по последнему fetch).
+
+    ⚠️ Ветка — **своя** у машины (`own_ref`): у копии это `base`, у оригинала
+    `master`. Иначе окно показывало бы «доступна версия из общего
+    репозитория» — то самое слияние 1-в-1, которого владелец не хочет.
+    """
     repo = repo_dir()
-    remote = _remote(repo)
+    ref = own_ref(repo)
+    remote, _, branch = ref.partition("/")
     commit = ""
     behind = 0
-    if remote:
-        code, out, _ = _git(["rev-parse", "--short", "%s/master" % remote], repo)
+    if remote and branch:
+        code, out, _ = _git(["rev-parse", "--short", ref], repo)
         if code == 0:
             commit = out
-            code, out, _ = _git(["rev-list", "--count", "HEAD..%s/master" % remote], repo)
+            code, out, _ = _git(["rev-list", "--count", "HEAD..%s" % ref], repo)
             if code == 0 and out.isdigit():
                 behind = int(out)
     return {"commit": commit, "behind": behind, "repo": str(repo),
-            "remote": remote}
+            "remote": remote, "ref": ref}
 
 
 def _cached_available() -> dict[str, Any]:
@@ -263,10 +295,11 @@ def check() -> dict[str, Any]:
     repo = repo_dir()
     if not (repo / ".git").exists():
         return {"ok": False, "why": "исходники программы не найдены: %s" % repo}
-    remote = _remote(repo)
-    if not remote:
-        return {"ok": False, "why": "в исходниках нет удалённого репозитория"}
-    code, out, err = _git(["fetch", "--quiet", remote, "master"], repo, timeout=300)
+    ref = own_ref(repo)
+    remote, _, branch = ref.partition("/")
+    if not remote or not branch:
+        remote, branch = _remote(repo) or "origin", "master"
+    code, out, err = _git(["fetch", "--quiet", remote, branch], repo, timeout=300)
     if code != 0:
         return {"ok": False, "why": "сервер не отдал изменения: %s" % (err or out)}
     with _lock:
@@ -347,24 +380,29 @@ def _run() -> None:
             _fail("repo", "в исходниках нет node_modules — поставь зависимости "
                           "(npm install в tools/minigen-gui) и повтори")
             return
-        remote = _remote(repo)
-        if not remote:
-            _fail("repo", "в исходниках нет удалённого репозитория")
-            return
+        # ⚠️ Обновление берёт код **своей** машины: программа — свой
+        # `origin/master`, копия — своя `origin/base`. Тянуть общий репозиторий
+        # программы нельзя: копия слилась бы с ним 1-в-1, а владелец хочет,
+        # чтобы каждая копия жила своей жизнью, а чужие наработки приходили
+        # **генами** (предложение + решение за человеком).
+        ref = own_ref(repo)
+        remote, _, branch = ref.partition("/")
+        if not remote or not branch:
+            remote, branch = _remote(repo) or "origin", "master"
 
         # 2) забрать новую версию
-        _log("pull", "забираю изменения из %s" % remote)
-        code, out, err = _git(["fetch", "--quiet", remote, "master"], repo, timeout=600)
+        _log("pull", "забираю изменения из %s/%s" % (remote, branch))
+        code, out, err = _git(["fetch", "--quiet", remote, branch], repo, timeout=600)
         if code != 0:
             _fail("pull", "сервер не отдал изменения: %s" % (err or out))
             return
         before = _git(["rev-parse", "--short", "HEAD"], repo)[1]
-        code, out, err = _git(["pull", "--ff-only", remote, "master"], repo, timeout=600)
+        code, out, err = _git(["pull", "--ff-only", remote, branch], repo, timeout=600)
         if code != 0:
             _fail("pull", "обновить исходники не вышло: %s" % (err or out))
             return
         after = _git(["rev-parse", "--short", "HEAD"], repo)[1]
-        _log("pull", "исходники: %s → %s" % (before, after), "ok")
+        _log("pull", "исходники: %s → %s (%s/%s)" % (before, after, remote, branch), "ok")
 
         # 3) сборка окна
         _log("build", "собираю окно (npm run build) — это минута-две")
